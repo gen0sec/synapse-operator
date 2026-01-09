@@ -19,18 +19,18 @@ import (
 )
 
 const (
-	moatLabelKey       = "app.kubernetes.io/name"
-	moatLabelValue     = "moat"
-	configHashAnnotKey = "moat.arxignis.com/config-hash"
+	synapseLabelKey    = "app.kubernetes.io/name"
+	synapseLabelValue  = "synapse"
+	configHashAnnotKey = "synapse.gen0sec.com/config-hash"
 )
 
-// ConfigMapReconciler watches Moat config ConfigMaps and forces a rollout on the Deployment when the config changes.
+// ConfigMapReconciler watches Synapse config ConfigMaps and forces a rollout on the Deployment when the config changes.
 type ConfigMapReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// Reconcile reacts to ConfigMap updates by updating the pod template annotation on Moat Deployments.
+// Reconcile reacts to ConfigMap updates by updating the pod template annotation on Synapse Deployments.
 func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("configmap", req.NamespacedName)
 
@@ -43,8 +43,8 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	if cfg.Labels[moatLabelKey] != moatLabelValue {
-		logger.V(1).Info("ConfigMap does not belong to Moat, skipping")
+	if cfg.Labels[synapseLabelKey] != synapseLabelValue {
+		logger.V(1).Info("ConfigMap does not belong to Synapse, skipping")
 		return ctrl.Result{}, nil
 	}
 
@@ -59,7 +59,7 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		ctx,
 		deployments,
 		client.InNamespace(req.Namespace),
-		client.MatchingLabels{moatLabelKey: moatLabelValue},
+		client.MatchingLabels{synapseLabelKey: synapseLabelValue},
 	); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -89,12 +89,12 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager configures the controller to watch ConfigMaps with the Moat label.
+// SetupWithManager configures the controller to watch ConfigMaps with the Synapse label.
 func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(
 			&corev1.ConfigMap{},
-			builder.WithPredicates(predicate.NewPredicateFuncs(isMoatObject)),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isSynapseObject)),
 		).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 1,
@@ -102,11 +102,11 @@ func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func isMoatObject(obj client.Object) bool {
+func isSynapseObject(obj client.Object) bool {
 	if obj == nil {
 		return false
 	}
-	return obj.GetLabels()[moatLabelKey] == moatLabelValue
+	return obj.GetLabels()[synapseLabelKey] == synapseLabelValue
 }
 
 func hashConfigMapContent(cfg *corev1.ConfigMap) string {

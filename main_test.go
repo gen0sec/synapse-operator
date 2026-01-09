@@ -145,7 +145,7 @@ func TestManagerOptionsConfiguration(t *testing.T) {
 			enableElect:      false,
 			watchedNamespace: "",
 			expectNamespace:  false,
-			expectedElectID:  "86a223f3.moat.arxignis.com",
+			expectedElectID:  "86a223f3.synapse.gen0sec.com",
 		},
 		{
 			name:             "with namespace",
@@ -154,7 +154,7 @@ func TestManagerOptionsConfiguration(t *testing.T) {
 			enableElect:      false,
 			watchedNamespace: "test-ns",
 			expectNamespace:  true,
-			expectedElectID:  "86a223f3.moat.arxignis.com",
+			expectedElectID:  "86a223f3.synapse.gen0sec.com",
 		},
 		{
 			name:             "with leader election",
@@ -163,7 +163,7 @@ func TestManagerOptionsConfiguration(t *testing.T) {
 			enableElect:      true,
 			watchedNamespace: "",
 			expectNamespace:  false,
-			expectedElectID:  "86a223f3.moat.arxignis.com",
+			expectedElectID:  "86a223f3.synapse.gen0sec.com",
 		},
 	}
 
@@ -211,9 +211,9 @@ func TestManagerOptionsConfiguration(t *testing.T) {
 
 func TestLeaderElectionID(t *testing.T) {
 	// Verify the leader election ID matches expected format
-	expectedID := "86a223f3.moat.arxignis.com"
-	assert.Equal(t, expectedID, "86a223f3.moat.arxignis.com")
+	expectedID := "86a223f3.synapse.gen0sec.com"
+	assert.Equal(t, expectedID, "86a223f3.synapse.gen0sec.com")
 	assert.NotEmpty(t, expectedID)
-	assert.Contains(t, expectedID, "moat")
-	assert.Contains(t, expectedID, "arxignis.com")
+	assert.Contains(t, expectedID, "synapse")
+	assert.Contains(t, expectedID, "gen0sec.com")
 }

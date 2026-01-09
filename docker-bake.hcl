@@ -1,5 +1,5 @@
 variable "DEFAULT_TAG" {
-  default = "moat-operator:local"
+  default = "synapse-operator:local"
 }
 
 // Special target: https://github.com/docker/metadata-action#bake-definition

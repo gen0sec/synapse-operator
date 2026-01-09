@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"moat-operator/controllers"
+	"synapse-operator/controllers"
 )
 
 var (
@@ -55,7 +55,7 @@ func main() {
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "86a223f3.moat.arxignis.com",
+		LeaderElectionID:       "86a223f3.synapse.gen0sec.com",
 	}
 
 	if watchedNamespace != "" {

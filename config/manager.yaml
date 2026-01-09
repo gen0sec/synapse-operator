@@ -1,34 +1,34 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: moat-system
+  name: synapse-system
   labels:
-    app.kubernetes.io/name: moat-operator
+    app.kubernetes.io/name: synapse-operator
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: moat-operator
-  namespace: moat-system
+  name: synapse-operator
+  namespace: synapse-system
   labels:
-    app.kubernetes.io/name: moat-operator
+    app.kubernetes.io/name: synapse-operator
     app.kubernetes.io/component: controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: moat-operator
+      app.kubernetes.io/name: synapse-operator
       app.kubernetes.io/component: controller
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: moat-operator
+        app.kubernetes.io/name: synapse-operator
         app.kubernetes.io/component: controller
     spec:
-      serviceAccountName: moat-operator
+      serviceAccountName: synapse-operator
       containers:
         - name: manager
-          image: moat-operator:local
+          image: synapse-operator:local
           imagePullPolicy: IfNotPresent
           args:
             - "--leader-elect"
