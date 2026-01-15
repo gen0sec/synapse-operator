@@ -25,6 +25,10 @@ func TestSchemeInitialization(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Pod", gvk.Kind)
 
+	gvk, err = apiutil.GVKForObject(&corev1.Secret{}, scheme)
+	require.NoError(t, err)
+	assert.Equal(t, "Secret", gvk.Kind)
+
 	gvk, err = apiutil.GVKForObject(&appsv1.Deployment{}, scheme)
 	require.NoError(t, err)
 	assert.Equal(t, "Deployment", gvk.Kind)
@@ -39,6 +43,9 @@ func TestSchemeKnownTypes(t *testing.T) {
 	_, err = scheme.New(corev1.SchemeGroupVersion.WithKind("Pod"))
 	require.NoError(t, err)
 
+	_, err = scheme.New(corev1.SchemeGroupVersion.WithKind("Secret"))
+	require.NoError(t, err)
+
 	_, err = scheme.New(appsv1.SchemeGroupVersion.WithKind("Deployment"))
 	require.NoError(t, err)
 }
@@ -51,6 +58,10 @@ func TestParseFlags(t *testing.T) {
 		expectedProbe     string
 		expectedElect     bool
 		expectedNamespace string
+		expectedSelector  string
+		expectedAnnot     string
+		expectedCMKeys    string
+		expectedSecretKey string
 	}{
 		{
 			name:              "default flags",
@@ -59,6 +70,10 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
+			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedAnnot:     "synapse.gen0sec.com/config-hash",
+			expectedCMKeys:    "upstreams.yaml",
+			expectedSecretKey: "",
 		},
 		{
 			name:              "custom metrics address",
@@ -67,6 +82,10 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
+			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedAnnot:     "synapse.gen0sec.com/config-hash",
+			expectedCMKeys:    "upstreams.yaml",
+			expectedSecretKey: "",
 		},
 		{
 			name:              "custom probe address",
@@ -75,6 +94,10 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":9091",
 			expectedElect:     false,
 			expectedNamespace: "",
+			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedAnnot:     "synapse.gen0sec.com/config-hash",
+			expectedCMKeys:    "upstreams.yaml",
+			expectedSecretKey: "",
 		},
 		{
 			name:              "enable leader election",
@@ -83,6 +106,10 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     true,
 			expectedNamespace: "",
+			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedAnnot:     "synapse.gen0sec.com/config-hash",
+			expectedCMKeys:    "upstreams.yaml",
+			expectedSecretKey: "",
 		},
 		{
 			name:              "watch specific namespace",
@@ -91,14 +118,22 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "test-ns",
+			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedAnnot:     "synapse.gen0sec.com/config-hash",
+			expectedCMKeys:    "upstreams.yaml",
+			expectedSecretKey: "",
 		},
 		{
 			name:              "all flags set",
-			args:              []string{"-metrics-bind-address", ":9000", "-health-probe-bind-address", ":9001", "-leader-elect", "-namespace", "production"},
+			args:              []string{"-metrics-bind-address", ":9000", "-health-probe-bind-address", ":9001", "-leader-elect", "-namespace", "production", "-label-selector", "app=synapse", "-config-hash-annotation", "synapse.test/hash", "-ignore-configmap-keys", "upstreams.yaml,extra.yaml", "-ignore-secret-keys", "password"},
 			expectedMetrics:   ":9000",
 			expectedProbe:     ":9001",
 			expectedElect:     true,
 			expectedNamespace: "production",
+			expectedSelector:  "app=synapse",
+			expectedAnnot:     "synapse.test/hash",
+			expectedCMKeys:    "upstreams.yaml,extra.yaml",
+			expectedSecretKey: "password",
 		},
 	}
 
@@ -111,11 +146,19 @@ func TestParseFlags(t *testing.T) {
 			var probeAddr string
 			var enableLeaderElection bool
 			var watchedNamespace string
+			var selector string
+			var configHashAnnotation string
+			var ignoredConfigMapKeys string
+			var ignoredSecretKeys string
 
 			flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 			flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 			flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 			flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
+			flag.StringVar(&selector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads.")
+			flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
+			flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
+			flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
 
 			err := flag.CommandLine.Parse(tt.args)
 			require.NoError(t, err)
@@ -124,6 +167,10 @@ func TestParseFlags(t *testing.T) {
 			assert.Equal(t, tt.expectedProbe, probeAddr)
 			assert.Equal(t, tt.expectedElect, enableLeaderElection)
 			assert.Equal(t, tt.expectedNamespace, watchedNamespace)
+			assert.Equal(t, tt.expectedSelector, selector)
+			assert.Equal(t, tt.expectedAnnot, configHashAnnotation)
+			assert.Equal(t, tt.expectedCMKeys, ignoredConfigMapKeys)
+			assert.Equal(t, tt.expectedSecretKey, ignoredSecretKeys)
 		})
 	}
 }
@@ -216,4 +263,28 @@ func TestLeaderElectionID(t *testing.T) {
 	assert.NotEmpty(t, expectedID)
 	assert.Contains(t, expectedID, "synapse")
 	assert.Contains(t, expectedID, "gen0sec.com")
+}
+
+func TestParseLabelSelector(t *testing.T) {
+	selector, err := parseLabelSelector("app=synapse,release=stable")
+	require.NoError(t, err)
+	assert.True(t, selector.Matches(map[string]string{"app": "synapse", "release": "stable"}))
+	assert.False(t, selector.Matches(map[string]string{"app": "synapse"}))
+
+	selector, err = parseLabelSelector("")
+	require.NoError(t, err)
+	assert.True(t, selector.Matches(map[string]string{"anything": "goes"}))
+}
+
+func TestParseKeySet(t *testing.T) {
+	set := parseKeySet("a,b, c , ,")
+	assert.Len(t, set, 3)
+	_, ok := set["a"]
+	assert.True(t, ok)
+	_, ok = set["b"]
+	assert.True(t, ok)
+	_, ok = set["c"]
+	assert.True(t, ok)
+
+	assert.Nil(t, parseKeySet(""))
 }
