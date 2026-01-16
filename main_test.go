@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
@@ -268,12 +269,12 @@ func TestLeaderElectionID(t *testing.T) {
 func TestParseLabelSelector(t *testing.T) {
 	selector, err := parseLabelSelector("app=synapse,release=stable")
 	require.NoError(t, err)
-	assert.True(t, selector.Matches(map[string]string{"app": "synapse", "release": "stable"}))
-	assert.False(t, selector.Matches(map[string]string{"app": "synapse"}))
+	assert.True(t, selector.Matches(labels.Set{"app": "synapse", "release": "stable"}))
+	assert.False(t, selector.Matches(labels.Set{"app": "synapse"}))
 
 	selector, err = parseLabelSelector("")
 	require.NoError(t, err)
-	assert.True(t, selector.Matches(map[string]string{"anything": "goes"}))
+	assert.True(t, selector.Matches(labels.Set{"anything": "goes"}))
 }
 
 func TestParseKeySet(t *testing.T) {
