@@ -1,4 +1,4 @@
-module moat-operator
+module synapse-operator
 
 go 1.24.0
 
