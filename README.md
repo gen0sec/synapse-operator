@@ -1,18 +1,18 @@
-![Arxignis logo](./images/logo.png)
+![Gen0Sec logo](./images/logo.svg)
 
 <p align="center">
-  <a href="https://github.com/arxignis/synapse-operator/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache 2-green" alt="License - Apache 2"></a> &nbsp;
-  <a href="https://github.com/arxignis/synapse-operator/actions?query=branch%3Amain"><img src="https://github.com/arxignis/synapse-operator/actions/workflows/release.yaml/badge.svg" alt="CI Build"></a> &nbsp;
-  <a href="https://github.com/arxignis/synapse-operator/releases"><img src="https://img.shields.io/github/release/arxignis/synapse-operator.svg?label=Release" alt="Release"></a> &nbsp;
-  <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/arxignis/synapse-operator/total"> &nbsp;
-  <a href="https://docs.arxignis.com/"><img alt="Static Badge" src="https://img.shields.io/badge/arxignis-documentation-page?style=flat&link=https%3A%2F%2Fdocs.arxignis.com%2F"></a> &nbsp;
+  <a href="https://github.com/gen0sec/synapse-operator/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache 2-green" alt="License - Apache 2"></a> &nbsp;
+  <a href="https://github.com/gen0sec/synapse-operator/actions?query=branch%3Amain"><img src="https://github.com/gen0sec/synapse-operator/actions/workflows/release.yaml/badge.svg" alt="CI Build"></a> &nbsp;
+  <a href="https://github.com/gen0sec/synapse-operator/releases"><img src="https://img.shields.io/github/release/gen0sec/synapse-operator.svg?label=Release" alt="Release"></a> &nbsp;
+  <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/gen0sec/synapse-operator/total"> &nbsp;
+  <a href="https://docs.gen0sec.com/"><img alt="Static Badge" src="https://img.shields.io/badge/gen0sec-documentation-page?style=flat&link=https%3A%2F%2Fdocs.gen0sec.com%2F"></a> &nbsp;
   <a href="https://discord.gg/jzsW5Q6s9q"><img src="https://img.shields.io/discord/1377189913849757726?label=Discord" alt="Discord"></a> &nbsp;
-  <a href="https://x.com/arxignis"><img src="https://img.shields.io/twitter/follow/arxignis?style=flat" alt="X (formerly Twitter) Follow" /> </a>
+  <a href="https://x.com/gen0sec"><img src="https://img.shields.io/twitter/follow/gen0sec?style=flat" alt="X (formerly Twitter) Follow" /> </a>
 </p>
 
 # Community
 [![Join us on Discord](https://img.shields.io/badge/Join%20Us%20on-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/jzsW5Q6s9q)
-[![Substack](https://img.shields.io/badge/Substack-FF6719?logo=substack&logoColor=fff)](https://arxignis.substack.com/)
+[![Substack](https://img.shields.io/badge/Substack-FF6719?logo=substack&logoColor=fff)](https://gen0sec.substack.com/)
 
 
 ## Synapse Operator (Go)
@@ -49,14 +49,31 @@ kubectl apply -k config
 ```
 This creates the `synapse-system` namespace, service account, RBAC, and a single replica of the operator.
 
-### Testing From WSL (no commands executed yet)
-1. **Prepare tools** - ensure WSL has `docker`, `kubectl`, and `kind` (or `minikube`) installed and on `$PATH`.
+### Testing From WSL
+1. **Prepare tools** - ensure WSL has `docker`, `kubectl`, `kind`, and `helm` installed and on `$PATH`.
 2. **Build & load the image** - inside WSL build the Linux image and use `kind load docker-image ghcr.io/<org>/synapse-operator:latest` (or push to a registry reachable by your cluster).
 3. **Create a test cluster** - `kind create cluster --name synapse`.
-4. **Deploy Synapse via Helm** - from `synapse-main/helm`, run `helm install synapse ./helm --namespace synapse --create-namespace`. This produces the ConfigMap and workloads with the expected labels.
-5. **Apply the operator manifests** - `kubectl apply -k ../synapse-operator/config`.
-6. **Trigger a config change** - edit the Synapse ConfigMap (`kubectl edit configmap synapse -n synapse`) or use `kubectl patch`.
-7. **Verify restart** - watch the rollout: `kubectl rollout status deployment/synapse -n synapse` and ensure pod annotation `synapse.gen0sec.com/config-hash` updates.
+4. **Deploy Synapse via Helm** - use the public chart repo:
+   ```bash
+   helm repo add gen0sec https://helm.gen0sec.com
+   helm repo update
+   export ARX_KEY="REPLACE_ME"
+   helm upgrade --install synapse-stack gen0sec/synapse-stack \
+     -n synapse --create-namespace \
+     --set global.namespaces.synapse="synapse" \
+     --set global.namespaces.operator="synapse-system" \
+     --set synapse.image.repository="ghcr.io/gen0sec/synapse" \
+     --set synapse.image.tag="latest" \
+     --set synapse.synapse.server.upstream="http://example.com" \
+     --set synapse.synapse.network.disableXdp=true \
+     --set synapse.synapse.arxignis.apiKey="$ARX_KEY" \
+     --set operator.enabled=true \
+     --set operator.image.repository="ghcr.io/<org>/synapse-operator" \
+     --set operator.image.tag="latest"
+   ```
+5. **Apply/verify operator** - if the chart already deployed the operator, check it with `kubectl -n synapse-system rollout status deployment/synapse-operator`.
+6. **Trigger a config change** - edit the Synapse ConfigMap (`kubectl edit configmap synapse-stack -n synapse`) or use `kubectl patch`.
+7. **Verify restart** - watch the rollout: `kubectl rollout status deployment/synapse-stack -n synapse` and ensure pod annotation `synapse.gen0sec.com/config-hash` updates.
 
 ### Helm Integration Notes
 The Helm chart already labels both the ConfigMap and workloads with `app.kubernetes.io/name=synapse`. The operator leans on that selector to discover which objects belong together. When Helm updates config sources (e.g., via `helm upgrade`), the operator sees the new data, recalculates the hash, and patches the workloads so the change propagates without any manual restarts.
