@@ -90,10 +90,17 @@ func newRenderModel() *renderModel {
 }
 
 // addRoute records host/path → servers with the object's annotation
-// settings (and any per-route extras from Gateway filters/weights).
-func (m *renderModel) addRoute(host, path string, servers []backend, a annSettings, extraReq, extraResp []string) {
+// settings. FIRST-WRITER-WINS: if (host,path) is already set it is
+// NOT overwritten; returns false so the caller can log a deterministic
+// conflict (sources are iterated in a stable order — Ingresses, then
+// HTTPRoutes, each sorted by namespace/name — so Ingress beats Gateway
+// and the result is reproducible regardless of informer ordering).
+func (m *renderModel) addRoute(host, path string, servers []backend, a annSettings, extraReq, extraResp []string) bool {
 	if m.hosts[host] == nil {
 		m.hosts[host] = map[string]*routeCfg{}
+	}
+	if _, exists := m.hosts[host][path]; exists {
+		return false
 	}
 	rc := &routeCfg{
 		servers:          servers,
@@ -113,6 +120,7 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 	if a.sticky {
 		m.sticky = true
 	}
+	return true
 }
 
 func parseBool(s string) *bool {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -42,10 +43,16 @@ type IngressReconciler struct {
 	// Ingress from the issuer's http01.ingress.ingressClassName.
 	IngressClassName string
 	// UpstreamsOutPath: where the rendered legacy upstreams.yaml is
-	// written in place (the shared emptyDir synapse inotify-reloads).
+	// atomically written (the shared emptyDir synapse reads).
 	UpstreamsOutPath string
 	// ClusterDomain for backend FQDNs (default cluster.local).
 	ClusterDomain string
+	// SignalReload: after a changed render, SIGHUP the co-located
+	// synapse process to deterministically trigger an upstreams
+	// re-read (requires the pod's shareProcessNamespace:true). Set
+	// for the long-running sidecar; off for the --render-once
+	// initContainer (synapse isn't running yet).
+	SignalReload bool
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
 	// API CRDs to be installed.
@@ -93,7 +100,21 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	// acme-challenge/* -> (empty) internal ACME server` matched BEFORE
 	// host `upstreams:` routes; cert-manager's ephemeral solver lands
 	// there. Per-Ingress annotations configure upstream settings.
+	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
+
+	// Deterministic source order: Ingresses sorted by ns/name and
+	// processed BEFORE HTTPRoutes (first-writer-wins in addRoute), so
+	// the rendered config is reproducible regardless of informer
+	// ordering and Ingress beats Gateway on a host+path conflict.
+	sort.Slice(list.Items, func(i, j int) bool {
+		a, b := &list.Items[i], &list.Items[j]
+		if a.Namespace != b.Namespace {
+			return a.Namespace < b.Namespace
+		}
+		return a.Name < b.Name
+	})
+
 	matched := 0
 	for i := range list.Items {
 		ing := &list.Items[i]
@@ -120,10 +141,15 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 					path = "/"
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
-					m.acme = addr
+					if m.acme == "" {
+						m.acme = addr
+					}
 					continue
 				}
-				m.addRoute(host, path, []backend{{addr: addr}}, a, nil, nil)
+				if !m.addRoute(host, path, []backend{{addr: addr}}, a, nil, nil) {
+					logger.Info("route conflict ignored (first-writer-wins)",
+						"host", host, "path", path, "ingress", ing.Namespace+"/"+ing.Name)
+				}
 			}
 		}
 	}
@@ -136,6 +162,9 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	changed, err := writeIfChanged(r.UpstreamsOutPath, yaml)
 	if err != nil {
 		return false, matched, len(m.hosts), fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
+	}
+	if changed && r.SignalReload {
+		r.signalReload(ctx)
 	}
 	return changed, matched, len(m.hosts), nil
 }
@@ -180,13 +209,12 @@ func (r *IngressReconciler) backendAddr(ctx context.Context, ns string, b networ
 // cert-manager's solver Ingress uses /.well-known/acme-challenge/<token>.
 const acmeChallengePrefix = "/.well-known/acme-challenge"
 
-// writeIfChanged writes IN PLACE (truncate same inode), NOT via
-// tmp+rename. synapse's upstreams filewatch only reloads on inotify
-// Modify(Data)/Create/Remove and IGNORES move/rename events, so an
-// atomic rename would never trigger a hot-reload. An in-place
-// truncate-write emits IN_MODIFY → Modify(Data) → synapse reloads.
-// (A torn mid-write read is self-correcting: synapse debounces ~2s
-// and re-reads on the next event.)
+// writeIfChanged writes ATOMICALLY (tmp file in the same dir +
+// rename), so a concurrent synapse read can never observe a torn or
+// empty file. The reload itself is driven explicitly by SIGHUP (see
+// signalReload) — NOT by synapse's inotify filewatch — so the fact
+// that synapse ignores rename/move events is irrelevant here; SIGHUP
+// makes the upstreams re-read deterministic and debounce-free.
 func writeIfChanged(path, content string) (bool, error) {
 	if cur, err := os.ReadFile(path); err == nil && string(cur) == content {
 		return false, nil
@@ -194,7 +222,12 @@ func writeIfChanged(path, content string) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return false, err
 	}
 	return true, nil

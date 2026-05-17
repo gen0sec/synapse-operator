@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -76,6 +77,15 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 	if err := r.List(ctx, &rtList); err != nil {
 		return 0
 	}
+	// Deterministic order so first-writer-wins is reproducible across
+	// reconciles regardless of informer ordering.
+	sort.Slice(rtList.Items, func(i, j int) bool {
+		a, b := &rtList.Items[i], &rtList.Items[j]
+		if a.Namespace != b.Namespace {
+			return a.Namespace < b.Namespace
+		}
+		return a.Name < b.Name
+	})
 	matched := 0
 	for i := range rtList.Items {
 		rt := &rtList.Items[i]
@@ -125,10 +135,15 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				for _, h := range hostnames {
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
-						m.acme = servers[0].addr
+						if m.acme == "" {
+							m.acme = servers[0].addr
+						}
 						continue
 					}
-					m.addRoute(host, path, servers, a, req, resp)
+					if !m.addRoute(host, path, servers, a, req, resp) {
+						logger.Info("route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
+							"host", host, "path", path, "httproute", rt.Namespace+"/"+rt.Name)
+					}
 				}
 			}
 		}

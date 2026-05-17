@@ -221,6 +221,86 @@ func TestRender_IngressACMESolverAndAnnotation(t *testing.T) {
 	}
 }
 
+// Fix #1: addRoute is first-writer-wins (no clobber) + reports conflict.
+func TestAddRoute_FirstWriterWins(t *testing.T) {
+	m := newRenderModel()
+	if !m.addRoute("h", "/", []backend{{addr: "first:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("first addRoute must succeed")
+	}
+	if m.addRoute("h", "/", []backend{{addr: "second:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("duplicate (host,path) must report conflict (false)")
+	}
+	if m.hosts["h"]["/"].servers[0].addr != "first:80" {
+		t.Fatalf("first writer must be kept, got %v", m.hosts["h"]["/"].servers)
+	}
+}
+
+// Fix #1: two Ingresses for the same host+path → deterministic
+// (ns/name-sorted, first kept) regardless of input order.
+func TestRender_DeterministicConflict(t *testing.T) {
+	mk := func(name, svc string) *networkingv1.Ingress {
+		i := &networkingv1.Ingress{}
+		i.Name, i.Namespace = name, "default"
+		i.Spec.IngressClassName = ptr("synapse")
+		i.Spec.Rules = []networkingv1.IngressRule{{Host: "h.example.com",
+			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: svc, Port: networkingv1.ServiceBackendPort{Number: 80}}}}}}}}}
+		return i
+	}
+	run := func(order ...*networkingv1.Ingress) string {
+		out := filepath.Join(t.TempDir(), "u.yaml")
+		c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+			WithObjects(order[0], order[1]).Build()
+		r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local"}
+		if _, _, _, err := r.render(context.Background()); err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		b, _ := os.ReadFile(out)
+		return string(b)
+	}
+	a, b := mk("a-ing", "svc-a"), mk("b-ing", "svc-b")
+	// "a-ing" sorts first → svc-a wins, both input orders identical.
+	o1, o2 := run(a, b), run(b, a)
+	if o1 != o2 {
+		t.Fatalf("non-deterministic across input order:\n--o1--\n%s\n--o2--\n%s", o1, o2)
+	}
+	if !strings.Contains(o1, "svc-a.default.svc.cluster.local:80") ||
+		strings.Contains(o1, "svc-b.default.svc.cluster.local:80") {
+		t.Fatalf("ns/name-first (a-ing/svc-a) must win:\n%s", o1)
+	}
+}
+
+// Fix #2: findReloadTargets identifies the synapse process (argv0
+// basename "synapse"), skips self and the operator (basename
+// "manager").
+func TestFindReloadTargets(t *testing.T) {
+	proc := t.TempDir()
+	mk := func(pid, cmdline string) {
+		d := filepath.Join(proc, pid)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "cmdline"), []byte(cmdline), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("10", "/synapse\x00--config=/etc/synapse/config.yaml\x00--mode=proxy\x00")
+	mk("11", "/manager\x00--ingress-mode\x00--gateway-api\x00") // operator → skip
+	mk("12", "/pause\x00")                                      // skip
+	mk("13", "")                                                // empty → skip
+	if err := os.MkdirAll(filepath.Join(proc, "notapid"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := findReloadTargets(proc, 99 /*self*/)
+	if len(got) != 1 || got[0] != 10 {
+		t.Fatalf("expected [10] (synapse), got %v", got)
+	}
+	if r := findReloadTargets(proc, 10 /*self==synapse*/); len(r) != 0 {
+		t.Fatalf("must skip self pid: %v", r)
+	}
+}
+
 func TestRender_IgnoresForeignClass(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "upstreams.yaml")
 	ing := &networkingv1.Ingress{}

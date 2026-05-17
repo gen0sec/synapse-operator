@@ -139,6 +139,7 @@ func main() {
 			UpstreamsOutPath: upstreamsOut,
 			ClusterDomain:    clusterDomain,
 			GatewayAPI:       gatewayAPI,
+			SignalReload:     true,
 		}
 		if err = ir.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Ingress")
