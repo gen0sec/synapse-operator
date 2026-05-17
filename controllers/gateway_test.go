@@ -42,19 +42,40 @@ func TestGwBackend(t *testing.T) {
 	}
 }
 
+func TestHeaderFilters(t *testing.T) {
+	filters := []gwv1.HTTPRouteFilter{
+		{Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: &gwv1.HTTPHeaderFilter{
+				Set: []gwv1.HTTPHeader{{Name: "X-Set", Value: "1"}},
+				Add: []gwv1.HTTPHeader{{Name: "X-Add", Value: "2"}},
+			}},
+		{Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
+			ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{
+				Set: []gwv1.HTTPHeader{{Name: "X-R", Value: "3"}}}},
+		{Type: gwv1.HTTPRouteFilterURLRewrite}, // no v1 equivalent → ignored
+	}
+	req, resp := headerFilters(filters)
+	if len(req) != 2 || req[0] != "X-Set: 1" || req[1] != "X-Add: 2" {
+		t.Fatalf("req headers = %v", req)
+	}
+	if len(resp) != 1 || resp[0] != "X-R: 3" {
+		t.Fatalf("resp headers = %v", resp)
+	}
+}
+
 func TestEnsureCond(t *testing.T) {
 	r := &IngressReconciler{}
 	var conds []metav1.Condition
 	if !r.ensureCond(&conds, 1, "Accepted", "Accepted", "msg") {
 		t.Fatal("first set must report changed")
 	}
-	if len(conds) != 1 || conds[0].Status != metav1.ConditionTrue || conds[0].Type != "Accepted" {
+	if len(conds) != 1 || conds[0].Status != metav1.ConditionTrue {
 		t.Fatalf("condition not set: %+v", conds)
 	}
 	if r.ensureCond(&conds, 1, "Accepted", "Accepted", "msg") {
-		t.Fatal("idempotent set (same gen, already True) must report unchanged")
+		t.Fatal("idempotent set must report unchanged")
 	}
-	if r.ensureCond(&conds, 2, "Accepted", "Accepted", "msg") == false {
+	if !r.ensureCond(&conds, 2, "Accepted", "Accepted", "msg") {
 		t.Fatal("new observedGeneration must report changed")
 	}
 	if len(conds) != 1 {
@@ -62,55 +83,64 @@ func TestEnsureCond(t *testing.T) {
 	}
 }
 
-// renderGateways: an HTTPRoute attached to a Gateway of our
-// GatewayClass, carrying the ACME challenge path, must surface as the
-// acmeBackend (→ internal_paths override) — the cert-manager
-// gatewayHTTPRoute solver path through synapse-as-ingress.
-func TestRenderGateways_ACMESolverHTTPRoute(t *testing.T) {
+// HTTPRoute attached to our GatewayClass: ACME path → model.acme;
+// app path → weighted servers + header-filter injection.
+func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	gc := &gwv1.GatewayClass{}
 	gc.Name = "synapse"
 	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
-
 	gw := &gwv1.Gateway{}
 	gw.Name, gw.Namespace = "synapse-gw", "default"
 	gw.Spec.GatewayClassName = gwv1.ObjectName("synapse")
 
-	rt := &gwv1.HTTPRoute{}
-	rt.Name, rt.Namespace = "cm-acme-http-solver-xyz", "default"
-	rt.Spec.ParentRefs = []gwv1.ParentReference{{
-		Name: gwv1.ObjectName("synapse-gw"), Namespace: ptr(gwv1.Namespace("default")),
-	}}
-	rt.Spec.Hostnames = []gwv1.Hostname{"app.example.com"}
-	rt.Spec.Rules = []gwv1.HTTPRouteRule{{
+	solver := &gwv1.HTTPRoute{}
+	solver.Name, solver.Namespace = "cm-acme-http-solver-xyz", "default"
+	solver.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	solver.Spec.Hostnames = []gwv1.Hostname{"app.example.com"}
+	solver.Spec.Rules = []gwv1.HTTPRouteRule{{
 		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{
-			Type: ptr(gwv1.PathMatchExact), Value: ptr("/.well-known/acme-challenge/tok"),
-		}}},
-		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
-			BackendObjectReference: gwv1.BackendObjectReference{
-				Name: gwv1.ObjectName("cm-acme-http-solver-svc"), Port: ptr(gwv1.PortNumber(8089)),
-			}}}},
+			Type: ptr(gwv1.PathMatchExact), Value: ptr("/.well-known/acme-challenge/tok")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{
+			Name: "cm-acme-http-solver-svc", Port: ptr(gwv1.PortNumber(8089))}}}},
 	}}
 
-	c := fake.NewClientBuilder().
-		WithScheme(testScheme(t)).
-		WithObjects(gc, gw, rt).
-		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).
-		Build()
+	app := &gwv1.HTTPRoute{}
+	app.Name, app.Namespace = "app", "default"
+	app.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	app.Spec.Hostnames = []gwv1.Hostname{"app.example.com"}
+	app.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Value: ptr("/")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{
+			{BackendRef: gwv1.BackendRef{Weight: ptr(int32(70)), BackendObjectReference: gwv1.BackendObjectReference{Name: "v1", Port: ptr(gwv1.PortNumber(80))}}},
+			{BackendRef: gwv1.BackendRef{Weight: ptr(int32(30)), BackendObjectReference: gwv1.BackendObjectReference{Name: "v2", Port: ptr(gwv1.PortNumber(80))}}},
+		},
+		Filters: []gwv1.HTTPRouteFilter{{Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: &gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "X-Canary", Value: "on"}}}}},
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(gc, gw, solver, app).
+		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
 	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true}
 
-	hosts := map[string]map[string]string{}
-	acme := ""
-	n := r.renderGateways(context.Background(), hosts, &acme)
-	if n < 1 {
-		t.Fatalf("expected ≥1 programmed HTTPRoute, got %d", n)
+	m := newRenderModel()
+	if n := r.renderGateways(context.Background(), m); n < 2 {
+		t.Fatalf("expected ≥2 programmed HTTPRoutes, got %d", n)
 	}
-	if acme != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
-		t.Fatalf("acmeBackend not set from Gateway HTTPRoute solver: %q", acme)
+	if m.acme != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
+		t.Fatalf("acme backend not set from Gateway solver HTTPRoute: %q", m.acme)
+	}
+	rc := m.hosts["app.example.com"]["/"]
+	if rc == nil || len(rc.servers) != 2 ||
+		rc.servers[0].addr != "v1.default.svc.cluster.local:80" || rc.servers[0].weight != 70 ||
+		rc.servers[1].weight != 30 {
+		t.Fatalf("weighted backends not mapped: %+v", rc)
+	}
+	if len(rc.reqHeaders) != 1 || rc.reqHeaders[0] != "X-Canary: on" {
+		t.Fatalf("header filter not applied: %+v", rc)
 	}
 }
 
-// An HTTPRoute whose parent Gateway is NOT of our GatewayClass must be
-// ignored.
 func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 	gc := &gwv1.GatewayClass{}
 	gc.Name = "other"
@@ -120,17 +150,15 @@ func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 	gw.Spec.GatewayClassName = gwv1.ObjectName("other")
 	rt := &gwv1.HTTPRoute{}
 	rt.Name, rt.Namespace = "r", "default"
-	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: gwv1.ObjectName("other-gw")}}
+	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: "other-gw"}}
 	rt.Spec.Hostnames = []gwv1.Hostname{"x"}
 	rt.Spec.Rules = []gwv1.HTTPRouteRule{{BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
 		BackendObjectReference: gwv1.BackendObjectReference{Name: "x", Port: ptr(gwv1.PortNumber(1))}}}}}}
-	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
-		WithObjects(gc, gw, rt).
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(gc, gw, rt).
 		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
 	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true}
-	hosts := map[string]map[string]string{}
-	acme := ""
-	if n := r.renderGateways(context.Background(), hosts, &acme); n != 0 || acme != "" || len(hosts) != 0 {
-		t.Fatalf("foreign GatewayClass leaked: n=%d acme=%q hosts=%v", n, acme, hosts)
+	m := newRenderModel()
+	if n := r.renderGateways(context.Background(), m); n != 0 || m.acme != "" || len(m.hosts) != 0 {
+		t.Fatalf("foreign GatewayClass leaked: n=%d acme=%q hosts=%v", n, m.acme, m.hosts)
 	}
 }

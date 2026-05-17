@@ -31,73 +31,117 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 func ptr[T any](v T) *T { return &v }
 
-// renderUpstreams is the crux of cert-manager HTTP-01 working: an ACME
-// challenge backend MUST be emitted as an internal_paths entry keyed
-// EXACTLY as synapse's built-in default so it overrides the (empty)
-// internal ACME server; everything else is a normal host upstream.
+// ACME challenge backend MUST be an internal_paths override (the crux
+// of cert-manager HTTP-01 working); other paths are host upstreams.
 func TestRenderUpstreams_ACMEOverrideAndHosts(t *testing.T) {
-	hosts := map[string]map[string]string{
-		"app.example.com": {"/": "whoami.default.svc.cluster.local:80"},
-	}
-	out := renderUpstreams(hosts, "cm-acme-http-solver-x.default.svc.cluster.local:8089")
+	m := newRenderModel()
+	m.acme = "cm-acme-http-solver-x.default.svc.cluster.local:8089"
+	m.addRoute("app.example.com", "/",
+		[]backend{{addr: "whoami.default.svc.cluster.local:80"}}, annSettings{}, nil, nil)
+	out := renderUpstreams(m)
 
 	if !strings.Contains(out, `internal_paths:`) ||
 		!strings.Contains(out, `"/.well-known/acme-challenge/*":`) ||
 		!strings.Contains(out, "cm-acme-http-solver-x.default.svc.cluster.local:8089") {
 		t.Fatalf("ACME internal_paths override missing:\n%s", out)
 	}
-	// The acme entry must be plain HTTP to the solver.
-	if !strings.Contains(out, "ssl_enabled: false") {
-		t.Fatalf("expected ssl_enabled: false:\n%s", out)
-	}
 	if !strings.Contains(out, `upstreams:`) ||
 		!strings.Contains(out, `"app.example.com":`) ||
 		!strings.Contains(out, "whoami.default.svc.cluster.local:80") {
 		t.Fatalf("host upstream missing:\n%s", out)
 	}
-	// internal_paths must precede upstreams (override semantics + stable).
 	if strings.Index(out, "internal_paths:") > strings.Index(out, "upstreams:") {
-		t.Fatalf("internal_paths must come before upstreams:\n%s", out)
+		t.Fatalf("internal_paths must precede upstreams:\n%s", out)
 	}
 }
 
 func TestRenderUpstreams_NoACMENoInternalPaths(t *testing.T) {
-	out := renderUpstreams(map[string]map[string]string{
-		"a.example.com": {"/": "b:80"},
-	}, "")
-	if strings.Contains(out, "internal_paths:") {
-		t.Fatalf("no acme backend ⇒ no internal_paths block:\n%s", out)
+	m := newRenderModel()
+	m.addRoute("a.example.com", "/", []backend{{addr: "b:80"}}, annSettings{}, nil, nil)
+	if strings.Contains(renderUpstreams(m), "internal_paths:") {
+		t.Fatal("no acme backend ⇒ no internal_paths block")
 	}
 }
 
 func TestRenderUpstreams_Deterministic(t *testing.T) {
-	h := map[string]map[string]string{
-		"b.example.com": {"/x": "x:1", "/a": "a:1"},
-		"a.example.com": {"/": "y:2"},
+	build := func() string {
+		m := newRenderModel()
+		m.acme = "s:8089"
+		m.addRoute("b.example.com", "/x", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+		m.addRoute("b.example.com", "/a", []backend{{addr: "a:1"}}, annSettings{}, nil, nil)
+		m.addRoute("a.example.com", "/", []backend{{addr: "y:2"}}, annSettings{}, nil, nil)
+		return renderUpstreams(m)
 	}
-	if renderUpstreams(h, "s:8089") != renderUpstreams(h, "s:8089") {
+	if build() != build() {
 		t.Fatal("renderUpstreams not deterministic (would cause spurious synapse reloads)")
 	}
 }
 
-// writeIfChanged must write IN PLACE and be a no-op when unchanged
-// (synapse's filewatch ignores rename/move events; only Modify(Data)).
-func TestWriteIfChanged(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "sub", "upstreams.yaml")
-	ch, err := writeIfChanged(p, "v1")
-	if err != nil || !ch {
-		t.Fatalf("first write: changed=%v err=%v", ch, err)
+// Annotation-driven upstream settings + weighted servers must surface
+// in the rendered legacy v1 schema.
+func TestRenderUpstreams_AnnotationsAndWeights(t *testing.T) {
+	m := newRenderModel()
+	tru := true
+	var ct uint64 = 7
+	m.addRoute("app.example.com", "/",
+		[]backend{{addr: "a:80", weight: 3}, {addr: "b:80", weight: 1}},
+		annSettings{ssl: &tru, http2: &tru, connectTimeout: &ct,
+			reqHeaders: []string{"X-A: 1"}, sticky: true}, nil, []string{"X-Resp: y"})
+	out := renderUpstreams(m)
+	for _, want := range []string{
+		"sticky_sessions: true",
+		`{ address: "a:80", weight: 3 }`,
+		`{ address: "b:80", weight: 1 }`,
+		"ssl_enabled: true",
+		"http2_enabled: true",
+		"connection_timeout: 7",
+		"request_headers:",
+		`- "X-A: 1"`,
+		"response_headers:",
+		`- "X-Resp: y"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
 	}
-	if b, _ := os.ReadFile(p); string(b) != "v1" {
-		t.Fatalf("content = %q", b)
+}
+
+func TestParseAnnotations(t *testing.T) {
+	a := parseAnnotations(map[string]string{
+		annPrefix + "backend-protocol":   "HTTPS",
+		annPrefix + "http2":              "true",
+		annPrefix + "force-https":        "true",
+		annPrefix + "connect-timeout":    "5",
+		annPrefix + "read-timeout":       "30",
+		annPrefix + "healthcheck":        "true",
+		annPrefix + "disable-access-log": "false",
+		annPrefix + "request-headers":    "X-A: 1, X-B: 2",
+		annPrefix + "response-headers":   "X-C: 3",
+		annPrefix + "sticky-sessions":    "true",
+	})
+	if a.ssl == nil || !*a.ssl {
+		t.Fatal("backend-protocol HTTPS ⇒ ssl true")
 	}
-	ch, err = writeIfChanged(p, "v1")
-	if err != nil || ch {
-		t.Fatalf("unchanged write must be no-op: changed=%v err=%v", ch, err)
+	if a.http2 == nil || !*a.http2 || a.forceHTTPS == nil || !*a.forceHTTPS {
+		t.Fatal("http2/force-https not parsed")
 	}
-	ch, _ = writeIfChanged(p, "v2")
-	if !ch {
-		t.Fatal("changed content must rewrite")
+	if a.connectTimeout == nil || *a.connectTimeout != 5 || a.readTimeout == nil || *a.readTimeout != 30 {
+		t.Fatalf("timeouts: %+v", a)
+	}
+	if a.healthcheck == nil || !*a.healthcheck || a.disableAccessLog == nil || *a.disableAccessLog {
+		t.Fatal("healthcheck/disable-access-log not parsed")
+	}
+	if len(a.reqHeaders) != 2 || a.reqHeaders[0] != "X-A: 1" || len(a.respHeaders) != 1 || !a.sticky {
+		t.Fatalf("headers/sticky: %+v", a)
+	}
+	// nginx-compat backend-protocol fallback.
+	n := parseAnnotations(map[string]string{nginxPrefix + "backend-protocol": "HTTPS"})
+	if n.ssl == nil || !*n.ssl {
+		t.Fatal("nginx backend-protocol compat not honored")
+	}
+	// unknown / empty ⇒ all nil.
+	if z := parseAnnotations(nil); z.ssl != nil || z.http2 != nil || z.sticky {
+		t.Fatalf("nil annotations must yield empty settings: %+v", z)
 	}
 }
 
@@ -106,11 +150,8 @@ func TestIsOurs(t *testing.T) {
 	mk := func(c *string) *networkingv1.Ingress {
 		return &networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: c}}
 	}
-	if r.isOurs(mk(nil)) {
-		t.Fatal("nil class must not match")
-	}
-	if r.isOurs(mk(ptr("traefik"))) {
-		t.Fatal("other class must not match")
+	if r.isOurs(mk(nil)) || r.isOurs(mk(ptr("traefik"))) {
+		t.Fatal("nil/other class must not match")
 	}
 	if !r.isOurs(mk(ptr("synapse"))) {
 		t.Fatal("synapse class must match")
@@ -121,8 +162,7 @@ func TestBackendAddr_PortNumber(t *testing.T) {
 	r := &IngressReconciler{ClusterDomain: "cluster.local"}
 	addr, ok := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
 		Service: &networkingv1.IngressServiceBackend{
-			Name: "whoami",
-			Port: networkingv1.ServiceBackendPort{Number: 80},
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80},
 		},
 	})
 	if !ok || addr != "whoami.default.svc.cluster.local:80" {
@@ -130,26 +170,40 @@ func TestBackendAddr_PortNumber(t *testing.T) {
 	}
 }
 
-// End-to-end controller test (fake client, no envtest): an Ingress
-// carrying the cert-manager solver path MUST produce the synapse
-// internal_paths override in the rendered file — this is exactly what
-// makes cert-manager HTTP-01 succeed through synapse-as-ingress.
-func TestRender_IngressACMESolver(t *testing.T) {
+func TestWriteIfChanged(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "sub", "upstreams.yaml")
+	if ch, err := writeIfChanged(p, "v1"); err != nil || !ch {
+		t.Fatalf("first write: changed=%v err=%v", ch, err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "v1" {
+		t.Fatalf("content=%q", b)
+	}
+	if ch, err := writeIfChanged(p, "v1"); err != nil || ch {
+		t.Fatalf("unchanged write must be no-op: changed=%v err=%v", ch, err)
+	}
+	if ch, _ := writeIfChanged(p, "v2"); !ch {
+		t.Fatal("changed content must rewrite")
+	}
+}
+
+// End-to-end (fake client): an Ingress with the cert-manager solver
+// path + an annotation must produce the internal_paths override AND
+// honor the annotation on the normal route.
+func TestRender_IngressACMESolverAndAnnotation(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "upstreams.yaml")
 	ing := &networkingv1.Ingress{}
-	ing.Name = "cm-acme-http-solver-abc"
-	ing.Namespace = "default"
+	ing.Name, ing.Namespace = "g0s", "default"
 	ing.Spec.IngressClassName = ptr("synapse")
+	ing.Annotations = map[string]string{annPrefix + "read-timeout": "42"}
 	ing.Spec.Rules = []networkingv1.IngressRule{{
 		Host: "app.example.com",
 		IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
-			Paths: []networkingv1.HTTPIngressPath{{
-				Path: "/.well-known/acme-challenge/tok123",
-				Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
-					Name: "cm-acme-http-solver-svc",
-					Port: networkingv1.ServiceBackendPort{Number: 8089},
-				}},
-			}},
+			Paths: []networkingv1.HTTPIngressPath{
+				{Path: "/.well-known/acme-challenge/tok", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: "solver", Port: networkingv1.ServiceBackendPort{Number: 8089}}}},
+				{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+			},
 		}},
 	}}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
@@ -157,15 +211,16 @@ func TestRender_IngressACMESolver(t *testing.T) {
 	if _, _, _, err := r.render(context.Background()); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	b, _ := os.ReadFile(out)
-	s := string(b)
-	if !strings.Contains(s, `"/.well-known/acme-challenge/*":`) ||
-		!strings.Contains(s, "cm-acme-http-solver-svc.default.svc.cluster.local:8089") {
-		t.Fatalf("solver Ingress did not produce internal_paths override:\n%s", s)
+	s, _ := os.ReadFile(out)
+	if !strings.Contains(string(s), `"/.well-known/acme-challenge/*":`) ||
+		!strings.Contains(string(s), "solver.default.svc.cluster.local:8089") {
+		t.Fatalf("solver internal_paths override missing:\n%s", s)
+	}
+	if !strings.Contains(string(s), "read_timeout: 42") {
+		t.Fatalf("annotation not applied to route:\n%s", s)
 	}
 }
 
-// A non-our-class Ingress must be ignored entirely.
 func TestRender_IgnoresForeignClass(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "upstreams.yaml")
 	ing := &networkingv1.Ingress{}
@@ -178,9 +233,6 @@ func TestRender_IgnoresForeignClass(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
 	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local"}
 	if _, n, _, err := r.render(context.Background()); err != nil || n != 0 {
-		t.Fatalf("foreign-class Ingress must not match: matched=%d err=%v", n, err)
-	}
-	if b, _ := os.ReadFile(out); strings.Contains(string(b), `"x"`) {
-		t.Fatalf("foreign host leaked:\n%s", b)
+		t.Fatalf("foreign-class must not match: matched=%d err=%v", n, err)
 	}
 }

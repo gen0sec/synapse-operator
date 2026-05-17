@@ -25,7 +25,7 @@ const ControllerName = "gen0sec.com/synapse"
 //
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gatewayclasses;gateways;httproutes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gatewayclasses/status;gateways/status;httproutes/status,verbs=get;update;patch
-func (r *IngressReconciler) renderGateways(ctx context.Context, hosts map[string]map[string]string, acmeBackend *string) int {
+func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) int {
 	logger := ctrl.LoggerFrom(ctx).WithName("gateway")
 
 	// GatewayClasses we control → mark Accepted.
@@ -98,26 +98,37 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, hosts map[string
 			continue
 		}
 		matched++
+		a := parseAnnotations(rt.Annotations)
+		if a.sticky {
+			m.sticky = true
+		}
 		hostnames := rt.Spec.Hostnames
 		for _, rule := range rt.Spec.Rules {
+			// All backendRefs in a rule → weighted server pool.
+			var servers []backend
 			for _, br := range rule.BackendRefs {
-				backend, ok := r.gwBackend(rt.Namespace, br)
+				addr, ok := r.gwBackend(rt.Namespace, br)
 				if !ok {
 					continue
 				}
-				paths := rulePaths(rule)
+				var w uint32
+				if br.Weight != nil && *br.Weight > 0 {
+					w = uint32(*br.Weight)
+				}
+				servers = append(servers, backend{addr: addr, weight: w})
+			}
+			if len(servers) == 0 {
+				continue
+			}
+			req, resp := headerFilters(rule.Filters)
+			for _, path := range rulePaths(rule) {
 				for _, h := range hostnames {
 					host := string(h)
-					for _, path := range paths {
-						if strings.HasPrefix(path, acmeChallengePrefix) {
-							*acmeBackend = backend
-							continue
-						}
-						if hosts[host] == nil {
-							hosts[host] = map[string]string{}
-						}
-						hosts[host][path] = backend
+					if strings.HasPrefix(path, acmeChallengePrefix) {
+						m.acme = servers[0].addr
+						continue
 					}
+					m.addRoute(host, path, servers, a, req, resp)
 				}
 			}
 		}
@@ -127,6 +138,36 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, hosts map[string
 		logger.Info("programmed HTTPRoutes", "count", matched)
 	}
 	return matched
+}
+
+// headerFilters maps HTTPRoute Request/ResponseHeaderModifier filters
+// to synapse request_headers/response_headers injection lines
+// ("Name: value"). Header `remove` and `URLRewrite`/`RequestMirror`
+// have no equivalent in synapse's v1 per-path schema and are left
+// unmodified (not silently faked).
+func headerFilters(filters []gwv1.HTTPRouteFilter) (req, resp []string) {
+	conv := func(f *gwv1.HTTPHeaderFilter) []string {
+		if f == nil {
+			return nil
+		}
+		var out []string
+		for _, h := range f.Set {
+			out = append(out, fmt.Sprintf("%s: %s", h.Name, h.Value))
+		}
+		for _, h := range f.Add {
+			out = append(out, fmt.Sprintf("%s: %s", h.Name, h.Value))
+		}
+		return out
+	}
+	for i := range filters {
+		switch filters[i].Type {
+		case gwv1.HTTPRouteFilterRequestHeaderModifier:
+			req = append(req, conv(filters[i].RequestHeaderModifier)...)
+		case gwv1.HTTPRouteFilterResponseHeaderModifier:
+			resp = append(resp, conv(filters[i].ResponseHeaderModifier)...)
+		}
+	}
+	return req, resp
 }
 
 func rulePaths(rule gwv1.HTTPRouteRule) []string {
