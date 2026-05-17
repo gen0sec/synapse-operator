@@ -1,21 +1,25 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"synapse-operator/controllers"
 )
@@ -29,6 +33,8 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(networkingv1.AddToScheme(scheme))
+	utilruntime.Must(gwv1.AddToScheme(scheme))
 }
 
 func main() {
@@ -40,6 +46,12 @@ func main() {
 	var configHashAnnotation string
 	var ignoredConfigMapKeys string
 	var ignoredSecretKeys string
+	var ingressMode bool
+	var renderOnce bool
+	var ingressClass string
+	var upstreamsOut string
+	var clusterDomain string
+	var gatewayAPI bool
 
 	opts := zap.Options{
 		Development: true,
@@ -54,9 +66,35 @@ func main() {
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
+	flag.BoolVar(&ingressMode, "ingress-mode", false, "Run as a Kubernetes Ingress + Gateway API controller (sidecar) instead of the config-hash controller: render class-matched Ingresses/HTTPRoutes into a synapse upstreams.yaml.")
+	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
+	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
+	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode; a shared volume synapse inotify-reloads).")
+	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
+	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if ingressMode && renderOnce {
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "render-once: client")
+			os.Exit(1)
+		}
+		ir := &controllers.IngressReconciler{
+			Client:           cl,
+			IngressClassName: ingressClass,
+			UpstreamsOutPath: upstreamsOut,
+			ClusterDomain:    clusterDomain,
+			GatewayAPI:       gatewayAPI,
+		}
+		if err := ir.RenderOnce(context.Background()); err != nil {
+			setupLog.Error(err, "render-once failed")
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	if strings.TrimSpace(configHashAnnotation) == "" {
 		setupLog.Error(nil, "config-hash-annotation cannot be empty")
@@ -94,7 +132,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.ConfigMapReconciler{
+	if ingressMode {
+		ir := &controllers.IngressReconciler{
+			Client:           mgr.GetClient(),
+			IngressClassName: ingressClass,
+			UpstreamsOutPath: upstreamsOut,
+			ClusterDomain:    clusterDomain,
+			GatewayAPI:       gatewayAPI,
+		}
+		if err = ir.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Ingress")
+			os.Exit(1)
+		}
+		ir.LogStartup(setupLog)
+	} else if err = (&controllers.ConfigMapReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		LabelSelector:        selector,
