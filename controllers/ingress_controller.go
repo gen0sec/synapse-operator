@@ -2,16 +2,25 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -36,6 +45,7 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingressclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 type IngressReconciler struct {
 	client.Client
 	// IngressClassName: only Ingresses whose spec.ingressClassName
@@ -57,6 +67,26 @@ type IngressReconciler struct {
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
 	// API CRDs to be installed.
 	GatewayAPI bool
+	// StatusAddresses, when non-empty, are published on every matched
+	// Ingress's .status.loadBalancer.ingress (IP-parseable entries as
+	// IP, others as Hostname) after a successful render. Empty ⇒ no
+	// status is published (never a bogus address).
+	StatusAddresses []string
+	// ReloadProcessName is the argv0 basename of the co-located proxy
+	// to SIGHUP (default "synapse").
+	ReloadProcessName string
+	// ReloadDebounce coalesces SIGHUP bursts: leading edge fires
+	// immediately, further changes within the window collapse into a
+	// single trailing fire so the final state is always applied. 0 ⇒
+	// every changed render signals immediately (no debounce).
+	ReloadDebounce time.Duration
+	// Recorder emits Kubernetes Events on the Ingress/HTTPRoute
+	// objects. nil in --render-once mode (no manager).
+	Recorder record.EventRecorder
+
+	ready      atomic.Bool
+	reloadOnce sync.Once
+	reload     *reloadDebouncer
 }
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
@@ -88,8 +118,10 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
+	mRenderTotal.Inc()
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
+		mRenderErrTotal.Inc()
 		return false, 0, 0, fmt.Errorf("list ingresses: %w", err)
 	}
 
@@ -115,13 +147,17 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		return a.Name < b.Name
 	})
 
+	defaultOurs := r.defaultClassIsOurs(ctx)
+
 	matched := 0
+	var matchedIngs []*networkingv1.Ingress
 	for i := range list.Items {
 		ing := &list.Items[i]
-		if !r.isOurs(ing) {
+		if !r.isOurs(ing, defaultOurs) {
 			continue
 		}
 		matched++
+		matchedIngs = append(matchedIngs, ing)
 		a := parseAnnotations(ing.Annotations)
 		if a.sticky {
 			m.sticky = true
@@ -134,11 +170,21 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			for _, p := range rule.HTTP.Paths {
 				addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend)
 				if !ok {
+					mBackendUnresolved.Inc()
+					r.emit(ing, corev1.EventTypeWarning, "BackendUnresolved",
+						"Ingress backend on host %q could not be resolved (no Service, or named port not found)", host)
 					continue
 				}
 				path := p.Path
 				if path == "" {
 					path = "/"
+				}
+				if p.PathType != nil && *p.PathType == networkingv1.PathTypeExact {
+					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse v1 matches longest-prefix)",
+						"ingress", ing.Namespace+"/"+ing.Name, "host", host, "path", path)
+					mUnsupportedMatch.Inc()
+					r.emit(ing, corev1.EventTypeWarning, "UnsupportedMatch",
+						"Exact pathType on host %s path %s is approximated as a prefix (synapse v1 matches longest-prefix)", host, path)
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
 					if m.acme == "" {
@@ -149,6 +195,9 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				if !m.addRoute(host, path, []backend{{addr: addr}}, a, nil, nil) {
 					logger.Info("route conflict ignored (first-writer-wins)",
 						"host", host, "path", path, "ingress", ing.Namespace+"/"+ing.Name)
+					mRouteConflicts.Inc()
+					r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
+						"host %s path %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, path)
 				}
 			}
 		}
@@ -158,23 +207,114 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		matched += r.renderGateways(ctx, m)
 	}
 
+	hosts, routes := 0, 0
+	for _, paths := range m.hosts {
+		hosts++
+		routes += len(paths)
+	}
+
 	yaml := renderUpstreams(m)
 	changed, err := writeIfChanged(r.UpstreamsOutPath, yaml)
 	if err != nil {
-		return false, matched, len(m.hosts), fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
+		mRenderErrTotal.Inc()
+		return false, matched, hosts, fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
 	}
-	if changed && r.SignalReload {
-		r.signalReload(ctx)
+
+	mHosts.Set(float64(hosts))
+	mRoutes.Set(float64(routes))
+	mLastRenderTS.SetToCurrentTime()
+	if changed {
+		mRenderChangedTotal.Inc()
+		if r.SignalReload {
+			r.signalReload(ctx)
+		}
+		for _, ing := range matchedIngs {
+			r.emit(ing, corev1.EventTypeNormal, "Programmed",
+				"programmed into synapse upstreams (%d hosts, %d routes)", hosts, routes)
+		}
 	}
-	return changed, matched, len(m.hosts), nil
+	r.publishStatus(ctx, matchedIngs)
+
+	if r.ready.CompareAndSwap(false, true) {
+		mReady.Set(1)
+	}
+	return changed, matched, hosts, nil
 }
 
-// isOurs: ingress is ours iff spec.ingressClassName == r.IngressClassName.
-func (r *IngressReconciler) isOurs(ing *networkingv1.Ingress) bool {
-	if ing.Spec.IngressClassName == nil {
+// isOurs reports whether this Ingress is served by us. Precedence
+// follows Kubernetes: an explicit spec.ingressClassName wins (must
+// equal ours); otherwise the legacy kubernetes.io/ingress.class
+// annotation is honored; otherwise it falls to the default
+// IngressClass (defaultOurs, resolved once per render).
+func (r *IngressReconciler) isOurs(ing *networkingv1.Ingress, defaultOurs bool) bool {
+	if ing.Spec.IngressClassName != nil {
+		return *ing.Spec.IngressClassName == r.IngressClassName
+	}
+	if v := strings.TrimSpace(ing.Annotations["kubernetes.io/ingress.class"]); v != "" {
+		return v == r.IngressClassName
+	}
+	return defaultOurs
+}
+
+// defaultClassIsOurs is true when an IngressClass annotated
+// ingressclass.kubernetes.io/is-default-class=true is controlled by
+// us (spec.controller == ControllerName) — so Ingresses with neither
+// spec.ingressClassName nor the legacy annotation are ours.
+func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
+	var icl networkingv1.IngressClassList
+	if err := r.List(ctx, &icl); err != nil {
 		return false
 	}
-	return *ing.Spec.IngressClassName == r.IngressClassName
+	for i := range icl.Items {
+		ic := &icl.Items[i]
+		if ic.Spec.Controller != ControllerName {
+			continue
+		}
+		if ic.Annotations["ingressclass.kubernetes.io/is-default-class"] == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+// emit records a Kubernetes Event on obj (no-op when there is no
+// recorder, e.g. --render-once).
+func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
+	if r.Recorder == nil || obj == nil {
+		return
+	}
+	r.Recorder.Eventf(obj, etype, reason, msgFmt, args...)
+}
+
+// publishStatus writes StatusAddresses onto each matched Ingress's
+// .status.loadBalancer.ingress (idempotent: only patches on change).
+// No-op when StatusAddresses is empty.
+func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkingv1.Ingress) {
+	if len(r.StatusAddresses) == 0 {
+		return
+	}
+	want := make([]networkingv1.IngressLoadBalancerIngress, 0, len(r.StatusAddresses))
+	for _, a := range r.StatusAddresses {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if net.ParseIP(a) != nil {
+			want = append(want, networkingv1.IngressLoadBalancerIngress{IP: a})
+		} else {
+			want = append(want, networkingv1.IngressLoadBalancerIngress{Hostname: a})
+		}
+	}
+	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
+	for _, ing := range ings {
+		if apiequality.Semantic.DeepEqual(ing.Status.LoadBalancer.Ingress, want) {
+			continue
+		}
+		ing.Status.LoadBalancer.Ingress = want
+		if err := r.Status().Update(ctx, ing); err != nil {
+			logger.Error(err, "publish Ingress status", "ingress", ing.Namespace+"/"+ing.Name)
+		}
+	}
 }
 
 // backendAddr resolves an Ingress backend to "fqdn:port". Port-by-name
@@ -241,13 +381,53 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	})
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("synapse-ingress").
-		Watches(&networkingv1.Ingress{}, enqueueAll)
+		Watches(&networkingv1.Ingress{}, enqueueAll).
+		Watches(&networkingv1.IngressClass{}, enqueueAll).
+		// Backends are DNS-addressed, but a Service add/delete or a
+		// named-port change must re-render (named ports are resolved
+		// via a Service lookup).
+		Watches(&corev1.Service{}, enqueueAll)
 	if r.GatewayAPI {
 		b = b.Watches(gwHTTPRoute(), enqueueAll).
 			Watches(gwGateway(), enqueueAll).
 			Watches(gwGatewayClass(), enqueueAll)
 	}
 	return b.Complete(r)
+}
+
+// ReadyCheck gates readyz on the first successful render so the proxy
+// is not advertised as ready before synapse has correct upstreams.
+func (r *IngressReconciler) ReadyCheck(*http.Request) error {
+	if r.ready.Load() {
+		return nil
+	}
+	return errors.New("initial upstreams render not complete")
+}
+
+// renderPrimer is a manager Runnable that performs one render after
+// the caches have synced (controller-runtime starts non-cache
+// Runnables only post-sync), so readyz flips even on a cluster with
+// zero Ingresses and the file is primed before traffic is admitted.
+type renderPrimer struct{ r *IngressReconciler }
+
+// NewRenderPrimer wraps an IngressReconciler as a manager Runnable.
+func NewRenderPrimer(r *IngressReconciler) ctrlManagerRunnable { return renderPrimer{r: r} }
+
+// ctrlManagerRunnable mirrors sigs.k8s.io/controller-runtime
+// manager.Runnable without importing it here.
+type ctrlManagerRunnable interface {
+	Start(context.Context) error
+}
+
+func (p renderPrimer) Start(ctx context.Context) error {
+	log := ctrl.LoggerFrom(ctx).WithName("ingress")
+	if _, _, _, err := p.r.render(ctx); err != nil {
+		// Don't crash the manager; the controller's reconciles retry.
+		log.Error(err, "initial render failed (will retry on reconcile)")
+		return nil
+	}
+	log.Info("initial upstreams render complete; ready")
+	return nil
 }
 
 // LogStartup is a tiny helper so main can announce the mode.

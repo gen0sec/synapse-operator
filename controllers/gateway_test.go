@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,12 +15,69 @@ func TestRulePaths(t *testing.T) {
 		{Path: &gwv1.HTTPPathMatch{Value: ptr("/a")}},
 		{Path: &gwv1.HTTPPathMatch{Value: ptr("/.well-known/acme-challenge/t")}},
 	}}
-	got := rulePaths(rule)
+	got, warns := rulePaths(rule)
 	if len(got) != 2 || got[0] != "/a" || got[1] != "/.well-known/acme-challenge/t" {
 		t.Fatalf("rulePaths = %v", got)
 	}
-	if p := rulePaths(gwv1.HTTPRouteRule{}); len(p) != 1 || p[0] != "/" {
-		t.Fatalf("empty rule must default to [/]: %v", p)
+	if len(warns) != 0 {
+		t.Fatalf("plain prefix paths must not warn: %v", warns)
+	}
+	// No matches ⇒ match-all ⇒ ["/"] with no warning.
+	if p, w := rulePaths(gwv1.HTTPRouteRule{}); len(p) != 1 || p[0] != "/" || len(w) != 0 {
+		t.Fatalf("empty rule must default to [/] no warn: %v %v", p, w)
+	}
+	// Exact ⇒ used (approximated) + warning.
+	p, w := rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+		{Path: &gwv1.HTTPPathMatch{Type: ptr(gwv1.PathMatchExact), Value: ptr("/exact")}}}})
+	if len(p) != 1 || p[0] != "/exact" || len(w) != 1 || !strings.Contains(w[0], "Exact") {
+		t.Fatalf("Exact must be used + warn: p=%v w=%v", p, w)
+	}
+	// RegularExpression ⇒ dropped + warning (NOT defaulted to "/").
+	p, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+		{Path: &gwv1.HTTPPathMatch{Type: ptr(gwv1.PathMatchRegularExpression), Value: ptr("/x.*")}}}})
+	if len(p) != 0 || len(w) != 1 || !strings.Contains(w[0], "RegularExpression") {
+		t.Fatalf("regex must be dropped + warn (no '/' default): p=%v w=%v", p, w)
+	}
+	// Header-only match ⇒ default path "/" + header-dropped warning.
+	p, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+		{Headers: []gwv1.HTTPHeaderMatch{{Name: "X-Env", Value: "canary"}}}}})
+	if len(p) != 1 || p[0] != "/" || len(w) != 1 || !strings.Contains(w[0], "header") {
+		t.Fatalf("header-only match ⇒ ['/'] + warn: p=%v w=%v", p, w)
+	}
+}
+
+// Gateway API weight semantics: weight 0 ⇒ no traffic (excluded);
+// unset-with-others ⇒ default 1; no weights at all ⇒ unweighted.
+func TestRuleBackends_WeightSemantics(t *testing.T) {
+	r := &IngressReconciler{ClusterDomain: "cluster.local"}
+	rt := &gwv1.HTTPRoute{}
+	rt.Namespace = "default"
+	mkRef := func(name string, w *int32) gwv1.HTTPBackendRef {
+		return gwv1.HTTPBackendRef{BackendRef: gwv1.BackendRef{Weight: w,
+			BackendObjectReference: gwv1.BackendObjectReference{Name: gwv1.ObjectName(name), Port: ptr(gwv1.PortNumber(80))}}}
+	}
+	// Mixed weights: a=70, b=0 (excluded), c=unset→1.
+	got := r.ruleBackends(context.Background(), rt, gwv1.HTTPRouteRule{BackendRefs: []gwv1.HTTPBackendRef{
+		mkRef("a", ptr(int32(70))), mkRef("b", ptr(int32(0))), mkRef("c", nil)}})
+	if len(got) != 2 {
+		t.Fatalf("weight-0 backend must be excluded: %+v", got)
+	}
+	if got[0].addr != "a.default.svc.cluster.local:80" || got[0].weight != 70 {
+		t.Fatalf("a weight: %+v", got[0])
+	}
+	if got[1].addr != "c.default.svc.cluster.local:80" || got[1].weight != 1 {
+		t.Fatalf("unset-with-others must default to weight 1: %+v", got[1])
+	}
+	// No weights anywhere ⇒ unweighted (weight 0 ⇒ bare-string form).
+	un := r.ruleBackends(context.Background(), rt, gwv1.HTTPRouteRule{BackendRefs: []gwv1.HTTPBackendRef{
+		mkRef("x", nil), mkRef("y", nil)}})
+	if len(un) != 2 || un[0].weight != 0 || un[1].weight != 0 {
+		t.Fatalf("no weights ⇒ unweighted pool: %+v", un)
+	}
+	// All weight 0 ⇒ no servers (no traffic).
+	if z := r.ruleBackends(context.Background(), rt, gwv1.HTTPRouteRule{BackendRefs: []gwv1.HTTPBackendRef{
+		mkRef("a", ptr(int32(0)))}}); len(z) != 0 {
+		t.Fatalf("all-zero-weight ⇒ empty pool: %+v", z)
 	}
 }
 

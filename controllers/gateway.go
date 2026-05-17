@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -114,24 +115,19 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		}
 		hostnames := rt.Spec.Hostnames
 		for _, rule := range rt.Spec.Rules {
-			// All backendRefs in a rule → weighted server pool.
-			var servers []backend
-			for _, br := range rule.BackendRefs {
-				addr, ok := r.gwBackend(rt.Namespace, br)
-				if !ok {
-					continue
-				}
-				var w uint32
-				if br.Weight != nil && *br.Weight > 0 {
-					w = uint32(*br.Weight)
-				}
-				servers = append(servers, backend{addr: addr, weight: w})
-			}
+			servers := r.ruleBackends(ctx, rt, rule)
 			if len(servers) == 0 {
 				continue
 			}
 			req, resp := headerFilters(rule.Filters)
-			for _, path := range rulePaths(rule) {
+			paths, warns := rulePaths(rule)
+			for _, w := range warns {
+				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
+					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
+				mUnsupportedMatch.Inc()
+				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", w)
+			}
+			for _, path := range paths {
 				for _, h := range hostnames {
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
@@ -143,6 +139,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					if !m.addRoute(host, path, servers, a, req, resp) {
 						logger.Info("route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
 							"host", host, "path", path, "httproute", rt.Namespace+"/"+rt.Name)
+						mRouteConflicts.Inc()
+						r.emit(rt, corev1.EventTypeWarning, "RouteConflict",
+							"host %s path %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, path)
 					}
 				}
 			}
@@ -185,17 +184,90 @@ func headerFilters(filters []gwv1.HTTPRouteFilter) (req, resp []string) {
 	return req, resp
 }
 
-func rulePaths(rule gwv1.HTTPRouteRule) []string {
-	var out []string
-	for _, m := range rule.Matches {
-		if m.Path != nil && m.Path.Value != nil && *m.Path.Value != "" {
-			out = append(out, *m.Path.Value)
+// ruleBackends resolves a rule's backendRefs into a synapse server
+// pool, honoring Gateway API weight semantics:
+//
+//   - If NO backendRef sets a weight, the pool is unweighted (synapse
+//     equal round-robin; rendered as bare "addr" strings).
+//   - If ANY backendRef sets a weight, an unset weight defaults to 1
+//     and weight 0 means "receive no traffic" — that backend is
+//     EXCLUDED (Gateway API conformance; previously a 0-weight backend
+//     was incorrectly treated as equal-weight).
+func (r *IngressReconciler) ruleBackends(ctx context.Context, rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule) []backend {
+	weighted := false
+	for i := range rule.BackendRefs {
+		if rule.BackendRefs[i].Weight != nil {
+			weighted = true
+			break
 		}
 	}
-	if len(out) == 0 {
-		out = []string{"/"}
+	var servers []backend
+	for _, br := range rule.BackendRefs {
+		addr, ok := r.gwBackend(rt.Namespace, br)
+		if !ok {
+			mBackendUnresolved.Inc()
+			r.emit(rt, corev1.EventTypeWarning, "BackendUnresolved",
+				"backendRef %q could not be resolved (non-Service kind or missing port)", br.Name)
+			continue
+		}
+		if !weighted {
+			servers = append(servers, backend{addr: addr})
+			continue
+		}
+		w := int32(1)
+		if br.Weight != nil {
+			w = *br.Weight
+		}
+		if w <= 0 {
+			continue // weight 0 ⇒ no traffic (Gateway API)
+		}
+		servers = append(servers, backend{addr: addr, weight: uint32(w)})
 	}
-	return out
+	return servers
+}
+
+// rulePaths extracts the path keys for a rule and reports any match
+// features synapse's host+prefix v1 model cannot represent, so the
+// caller warns instead of silently mis-routing:
+//
+//	PathPrefix           used as-is
+//	Exact                used as a prefix (best-effort) + warning
+//	RegularExpression    dropped + warning (no regex path support)
+//	Headers/Method/Query path still used, constraint dropped + warning
+//
+// A rule with no matches means "match all" → ["/"]. A match with no
+// Path defaults to PathPrefix "/" (Gateway API default).
+func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, warnings []string) {
+	if len(rule.Matches) == 0 {
+		return []string{"/"}, nil
+	}
+	for _, mt := range rule.Matches {
+		if len(mt.Headers) > 0 || mt.Method != nil || len(mt.QueryParams) > 0 {
+			warnings = append(warnings,
+				"header/method/queryParam match conditions are ignored (synapse v1 routes on host+path only)")
+		}
+		pv := "/"
+		pt := gwv1.PathMatchPathPrefix
+		if mt.Path != nil {
+			if mt.Path.Type != nil {
+				pt = *mt.Path.Type
+			}
+			if mt.Path.Value != nil && *mt.Path.Value != "" {
+				pv = *mt.Path.Value
+			}
+		}
+		switch pt {
+		case gwv1.PathMatchRegularExpression:
+			warnings = append(warnings,
+				fmt.Sprintf("RegularExpression path match %q dropped (synapse v1 has no regex path support)", pv))
+			continue
+		case gwv1.PathMatchExact:
+			warnings = append(warnings,
+				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse v1 matches longest-prefix)", pv))
+		}
+		paths = append(paths, pv)
+	}
+	return paths, warnings
 }
 
 func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {

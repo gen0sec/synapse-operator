@@ -5,11 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -150,11 +154,167 @@ func TestIsOurs(t *testing.T) {
 	mk := func(c *string) *networkingv1.Ingress {
 		return &networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: c}}
 	}
-	if r.isOurs(mk(nil)) || r.isOurs(mk(ptr("traefik"))) {
-		t.Fatal("nil/other class must not match")
+	// Explicit spec.ingressClassName wins regardless of default.
+	if r.isOurs(mk(ptr("traefik")), true) {
+		t.Fatal("explicit other class must NOT match even when default is ours")
 	}
-	if !r.isOurs(mk(ptr("synapse"))) {
-		t.Fatal("synapse class must match")
+	if !r.isOurs(mk(ptr("synapse")), false) {
+		t.Fatal("explicit synapse class must match")
+	}
+	// No class, no default ⇒ not ours; no class + default ours ⇒ ours.
+	if r.isOurs(mk(nil), false) {
+		t.Fatal("classless + no default must not match")
+	}
+	if !r.isOurs(mk(nil), true) {
+		t.Fatal("classless + default-is-ours must match")
+	}
+	// Legacy annotation honored only when spec field unset.
+	leg := &networkingv1.Ingress{}
+	leg.Annotations = map[string]string{"kubernetes.io/ingress.class": "synapse"}
+	if !r.isOurs(leg, false) {
+		t.Fatal("legacy kubernetes.io/ingress.class=synapse must match")
+	}
+	leg.Annotations["kubernetes.io/ingress.class"] = "nginx"
+	if r.isOurs(leg, true) {
+		t.Fatal("legacy annotation for another class must NOT match (even with default ours)")
+	}
+	// spec field beats a contradicting legacy annotation.
+	both := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: ptr("synapse")}}
+	both.Annotations = map[string]string{"kubernetes.io/ingress.class": "nginx"}
+	if !r.isOurs(both, false) {
+		t.Fatal("spec.ingressClassName must take precedence over legacy annotation")
+	}
+}
+
+// #3 default IngressClass: a classless Ingress is programmed when an
+// is-default-class IngressClass with our controller exists; foreign
+// default class does not capture it.
+func TestRender_DefaultIngressClass(t *testing.T) {
+	mkClassless := func() *networkingv1.Ingress {
+		i := &networkingv1.Ingress{}
+		i.Name, i.Namespace = "noclass", "default"
+		i.Spec.Rules = []networkingv1.IngressRule{{Host: "d.example.com",
+			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: "app", Port: networkingv1.ServiceBackendPort{Number: 80}}}}}}}}}
+		return i
+	}
+	mkClass := func(name, controller string, def bool) *networkingv1.IngressClass {
+		ic := &networkingv1.IngressClass{}
+		ic.Name = name
+		ic.Spec.Controller = controller
+		if def {
+			ic.Annotations = map[string]string{"ingressclass.kubernetes.io/is-default-class": "true"}
+		}
+		return ic
+	}
+	run := func(ics ...*networkingv1.IngressClass) string {
+		out := filepath.Join(t.TempDir(), "u.yaml")
+		objs := []client.Object{mkClassless()}
+		for _, ic := range ics {
+			objs = append(objs, ic)
+		}
+		c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
+		r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local"}
+		if _, _, _, err := r.render(context.Background()); err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		b, _ := os.ReadFile(out)
+		return string(b)
+	}
+	if s := run(mkClass("synapse", ControllerName, true)); !strings.Contains(s, "d.example.com") {
+		t.Fatalf("classless Ingress must be captured by our default IngressClass:\n%s", s)
+	}
+	if s := run(mkClass("nginx", "k8s.io/ingress-nginx", true)); strings.Contains(s, "d.example.com") {
+		t.Fatalf("classless Ingress must NOT be captured by a foreign default class:\n%s", s)
+	}
+	if s := run(mkClass("synapse", ControllerName, false)); strings.Contains(s, "d.example.com") {
+		t.Fatalf("non-default class must NOT capture a classless Ingress:\n%s", s)
+	}
+}
+
+// #4 publishStatus: IP vs hostname classification, idempotent, and a
+// no-op when no addresses are configured.
+func TestPublishStatus(t *testing.T) {
+	mk := func() *networkingv1.Ingress {
+		i := &networkingv1.Ingress{}
+		i.Name, i.Namespace = "g0s", "default"
+		i.Spec.IngressClassName = ptr("synapse")
+		return i
+	}
+	// No addresses ⇒ status untouched.
+	ing := mk()
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).
+		WithStatusSubresource(&networkingv1.Ingress{}).Build()
+	r := &IngressReconciler{Client: c}
+	r.publishStatus(context.Background(), []*networkingv1.Ingress{ing})
+	if len(ing.Status.LoadBalancer.Ingress) != 0 {
+		t.Fatal("no StatusAddresses ⇒ must not publish")
+	}
+	// IP + hostname classification.
+	ing2 := mk()
+	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing2).
+		WithStatusSubresource(&networkingv1.Ingress{}).Build()
+	r2 := &IngressReconciler{Client: c2, StatusAddresses: []string{"203.0.113.7", "lb.example.com"}}
+	r2.publishStatus(context.Background(), []*networkingv1.Ingress{ing2})
+	got := ing2.Status.LoadBalancer.Ingress
+	if len(got) != 2 || got[0].IP != "203.0.113.7" || got[0].Hostname != "" ||
+		got[1].Hostname != "lb.example.com" || got[1].IP != "" {
+		t.Fatalf("IP/hostname classification wrong: %+v", got)
+	}
+	var fetched networkingv1.Ingress
+	if err := c2.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "g0s"}, &fetched); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(fetched.Status.LoadBalancer.Ingress) != 2 {
+		t.Fatalf("status not persisted: %+v", fetched.Status.LoadBalancer.Ingress)
+	}
+}
+
+// #7 readiness: not ready until the first successful render.
+func TestReadyCheck(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local"}
+	if r.ReadyCheck(nil) == nil {
+		t.Fatal("must not be ready before first render")
+	}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if r.ReadyCheck(nil) != nil {
+		t.Fatal("must be ready after first successful render")
+	}
+}
+
+// #9 reloadDebouncer: leading edge fires immediately; a burst within
+// the window collapses to exactly one extra (trailing) fire, and the
+// final state is always applied.
+func TestReloadDebouncer(t *testing.T) {
+	var n atomic.Int32
+	d := newReloadDebouncer(80*time.Millisecond, func() { n.Add(1) })
+	d.trigger() // leading
+	if n.Load() != 1 {
+		t.Fatalf("leading edge must fire immediately, got %d", n.Load())
+	}
+	for i := 0; i < 8; i++ {
+		d.trigger() // burst within window
+	}
+	if n.Load() != 1 {
+		t.Fatalf("burst within window must NOT fire again yet, got %d", n.Load())
+	}
+	time.Sleep(160 * time.Millisecond)
+	if got := n.Load(); got != 2 {
+		t.Fatalf("burst must collapse to exactly one trailing fire (want 2 total), got %d", got)
+	}
+	// window<=0 ⇒ no debounce, every trigger fires.
+	var m atomic.Int32
+	d0 := newReloadDebouncer(0, func() { m.Add(1) })
+	d0.trigger()
+	d0.trigger()
+	d0.trigger()
+	if m.Load() != 3 {
+		t.Fatalf("window<=0 ⇒ every trigger fires, got %d", m.Load())
 	}
 }
 
@@ -289,15 +449,20 @@ func TestFindReloadTargets(t *testing.T) {
 	mk("11", "/manager\x00--ingress-mode\x00--gateway-api\x00") // operator → skip
 	mk("12", "/pause\x00")                                      // skip
 	mk("13", "")                                                // empty → skip
+	mk("14", "/usr/local/bin/synapse-proxy\x00--x\x00")         // custom name
 	if err := os.MkdirAll(filepath.Join(proc, "notapid"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got := findReloadTargets(proc, 99 /*self*/)
+	got := findReloadTargets(proc, 99 /*self*/, "synapse")
 	if len(got) != 1 || got[0] != 10 {
 		t.Fatalf("expected [10] (synapse), got %v", got)
 	}
-	if r := findReloadTargets(proc, 10 /*self==synapse*/); len(r) != 0 {
+	if r := findReloadTargets(proc, 10 /*self==synapse*/, "synapse"); len(r) != 0 {
 		t.Fatalf("must skip self pid: %v", r)
+	}
+	// Configurable process name.
+	if c := findReloadTargets(proc, 99, "synapse-proxy"); len(c) != 1 || c[0] != 14 {
+		t.Fatalf("custom process name must match argv0 basename, got %v", c)
 	}
 }
 
