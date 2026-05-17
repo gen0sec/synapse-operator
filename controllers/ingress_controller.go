@@ -46,6 +46,7 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingressclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 type IngressReconciler struct {
 	client.Client
 	// IngressClassName: only Ingresses whose spec.ingressClassName
@@ -83,6 +84,12 @@ type IngressReconciler struct {
 	// Recorder emits Kubernetes Events on the Ingress/HTTPRoute
 	// objects. nil in --render-once mode (no manager).
 	Recorder record.EventRecorder
+	// IsLeader gates writes to SHARED cluster status (GatewayClass/
+	// Gateway/HTTPRoute status, Ingress .status.loadBalancer) so that
+	// with >1 proxy replica only one sidecar churns those objects.
+	// Per-pod work (render + SIGHUP) is NEVER gated. nil ⇒ always
+	// leader (single-writer / --render-once / tests: unchanged).
+	IsLeader func() bool
 
 	ready      atomic.Bool
 	reloadOnce sync.Once
@@ -277,6 +284,12 @@ func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 	return false
 }
 
+// leader reports whether this instance may write shared cluster
+// status. nil gate ⇒ always leader (unchanged single-writer behavior).
+func (r *IngressReconciler) leader() bool {
+	return r.IsLeader == nil || r.IsLeader()
+}
+
 // emit records a Kubernetes Event on obj (no-op when there is no
 // recorder, e.g. --render-once).
 func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
@@ -290,7 +303,7 @@ func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt strin
 // .status.loadBalancer.ingress (idempotent: only patches on change).
 // No-op when StatusAddresses is empty.
 func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkingv1.Ingress) {
-	if len(r.StatusAddresses) == 0 {
+	if len(r.StatusAddresses) == 0 || !r.leader() {
 		return
 	}
 	want := make([]networkingv1.IngressLoadBalancerIngress, 0, len(r.StatusAddresses))

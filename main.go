@@ -56,6 +56,9 @@ func main() {
 	var publishStatusAddress string
 	var reloadProcessName string
 	var reloadDebounce time.Duration
+	var statusLeaderElection bool
+	var statusLeaderElectionID string
+	var leaderElectionNamespace string
 
 	opts := zap.Options{
 		Development: true,
@@ -79,6 +82,9 @@ func main() {
 	flag.StringVar(&publishStatusAddress, "publish-status-address", "", "Comma-separated IPs/hostnames to publish on matched Ingresses' .status.loadBalancer.ingress (ingress-mode). Empty = do not publish.")
 	flag.StringVar(&reloadProcessName, "reload-process-name", "synapse", "argv0 basename of the co-located proxy process to SIGHUP on a changed render (ingress-mode).")
 	flag.DurationVar(&reloadDebounce, "reload-debounce", 500*time.Millisecond, "Coalesce SIGHUP reload bursts within this window (ingress-mode; 0 = signal immediately on every changed render).")
+	flag.BoolVar(&statusLeaderElection, "status-leader-election", false, "Ingress-mode: with >1 proxy replica, only the Lease holder writes shared cluster status (Gateway/HTTPRoute status, Ingress .status.loadBalancer). Per-pod render+SIGHUP is never gated. Off ⇒ every replica writes (single-replica default).")
+	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
@@ -152,6 +158,19 @@ func main() {
 			ReloadProcessName: reloadProcessName,
 			ReloadDebounce:    reloadDebounce,
 			Recorder:          mgr.GetEventRecorderFor("synapse-ingress"),
+		}
+		if statusLeaderElection {
+			ns := leaderElectionNamespace
+			if ns == "" {
+				ns = os.Getenv("POD_NAMESPACE")
+			}
+			gate := &controllers.LeaderGate{}
+			ingressReconciler.IsLeader = gate.IsLeader
+			if err = mgr.Add(controllers.NewStatusLeaderElection(
+				mgr.GetConfig(), ns, statusLeaderElectionID, os.Getenv("POD_NAME"), gate)); err != nil {
+				setupLog.Error(err, "unable to add status leader election")
+				os.Exit(1)
+			}
 		}
 		if err = ingressReconciler.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Ingress")

@@ -43,7 +43,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			continue
 		}
 		ours[gc.Name] = true
-		if r.ensureCond(&gc.Status.Conditions, gc.Generation, "Accepted", "Accepted", "synapse-operator") {
+		if r.ensureCond(&gc.Status.Conditions, gc.Generation, "Accepted", "Accepted", "synapse-operator") && r.leader() {
 			_ = r.Status().Update(ctx, gc)
 		}
 	}
@@ -65,7 +65,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		ourGW[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = true
 		changed := r.ensureCond(&gw.Status.Conditions, gw.Generation, "Accepted", "Accepted", "synapse-operator")
 		changed = r.ensureCond(&gw.Status.Conditions, gw.Generation, "Programmed", "Programmed", "synapse-operator") || changed
-		if changed {
+		if changed && r.leader() {
 			_ = r.Status().Update(ctx, gw)
 		}
 	}
@@ -322,8 +322,12 @@ func (r *IngressReconciler) ensureCond(conds *[]metav1.Condition, gen int64, cty
 
 // acceptRoute sets the HTTPRoute parent status (Accepted +
 // ResolvedRefs True) under our controller name — cert-manager's
-// gatewayHTTPRoute solver blocks until the route is Accepted.
+// gatewayHTTPRoute solver blocks until the route is Accepted. Shared
+// status: leader-gated so >1 replica does not churn it.
 func (r *IngressReconciler) acceptRoute(ctx context.Context, rt *gwv1.HTTPRoute, parent *gwv1.ParentReference) {
+	if !r.leader() {
+		return
+	}
 	now := metav1.NewTime(time.Now())
 	mk := func(t, reason string) metav1.Condition {
 		return metav1.Condition{Type: t, Status: metav1.ConditionTrue, Reason: reason,
