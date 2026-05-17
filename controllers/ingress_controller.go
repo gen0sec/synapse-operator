@@ -22,8 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -45,6 +47,7 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingressclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 type IngressReconciler struct {
@@ -56,6 +59,11 @@ type IngressReconciler struct {
 	// UpstreamsOutPath: where the rendered legacy upstreams.yaml is
 	// atomically written (the shared emptyDir synapse reads).
 	UpstreamsOutPath string
+	// CertsOutDir: when set, referenced Ingress/Gateway TLS Secrets
+	// are projected here as <stem>.crt/<stem>.key (the operator-owned
+	// dir synapse's `certificates` points at; synapse inotify-hot-
+	// reloads it). Empty ⇒ multi-cert disabled (legacy static mount).
+	CertsOutDir string
 	// ClusterDomain for backend FQDNs (default cluster.local).
 	ClusterDomain string
 	// SignalReload: after a changed render, SIGHUP the co-located
@@ -169,6 +177,33 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if a.sticky {
 			m.sticky = true
 		}
+		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
+		// applies to this Ingress's rule hosts (Kubernetes semantics).
+		for _, t := range ing.Spec.TLS {
+			if t.SecretName == "" {
+				continue
+			}
+			hosts := t.Hosts
+			if len(hosts) == 0 {
+				for _, rl := range ing.Spec.Rules {
+					if rl.Host != "" {
+						hosts = append(hosts, rl.Host)
+					}
+				}
+			}
+			if len(hosts) == 0 {
+				stem, _ := certStem("", ing.Namespace, t.SecretName)
+				m.addCert("", stem, ing.Namespace, t.SecretName)
+				continue
+			}
+			for _, h := range hosts {
+				if stem, bound := certStem(h, ing.Namespace, t.SecretName); bound {
+					m.addCert(h, stem, ing.Namespace, t.SecretName)
+				} else {
+					m.addCert("", stem, ing.Namespace, t.SecretName)
+				}
+			}
+		}
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
 			if host == "" || rule.HTTP == nil {
@@ -212,6 +247,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	if r.GatewayAPI {
 		matched += r.renderGateways(ctx, m)
+	}
+
+	// Project referenced TLS Secrets into the certificates dir
+	// (per-pod, never leader-gated — like the upstreams render;
+	// synapse inotify-hot-reloads certs independently of SIGHUP).
+	if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
+		mRenderErrTotal.Inc()
+		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
 	}
 
 	hosts, routes := 0, 0
@@ -400,6 +443,16 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// named-port change must re-render (named ports are resolved
 		// via a Service lookup).
 		Watches(&corev1.Service{}, enqueueAll)
+	if r.CertsOutDir != "" {
+		// Re-project on TLS Secret changes (cert rotation/renewal)
+		// without waiting for an unrelated Ingress event. Filtered
+		// to kubernetes.io/tls to avoid watching every Secret.
+		b = b.Watches(&corev1.Secret{}, enqueueAll, builder.WithPredicates(
+			predicate.NewPredicateFuncs(func(o client.Object) bool {
+				s, ok := o.(*corev1.Secret)
+				return ok && s.Type == corev1.SecretTypeTLS
+			})))
+	}
 	if r.GatewayAPI {
 		b = b.Watches(gwHTTPRoute(), enqueueAll).
 			Watches(gwGateway(), enqueueAll).

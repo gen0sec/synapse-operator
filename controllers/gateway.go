@@ -63,6 +63,34 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			continue
 		}
 		ourGW[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = true
+		// listener certificateRefs (Terminate) → project Secrets.
+		for li := range gw.Spec.Listeners {
+			l := &gw.Spec.Listeners[li]
+			if l.TLS == nil {
+				continue
+			}
+			if l.TLS.Mode != nil && *l.TLS.Mode != gwv1.TLSModeTerminate {
+				continue
+			}
+			host := ""
+			if l.Hostname != nil {
+				host = string(*l.Hostname)
+			}
+			for _, cr := range l.TLS.CertificateRefs {
+				if cr.Kind != nil && *cr.Kind != "Secret" {
+					continue
+				}
+				ns := gw.Namespace
+				if cr.Namespace != nil {
+					ns = string(*cr.Namespace)
+				}
+				if stem, bound := certStem(host, ns, string(cr.Name)); bound {
+					m.addCert(host, stem, ns, string(cr.Name))
+				} else {
+					m.addCert("", stem, ns, string(cr.Name))
+				}
+			}
+		}
 		changed := r.ensureCond(&gw.Status.Conditions, gw.Generation, "Accepted", "Accepted", "synapse-operator")
 		changed = r.ensureCond(&gw.Status.Conditions, gw.Generation, "Programmed", "Programmed", "synapse-operator") || changed
 		if changed && r.leader() {

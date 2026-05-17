@@ -52,6 +52,7 @@ func main() {
 	var ingressClass string
 	var upstreamsOut string
 	var clusterDomain string
+	var certsOut string
 	var gatewayAPI bool
 	var publishStatusAddress string
 	var reloadProcessName string
@@ -78,6 +79,7 @@ func main() {
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode; a shared volume synapse inotify-reloads).")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
+	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
 	flag.StringVar(&publishStatusAddress, "publish-status-address", "", "Comma-separated IPs/hostnames to publish on matched Ingresses' .status.loadBalancer.ingress (ingress-mode). Empty = do not publish.")
 	flag.StringVar(&reloadProcessName, "reload-process-name", "synapse", "argv0 basename of the co-located proxy process to SIGHUP on a changed render (ingress-mode).")
@@ -99,6 +101,7 @@ func main() {
 			Client:           cl,
 			IngressClassName: ingressClass,
 			UpstreamsOutPath: upstreamsOut,
+			CertsOutDir:      certsOut,
 			ClusterDomain:    clusterDomain,
 			GatewayAPI:       gatewayAPI,
 		}
@@ -151,6 +154,7 @@ func main() {
 			Client:            mgr.GetClient(),
 			IngressClassName:  ingressClass,
 			UpstreamsOutPath:  upstreamsOut,
+			CertsOutDir:       certsOut,
 			ClusterDomain:     clusterDomain,
 			GatewayAPI:        gatewayAPI,
 			SignalReload:      true,

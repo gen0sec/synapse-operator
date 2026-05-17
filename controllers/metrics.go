@@ -53,12 +53,20 @@ var (
 		Name: "synapse_operator_ready",
 		Help: "1 once the first successful upstreams render has completed, else 0.",
 	})
+	mCerts = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "synapse_operator_certs",
+		Help: "TLS Secrets currently projected into the certificates dir.",
+	})
+	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_cert_errors_total",
+		Help: "Referenced TLS Secrets that were missing or not usable.",
+	})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
-		mHosts, mRoutes, mLastRenderTS, mReady,
+		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
 	)
 }

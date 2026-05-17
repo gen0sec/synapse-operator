@@ -79,14 +79,51 @@ type annSettings struct {
 	sticky           bool
 }
 
+// certProjection is one TLS Secret to materialize into the synapse
+// certificates dir as <stem>.crt/<stem>.key.
+type certProjection struct {
+	stem string // file-stem == synapse cert name (usually the host)
+	ns   string // Secret namespace
+	name string // Secret name
+}
+
 type renderModel struct {
-	hosts  map[string]map[string]*routeCfg
-	acme   string
-	sticky bool
+	hosts map[string]map[string]*routeCfg
+	acme  string
+	// hostCert maps a host to a cert file-stem, emitted as the
+	// per-host `certificate:` in upstreams.yaml (synapse SNI
+	// precedence #1: upstreams_cert_map).
+	hostCert map[string]string
+	// certProjections is the set of Secrets to write into the
+	// certificates dir (keyed by stem, first-writer-wins).
+	certProjections map[string]certProjection
+	sticky          bool
 }
 
 func newRenderModel() *renderModel {
-	return &renderModel{hosts: map[string]map[string]*routeCfg{}}
+	return &renderModel{
+		hosts:           map[string]map[string]*routeCfg{},
+		hostCert:        map[string]string{},
+		certProjections: map[string]certProjection{},
+	}
+}
+
+// addCert records a host→Secret TLS binding: it schedules the Secret
+// for projection as <stem>.crt/<stem>.key and (when host != "")
+// binds the host to that cert name in upstreams.yaml. First-writer-
+// wins per stem and per host so output is deterministic.
+func (m *renderModel) addCert(host, stem, ns, name string) {
+	if stem == "" || ns == "" || name == "" {
+		return
+	}
+	if _, ok := m.certProjections[stem]; !ok {
+		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name}
+	}
+	if host != "" {
+		if _, ok := m.hostCert[host]; !ok {
+			m.hostCert[host] = stem
+		}
+	}
 }
 
 // addRoute records host/path → servers with the object's annotation
@@ -236,7 +273,11 @@ func renderUpstreams(m *renderModel) string {
 	}
 	sort.Strings(hostKeys)
 	for _, h := range hostKeys {
-		fmt.Fprintf(&b, "  %q:\n    paths:\n", h)
+		fmt.Fprintf(&b, "  %q:\n", h)
+		if stem := m.hostCert[h]; stem != "" {
+			fmt.Fprintf(&b, "    certificate: %q\n", stem)
+		}
+		b.WriteString("    paths:\n")
 		paths := m.hosts[h]
 		pathKeys := make([]string, 0, len(paths))
 		for p := range paths {
