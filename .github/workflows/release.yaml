@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  MOAT_OPERATOR_REGISTRY_IMAGE: ghcr.io/arxignis/moat-operator
+  MOAT_OPERATOR_REGISTRY_IMAGE: ghcr.io/gen0sec/synapse-operator
 
 jobs:
   docker-prepare:
