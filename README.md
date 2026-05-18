@@ -28,7 +28,7 @@ This Go operator watches Synapse configuration ConfigMaps and Secrets and keeps 
 ### Project Layout
 - `main.go` bootstraps a controller-runtime manager with health probes and optional namespace scoping.
 - `controllers/configmap_controller.go` contains the reconciliation logic and hashing helper.
-- `config/` holds a kustomize deployment (service account, RBAC, manager deployment). Replace `ghcr.io/example/synapse-operator:latest` with your published image.
+- `config/` holds a kustomize deployment (service account, RBAC, manager deployment). It references the published image `ghcr.io/gen0sec/synapse-operator:latest`.
 
 ### Building
 ```bash
@@ -38,8 +38,8 @@ Adjust the target architecture if you are building for another platform.
 
 To containerize:
 ```bash
-docker build -t ghcr.io/<org>/synapse-operator:latest .
-docker push ghcr.io/<org>/synapse-operator:latest
+docker build -t ghcr.io/gen0sec/synapse-operator:latest .
+docker push ghcr.io/gen0sec/synapse-operator:latest
 ```
 Update `config/manager.yaml` with the pushed image reference.
 
@@ -51,13 +51,12 @@ This creates the `synapse-system` namespace, service account, RBAC, and a single
 
 ### Testing From WSL
 1. **Prepare tools** - ensure WSL has `docker`, `kubectl`, `kind`, and `helm` installed and on `$PATH`.
-2. **Build & load the image** - inside WSL build the Linux image and use `kind load docker-image ghcr.io/<org>/synapse-operator:latest` (or push to a registry reachable by your cluster).
+2. **Build & load the image** - inside WSL build the Linux image and use `kind load docker-image ghcr.io/gen0sec/synapse-operator:latest` (or push to a registry reachable by your cluster).
 3. **Create a test cluster** - `kind create cluster --name synapse`.
 4. **Deploy Synapse via Helm** - use the public chart repo:
    ```bash
    helm repo add gen0sec https://helm.gen0sec.com
    helm repo update
-   export ARX_KEY="REPLACE_ME"
    helm upgrade --install synapse-stack gen0sec/synapse-stack \
      -n synapse --create-namespace \
      --set global.namespaces.synapse="synapse" \
@@ -66,9 +65,8 @@ This creates the `synapse-system` namespace, service account, RBAC, and a single
      --set synapse.image.tag="latest" \
      --set synapse.synapse.server.upstream="http://example.com" \
      --set synapse.synapse.network.disableXdp=true \
-     --set synapse.synapse.arxignis.apiKey="$ARX_KEY" \
      --set operator.enabled=true \
-     --set operator.image.repository="ghcr.io/<org>/synapse-operator" \
+     --set operator.image.repository="ghcr.io/gen0sec/synapse-operator" \
      --set operator.image.tag="latest"
    ```
 5. **Apply/verify operator** - if the chart already deployed the operator, check it with `kubectl -n synapse-system rollout status deployment/synapse-operator`.
