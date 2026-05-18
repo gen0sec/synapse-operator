@@ -1,21 +1,26 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"synapse-operator/controllers"
 )
@@ -29,6 +34,8 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(networkingv1.AddToScheme(scheme))
+	utilruntime.Must(gwv1.AddToScheme(scheme))
 }
 
 func main() {
@@ -40,6 +47,19 @@ func main() {
 	var configHashAnnotation string
 	var ignoredConfigMapKeys string
 	var ignoredSecretKeys string
+	var ingressMode bool
+	var renderOnce bool
+	var ingressClass string
+	var upstreamsOut string
+	var clusterDomain string
+	var certsOut string
+	var gatewayAPI bool
+	var publishStatusAddress string
+	var reloadProcessName string
+	var reloadDebounce time.Duration
+	var statusLeaderElection bool
+	var statusLeaderElectionID string
+	var leaderElectionNamespace string
 
 	opts := zap.Options{
 		Development: true,
@@ -54,9 +74,43 @@ func main() {
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
+	flag.BoolVar(&ingressMode, "ingress-mode", false, "Run as a Kubernetes Ingress + Gateway API controller (sidecar) instead of the config-hash controller: render class-matched Ingresses/HTTPRoutes into a synapse upstreams.yaml.")
+	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
+	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
+	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode; a shared volume synapse inotify-reloads).")
+	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
+	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
+	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
+	flag.StringVar(&publishStatusAddress, "publish-status-address", "", "Comma-separated IPs/hostnames to publish on matched Ingresses' .status.loadBalancer.ingress (ingress-mode). Empty = do not publish.")
+	flag.StringVar(&reloadProcessName, "reload-process-name", "synapse", "argv0 basename of the co-located proxy process to SIGHUP on a changed render (ingress-mode).")
+	flag.DurationVar(&reloadDebounce, "reload-debounce", 500*time.Millisecond, "Coalesce SIGHUP reload bursts within this window (ingress-mode; 0 = signal immediately on every changed render).")
+	flag.BoolVar(&statusLeaderElection, "status-leader-election", false, "Ingress-mode: with >1 proxy replica, only the Lease holder writes shared cluster status (Gateway/HTTPRoute status, Ingress .status.loadBalancer). Per-pod render+SIGHUP is never gated. Off ⇒ every replica writes (single-replica default).")
+	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if ingressMode && renderOnce {
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "render-once: client")
+			os.Exit(1)
+		}
+		ir := &controllers.IngressReconciler{
+			Client:           cl,
+			IngressClassName: ingressClass,
+			UpstreamsOutPath: upstreamsOut,
+			CertsOutDir:      certsOut,
+			ClusterDomain:    clusterDomain,
+			GatewayAPI:       gatewayAPI,
+		}
+		if err := ir.RenderOnce(context.Background()); err != nil {
+			setupLog.Error(err, "render-once failed")
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	if strings.TrimSpace(configHashAnnotation) == "" {
 		setupLog.Error(nil, "config-hash-annotation cannot be empty")
@@ -94,7 +148,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.ConfigMapReconciler{
+	var ingressReconciler *controllers.IngressReconciler
+	if ingressMode {
+		ingressReconciler = &controllers.IngressReconciler{
+			Client:            mgr.GetClient(),
+			IngressClassName:  ingressClass,
+			UpstreamsOutPath:  upstreamsOut,
+			CertsOutDir:       certsOut,
+			ClusterDomain:     clusterDomain,
+			GatewayAPI:        gatewayAPI,
+			SignalReload:      true,
+			StatusAddresses:   parseCSV(publishStatusAddress),
+			ReloadProcessName: reloadProcessName,
+			ReloadDebounce:    reloadDebounce,
+			Recorder:          mgr.GetEventRecorderFor("synapse-ingress"),
+		}
+		if statusLeaderElection {
+			ns := leaderElectionNamespace
+			if ns == "" {
+				ns = os.Getenv("POD_NAMESPACE")
+			}
+			gate := &controllers.LeaderGate{}
+			ingressReconciler.IsLeader = gate.IsLeader
+			if err = mgr.Add(controllers.NewStatusLeaderElection(
+				mgr.GetConfig(), ns, statusLeaderElectionID, os.Getenv("POD_NAME"), gate)); err != nil {
+				setupLog.Error(err, "unable to add status leader election")
+				os.Exit(1)
+			}
+		}
+		if err = ingressReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Ingress")
+			os.Exit(1)
+		}
+		if err = mgr.Add(controllers.NewRenderPrimer(ingressReconciler)); err != nil {
+			setupLog.Error(err, "unable to add render primer")
+			os.Exit(1)
+		}
+		ingressReconciler.LogStartup(setupLog)
+	} else if err = (&controllers.ConfigMapReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		LabelSelector:        selector,
@@ -111,7 +202,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	readyCheck := healthz.Ping
+	if ingressReconciler != nil {
+		readyCheck = ingressReconciler.ReadyCheck
+	}
+	if err := mgr.AddReadyzCheck("readyz", readyCheck); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
@@ -128,6 +223,16 @@ func parseLabelSelector(value string) (labels.Selector, error) {
 		return labels.Everything(), nil
 	}
 	return labels.Parse(value)
+}
+
+func parseCSV(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if s := strings.TrimSpace(item); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func parseKeySet(value string) map[string]struct{} {
