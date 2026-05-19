@@ -64,14 +64,14 @@ Creates the `synapse-system` namespace, ServiceAccount, RBAC, and a single opera
 helm repo add gen0sec https://helm.gen0sec.com
 helm repo update
 
-export ARX_KEY="REPLACE_ME"
+export GEN0SEC_API_KEY="REPLACE_ME"
 helm upgrade --install synapse-stack gen0sec/synapse-stack \
   -n synapse --create-namespace \
   --set global.namespaces.synapse="synapse" \
   --set global.namespaces.operator="synapse-system" \
   --set synapse.image.repository="ghcr.io/gen0sec/synapse" \
   --set synapse.image.tag="latest" \
-  --set synapse.synapse.arxignis.apiKey="$ARX_KEY" \
+  --set synapse.synapse.gen0sec.apiKey="$GEN0SEC_API_KEY" \
   --set operator.enabled=true \
   --set operator.image.repository="ghcr.io/<org>/synapse-operator" \
   --set operator.image.tag="latest"
