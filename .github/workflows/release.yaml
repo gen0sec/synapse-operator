@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  MOAT_OPERATOR_REGISTRY_IMAGE: ghcr.io/gen0sec/synapse-operator
+  SYNAPSE_OPERATOR_REGISTRY_IMAGE: ghcr.io/gen0sec/synapse-operator
 
 jobs:
   docker-prepare:
@@ -36,7 +36,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.MOAT_OPERATOR_REGISTRY_IMAGE }}
+          images: ${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}
           tags: |
             type=sha,format=short
             type=match,pattern=v(\d+\.\d+\.\d+),group=1
@@ -46,13 +46,13 @@ jobs:
 
       - name: Rename meta bake definition file
         run: |
-          mv "${{ steps.meta.outputs.bake-file }}" "${{ runner.temp }}/moat-bake-meta.json"
+          mv "${{ steps.meta.outputs.bake-file }}" "${{ runner.temp }}/synapse-bake-meta.json"
 
       - name: Upload meta bake definition
         uses: actions/upload-artifact@v4
         with:
-          name: moat-operator-bake-meta
-          path: ${{ runner.temp }}/moat-bake-meta.json
+          name: synapse-operator-bake-meta
+          path: ${{ runner.temp }}/synapse-bake-meta.json
           if-no-files-found: error
           retention-days: 1
 
@@ -73,7 +73,7 @@ jobs:
       - name: Download meta bake definition
         uses: actions/download-artifact@v5
         with:
-          name: moat-operator-bake-meta
+          name: synapse-operator-bake-meta
           path: ${{ runner.temp }}
 
       - name: Login to Github Packages
@@ -95,10 +95,10 @@ jobs:
         with:
           files: |
             docker-bake.hcl
-            cwd://${{ runner.temp }}/moat-bake-meta.json
+            cwd://${{ runner.temp }}/synapse-bake-meta.json
           targets: image
           set: |
-            *.tags=${{ env.MOAT_OPERATOR_REGISTRY_IMAGE }}
+            *.tags=${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}
             *.platform=${{ matrix.platform }}
             *.output=type=image,push-by-digest=true,name-canonical=true,push=true
 
@@ -111,7 +111,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: moat-digests-${{ env.PLATFORM_PAIR }}
+          name: synapse-digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -124,14 +124,14 @@ jobs:
       - name: Download meta bake definition
         uses: actions/download-artifact@v5
         with:
-          name: moat-operator-bake-meta
+          name: synapse-operator-bake-meta
           path: ${{ runner.temp }}
 
       - name: Download digests
         uses: actions/download-artifact@v5
         with:
           path: ${{ runner.temp }}/digests
-          pattern: moat-digests-*
+          pattern: synapse-digests-*
           merge-multiple: true
 
       - name: Login to Github Packages
@@ -147,12 +147,12 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.target."docker-metadata-action".tags | map(select(startswith("${{ env.MOAT_OPERATOR_REGISTRY_IMAGE }}")) | "-t " + .) | join(" ")' ${{ runner.temp }}/moat-bake-meta.json) \
-            $(printf '${{ env.MOAT_OPERATOR_REGISTRY_IMAGE }}@sha256:%s ' *)
+          docker buildx imagetools create $(jq -cr '.target."docker-metadata-action".tags | map(select(startswith("${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}")) | "-t " + .) | join(" ")' ${{ runner.temp }}/synapse-bake-meta.json) \
+            $(printf '${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.MOAT_OPERATOR_REGISTRY_IMAGE }}:$(jq -r '.target."docker-metadata-action".args.DOCKER_META_VERSION' ${{ runner.temp }}/moat-bake-meta.json)
+          docker buildx imagetools inspect ${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}:$(jq -r '.target."docker-metadata-action".args.DOCKER_META_VERSION' ${{ runner.temp }}/synapse-bake-meta.json)
 
       - name: Release
         uses: softprops/action-gh-release@v2.2.1
