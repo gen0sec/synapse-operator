@@ -498,10 +498,10 @@ func TestParseSize(t *testing.T) {
 		{"1024k", ptr[uint64](1024 * 1024)},
 		{"1024K", ptr[uint64](1024 * 1024)},
 		{"  10m  ", ptr[uint64](10 * 1024 * 1024)}, // whitespace tolerated
-		{"", nil},                                  // empty
-		{"abc", nil},                               // non-numeric
-		{"50mb", nil},                              // unsupported suffix
-		{"-5m", nil},                               // negative
+		{"", nil},     // empty
+		{"abc", nil},  // non-numeric
+		{"50mb", nil}, // unsupported suffix
+		{"-5m", nil},  // negative
 	}
 	for _, c := range cases {
 		got := parseSize(c.in)
