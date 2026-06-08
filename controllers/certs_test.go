@@ -227,7 +227,7 @@ func TestRenderGateways_CollectsListenerCerts(t *testing.T) {
 	hn := gwv1.Hostname("svc.example.com")
 	gw.Spec.Listeners = []gwv1.Listener{{
 		Name: "https", Protocol: gwv1.HTTPSProtocolType, Port: 443, Hostname: &hn,
-		TLS: &gwv1.GatewayTLSConfig{
+		TLS: &gwv1.ListenerTLSConfig{
 			CertificateRefs: []gwv1.SecretObjectReference{{Name: gwv1.ObjectName("svc-tls")}},
 		},
 	}}
