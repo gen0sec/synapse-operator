@@ -48,6 +48,7 @@ func main() {
 	var ignoredConfigMapKeys string
 	var ignoredSecretKeys string
 	var ingressMode bool
+	var upstreamsResolver bool
 	var renderOnce bool
 	var ingressClass string
 	var upstreamsOut string
@@ -75,6 +76,7 @@ func main() {
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
 	flag.BoolVar(&ingressMode, "ingress-mode", false, "Run as a Kubernetes Ingress + Gateway API controller (sidecar) instead of the config-hash controller: render class-matched Ingresses/HTTPRoutes into a synapse upstreams.yaml.")
+	flag.BoolVar(&upstreamsResolver, "upstreams-resolver", false, "Enable the UpstreamsResolverReconciler: watch ConfigMaps labelled synapse.gen0sec.com/resolve-upstreams=true, substitute backend Service DNS names with their ClusterIPs, write the result to a sibling ConfigMap. Composable with other modes.")
 	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode; a shared volume synapse inotify-reloads).")
@@ -195,6 +197,19 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ConfigMap")
 		os.Exit(1)
+	}
+
+	if upstreamsResolver {
+		ur := &controllers.UpstreamsResolverReconciler{
+			Client:        mgr.GetClient(),
+			Scheme:        mgr.GetScheme(),
+			ClusterDomain: clusterDomain,
+		}
+		if err = ur.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "UpstreamsResolver")
+			os.Exit(1)
+		}
+		ur.LogStartup(setupLog)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
