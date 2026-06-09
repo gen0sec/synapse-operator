@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -479,5 +481,205 @@ func TestRender_IgnoresForeignClass(t *testing.T) {
 	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local"}
 	if _, n, _, err := r.render(context.Background()); err != nil || n != 0 {
 		t.Fatalf("foreign-class must not match: matched=%d err=%v", n, err)
+	}
+}
+
+// --- Central mode (ConfigMap output + ClusterIP resolution) ---
+
+// svcWithIP is a one-line helper for backendAddr/render tests that need
+// a Service object with a populated ClusterIP. Mirrors what the cluster
+// would have for a normal namespace-scoped Service.
+func svcWithIP(ns, name, clusterIP string, port int32, portName string) *corev1.Service {
+	sp := corev1.ServicePort{Port: port}
+	if portName != "" {
+		sp.Name = portName
+	}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: clusterIP,
+			Ports:     []corev1.ServicePort{sp},
+		},
+	}
+}
+
+func TestBackendAddr_ResolvesClusterIP_PortByNumber(t *testing.T) {
+	svc := svcWithIP("default", "whoami", "10.20.30.40", 80, "")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(svc).Build()
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", ResolveBackendClusterIPs: true}
+	addr, ok := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80},
+		},
+	})
+	if !ok || addr != "10.20.30.40:80" {
+		t.Fatalf("got %q ok=%v (want 10.20.30.40:80)", addr, ok)
+	}
+}
+
+func TestBackendAddr_ResolvesClusterIP_PortByName(t *testing.T) {
+	svc := svcWithIP("default", "whoami", "10.20.30.40", 8080, "http")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(svc).Build()
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", ResolveBackendClusterIPs: true}
+	addr, ok := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Name: "http"},
+		},
+	})
+	if !ok || addr != "10.20.30.40:8080" {
+		t.Fatalf("got %q ok=%v (want 10.20.30.40:8080)", addr, ok)
+	}
+}
+
+func TestBackendAddr_HeadlessService_FallsBackToFQDN(t *testing.T) {
+	svc := svcWithIP("default", "whoami", corev1.ClusterIPNone, 80, "")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(svc).Build()
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", ResolveBackendClusterIPs: true}
+	addr, ok := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80},
+		},
+	})
+	if !ok || addr != "whoami.default.svc.cluster.local:80" {
+		t.Fatalf("headless must fall back to FQDN; got %q ok=%v", addr, ok)
+	}
+}
+
+func TestBackendAddr_MissingService_PortByNumber_FallsBackToFQDN(t *testing.T) {
+	// Service absent → port-by-number can still emit the FQDN (the
+	// in-proxy DNS cache will resolve it lazily). port-by-name can't.
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", ResolveBackendClusterIPs: true}
+	addr, ok := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80},
+		},
+	})
+	if !ok || addr != "whoami.default.svc.cluster.local:80" {
+		t.Fatalf("missing-svc port-by-number must fall back to FQDN; got %q ok=%v", addr, ok)
+	}
+}
+
+func TestBackendAddr_NoResolveFlag_KeepsFQDN(t *testing.T) {
+	// Even when a ClusterIP is available, ResolveBackendClusterIPs=false
+	// must keep the FQDN — that's the legacy sidecar behaviour.
+	svc := svcWithIP("default", "whoami", "10.20.30.40", 80, "")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(svc).Build()
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local"}
+	addr, _ := r.backendAddr(context.Background(), "default", networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80},
+		},
+	})
+	if addr != "whoami.default.svc.cluster.local:80" {
+		t.Fatalf("FQDN must be preserved when ResolveBackendClusterIPs is off; got %q", addr)
+	}
+}
+
+func TestRender_WritesConfigMap_AndCreatesIfMissing(t *testing.T) {
+	ing := &networkingv1.Ingress{}
+	ing.Name, ing.Namespace = "g0s", "default"
+	ing.Spec.IngressClassName = ptr("synapse")
+	ing.Spec.Rules = []networkingv1.IngressRule{{
+		Host: "app.example.com",
+		IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+			Paths: []networkingv1.HTTPIngressPath{
+				{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{
+						Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+			},
+		}},
+	}}
+	svc := svcWithIP("default", "whoami", "10.0.0.42", 80, "")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing, svc).Build()
+	r := &IngressReconciler{
+		Client:                   c,
+		IngressClassName:         "synapse",
+		ClusterDomain:            "cluster.local",
+		UpstreamsOutConfigMap:    types.NamespacedName{Namespace: "ingress-synapse", Name: "synapse-ingress-rendered"},
+		ResolveBackendClusterIPs: true,
+	}
+	changed, matched, hosts, err := r.render(context.Background())
+	if err != nil || !changed || matched != 1 || hosts != 1 {
+		t.Fatalf("render: changed=%v matched=%d hosts=%d err=%v", changed, matched, hosts, err)
+	}
+	var got corev1.ConfigMap
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "ingress-synapse", Name: "synapse-ingress-rendered",
+	}, &got); err != nil {
+		t.Fatalf("output ConfigMap not created: %v", err)
+	}
+	if got.Labels[ingressUpstreamsManagedLabel] != "true" {
+		t.Errorf("missing managed label: %v", got.Labels)
+	}
+	body, ok := got.Data[UpstreamsKey]
+	if !ok || !strings.Contains(body, "10.0.0.42:80") {
+		t.Fatalf("upstreams.yaml missing or unresolved:\n%s", body)
+	}
+	if strings.Contains(body, "whoami.default.svc.cluster.local") {
+		t.Errorf("FQDN should have been substituted with ClusterIP:\n%s", body)
+	}
+}
+
+func TestRender_ConfigMapOutput_SecondRunIsNoOp(t *testing.T) {
+	// Identical-content second render returns changed=false and does
+	// not bump Generation by updating Data.
+	ing := &networkingv1.Ingress{}
+	ing.Name, ing.Namespace = "g0s", "default"
+	ing.Spec.IngressClassName = ptr("synapse")
+	ing.Spec.Rules = []networkingv1.IngressRule{{
+		Host: "app.example.com",
+		IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+			Paths: []networkingv1.HTTPIngressPath{
+				{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{
+						Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+			},
+		}},
+	}}
+	svc := svcWithIP("default", "whoami", "10.0.0.42", 80, "")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing, svc).Build()
+	r := &IngressReconciler{
+		Client:                   c,
+		IngressClassName:         "synapse",
+		ClusterDomain:            "cluster.local",
+		UpstreamsOutConfigMap:    types.NamespacedName{Namespace: "ns", Name: "out"},
+		ResolveBackendClusterIPs: true,
+	}
+	if changed, _, _, err := r.render(context.Background()); err != nil || !changed {
+		t.Fatalf("first render must change: changed=%v err=%v", changed, err)
+	}
+	if changed, _, _, err := r.render(context.Background()); err != nil || changed {
+		t.Fatalf("identical second render must be no-op: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestRender_FilePath_StillWorks(t *testing.T) {
+	// Belt-and-suspenders for the existing sidecar mode: leaving
+	// UpstreamsOutConfigMap empty must keep the file-write path.
+	out := filepath.Join(t.TempDir(), "upstreams.yaml")
+	ing := &networkingv1.Ingress{}
+	ing.Name, ing.Namespace = "g0s", "default"
+	ing.Spec.IngressClassName = ptr("synapse")
+	ing.Spec.Rules = []networkingv1.IngressRule{{
+		Host: "app.example.com",
+		IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+			Paths: []networkingv1.HTTPIngressPath{
+				{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{
+						Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+			},
+		}},
+	}}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
+	r := &IngressReconciler{
+		Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, ClusterDomain: "cluster.local",
+	}
+	if changed, _, _, err := r.render(context.Background()); err != nil || !changed {
+		t.Fatalf("render: changed=%v err=%v", changed, err)
+	}
+	body, _ := os.ReadFile(out)
+	if !strings.Contains(string(body), "whoami.default.svc.cluster.local:80") {
+		t.Fatalf("file output missing or unexpected:\n%s", body)
 	}
 }

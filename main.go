@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,6 +54,8 @@ func main() {
 	var renderOnce bool
 	var ingressClass string
 	var upstreamsOut string
+	var upstreamsOutConfigMap string
+	var resolveBackendClusterIPs bool
 	var clusterDomain string
 	var certsOut string
 	var gatewayAPI bool
@@ -79,7 +83,9 @@ func main() {
 	flag.BoolVar(&upstreamsResolver, "upstreams-resolver", false, "Enable the UpstreamsResolverReconciler: watch ConfigMaps labelled synapse.gen0sec.com/resolve-upstreams=true, substitute backend Service DNS names with their ClusterIPs, write the result to a sibling ConfigMap. Composable with other modes.")
 	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
-	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode; a shared volume synapse inotify-reloads).")
+	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode, sidecar layout: a shared volume synapse inotify-reloads). Ignored when --upstreams-out-configmap is set.")
+	flag.StringVar(&upstreamsOutConfigMap, "upstreams-out-configmap", "", "Ingress-mode central layout: write the rendered upstreams.yaml to this ConfigMap (format namespace/name) instead of a file path. Disables SIGHUP signalling — synapse-proxy reloads via its own machinery on the ConfigMap mount.")
+	flag.BoolVar(&resolveBackendClusterIPs, "resolve-backend-cluster-ips", false, "Ingress-mode: emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port` for each backend, so synapse-proxy's HttpPeer skips DNS. Falls back to the FQDN for headless / ExternalName / not-yet-allocated Services.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
@@ -93,6 +99,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	outCM, err := parseNamespacedName(upstreamsOutConfigMap)
+	if err != nil {
+		setupLog.Error(err, "--upstreams-out-configmap")
+		os.Exit(1)
+	}
+
 	if ingressMode && renderOnce {
 		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 		if err != nil {
@@ -100,12 +112,14 @@ func main() {
 			os.Exit(1)
 		}
 		ir := &controllers.IngressReconciler{
-			Client:           cl,
-			IngressClassName: ingressClass,
-			UpstreamsOutPath: upstreamsOut,
-			CertsOutDir:      certsOut,
-			ClusterDomain:    clusterDomain,
-			GatewayAPI:       gatewayAPI,
+			Client:                   cl,
+			IngressClassName:         ingressClass,
+			UpstreamsOutPath:         upstreamsOut,
+			UpstreamsOutConfigMap:    outCM,
+			ResolveBackendClusterIPs: resolveBackendClusterIPs,
+			CertsOutDir:              certsOut,
+			ClusterDomain:            clusterDomain,
+			GatewayAPI:               gatewayAPI,
 		}
 		if err := ir.RenderOnce(context.Background()); err != nil {
 			setupLog.Error(err, "render-once failed")
@@ -153,13 +167,20 @@ func main() {
 	var ingressReconciler *controllers.IngressReconciler
 	if ingressMode {
 		ingressReconciler = &controllers.IngressReconciler{
-			Client:            mgr.GetClient(),
-			IngressClassName:  ingressClass,
-			UpstreamsOutPath:  upstreamsOut,
-			CertsOutDir:       certsOut,
-			ClusterDomain:     clusterDomain,
-			GatewayAPI:        gatewayAPI,
-			SignalReload:      true,
+			Client:                   mgr.GetClient(),
+			IngressClassName:         ingressClass,
+			UpstreamsOutPath:         upstreamsOut,
+			UpstreamsOutConfigMap:    outCM,
+			ResolveBackendClusterIPs: resolveBackendClusterIPs,
+			CertsOutDir:              certsOut,
+			ClusterDomain:            clusterDomain,
+			GatewayAPI:               gatewayAPI,
+			// SignalReload is the sidecar-mode reload mechanism. The
+			// reconciler also no-ops it internally in central mode (when
+			// UpstreamsOutConfigMap is set), but we still gate the
+			// constructor flag here for clarity: there's no co-located
+			// synapse process to signal when we write to a ConfigMap.
+			SignalReload:      outCM.Name == "",
 			StatusAddresses:   parseCSV(publishStatusAddress),
 			ReloadProcessName: reloadProcessName,
 			ReloadDebounce:    reloadDebounce,
@@ -238,6 +259,24 @@ func parseLabelSelector(value string) (labels.Selector, error) {
 		return labels.Everything(), nil
 	}
 	return labels.Parse(value)
+}
+
+// parseNamespacedName accepts "namespace/name". Returns the zero value
+// for an empty input — callers gate on Name == "" to detect "no output
+// ConfigMap configured" (sidecar / file-only mode).
+func parseNamespacedName(value string) (types.NamespacedName, error) {
+	if strings.TrimSpace(value) == "" {
+		return types.NamespacedName{}, nil
+	}
+	parts := strings.SplitN(value, "/", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return types.NamespacedName{}, fmt.Errorf(
+			"expected namespace/name, got %q", value)
+	}
+	return types.NamespacedName{
+		Namespace: strings.TrimSpace(parts[0]),
+		Name:      strings.TrimSpace(parts[1]),
+	}, nil
 }
 
 func parseCSV(value string) []string {
