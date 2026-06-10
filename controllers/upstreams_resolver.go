@@ -1,6 +1,6 @@
 // Package controllers — UpstreamsResolverReconciler.
 //
-// Why this exists
+// # Why this exists
 //
 // synapse-proxy reverse-proxies traffic to backends declared in
 // `upstreams.yaml`. Each backend entry today carries a k8s Service DNS
@@ -18,19 +18,19 @@
 //
 // This controller closes that loop:
 //
-//   1. Watches ConfigMaps labelled
-//      `synapse.gen0sec.com/resolve-upstreams=true`.
-//   2. Parses each source ConfigMap's `upstreams.yaml`.
-//   3. Looks up every backend Service in the k8s API, substitutes the
-//      hostname with the Service's ClusterIP.
-//   4. Writes the rewritten upstreams.yaml to a sibling ConfigMap
-//      (`<source-name>-resolved` by default; overridable via the
-//      `synapse.gen0sec.com/resolved-configmap` annotation on the
-//      source).
-//   5. The output ConfigMap is owned by the source — `kubectl delete`
-//      on the source garbage-collects the output. Synapse-proxy mounts
-//      the OUTPUT ConfigMap, so it sees pre-resolved IPs and skips the
-//      DNS hit entirely.
+//  1. Watches ConfigMaps labelled
+//     `synapse.gen0sec.com/resolve-upstreams=true`.
+//  2. Parses each source ConfigMap's `upstreams.yaml`.
+//  3. Looks up every backend Service in the k8s API, substitutes the
+//     hostname with the Service's ClusterIP.
+//  4. Writes the rewritten upstreams.yaml to a sibling ConfigMap
+//     (`<source-name>-resolved` by default; overridable via the
+//     `synapse.gen0sec.com/resolved-configmap` annotation on the
+//     source).
+//  5. The output ConfigMap is owned by the source — `kubectl delete`
+//     on the source garbage-collects the output. Synapse-proxy mounts
+//     the OUTPUT ConfigMap, so it sees pre-resolved IPs and skips the
+//     DNS hit entirely.
 //
 // Service add/update/delete events trigger a re-render across all
 // labelled source ConfigMaps; the data plane converges on the new IP

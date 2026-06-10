@@ -56,7 +56,7 @@ Update `config/manager.yaml` with the pushed image reference.
 kubectl apply -k config
 ```
 
-Creates the `synapse-system` namespace, ServiceAccount, RBAC, and a single operator replica.
+Creates the `synapse-os` namespace, ServiceAccount, RBAC, and a single operator replica.
 
 ### Deploy with Helm (alongside Synapse)
 
@@ -68,7 +68,7 @@ export GEN0SEC_API_KEY="REPLACE_ME"
 helm upgrade --install synapse-stack gen0sec/synapse-stack \
   -n synapse --create-namespace \
   --set global.namespaces.synapse="synapse" \
-  --set global.namespaces.operator="synapse-system" \
+  --set global.namespaces.operator="synapse-os" \
   --set synapse.image.repository="ghcr.io/gen0sec/synapse" \
   --set synapse.image.tag="latest" \
   --set synapse.synapse.gen0sec.apiKey="$GEN0SEC_API_KEY" \
@@ -80,7 +80,7 @@ helm upgrade --install synapse-stack gen0sec/synapse-stack \
 Verify, then trigger a config change and watch the rollout:
 
 ```bash
-kubectl -n synapse-system rollout status deployment/synapse-operator
+kubectl -n synapse-os rollout status deployment/synapse-operator
 kubectl -n synapse edit configmap synapse-stack          # change any key
 kubectl -n synapse rollout status deployment/synapse-stack
 # the pod annotation synapse.gen0sec.com/config-hash updates

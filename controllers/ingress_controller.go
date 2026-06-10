@@ -18,12 +18,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -48,6 +50,7 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingressclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 type IngressReconciler struct {
@@ -98,10 +101,32 @@ type IngressReconciler struct {
 	// Per-pod work (render + SIGHUP) is NEVER gated. nil ⇒ always
 	// leader (single-writer / --render-once / tests: unchanged).
 	IsLeader func() bool
+	// UpstreamsOutConfigMap, when set, switches the reconciler from
+	// "write upstreams.yaml to UpstreamsOutPath + SIGHUP a co-located
+	// synapse process" (sidecar mode) to "write upstreams.yaml to this
+	// ConfigMap" (central-controller mode). The ConfigMap is created
+	// if missing and the `upstreams.yaml` key is overwritten on every
+	// changed render. SignalReload has no effect in central mode —
+	// synapse reads through a ConfigMap mount and reloads via its own
+	// inotify/poll machinery. Cannot be combined with `UpstreamsOutPath`.
+	UpstreamsOutConfigMap types.NamespacedName
+	// ResolveBackendClusterIPs swaps the `<svc>.<ns>.svc.<ClusterDomain>`
+	// FQDN that `backendAddr` would normally emit for an Ingress
+	// backend with the Service's `spec.clusterIP`. Cuts the DNS round-
+	// trip that pingora's `HttpPeer::new` does on every connection.
+	// Services without a ClusterIP (headless, ExternalName) pass through
+	// as FQDNs — synapse-proxy's in-process DNS cache handles them.
+	ResolveBackendClusterIPs bool
 
 	ready      atomic.Bool
 	reloadOnce sync.Once
 	reload     *reloadDebouncer
+}
+
+// usesConfigMapOutput reports whether the reconciler is in central
+// mode (writes to a ConfigMap instead of a file).
+func (r *IngressReconciler) usesConfigMapOutput() bool {
+	return r.UpstreamsOutConfigMap.Name != ""
 }
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
@@ -317,10 +342,23 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	} else {
 		yaml = renderUpstreams(m)
 	}
-	changed, err := writeIfChanged(r.UpstreamsOutPath, yaml)
-	if err != nil {
-		mRenderErrTotal.Inc()
-		return false, matched, hosts, fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
+	var (
+		changed bool
+		err     error
+	)
+	if r.usesConfigMapOutput() {
+		changed, err = r.writeConfigMapIfChanged(ctx, yaml)
+		if err != nil {
+			mRenderErrTotal.Inc()
+			return false, matched, hosts, fmt.Errorf("write configmap %s/%s: %w",
+				r.UpstreamsOutConfigMap.Namespace, r.UpstreamsOutConfigMap.Name, err)
+		}
+	} else {
+		changed, err = writeIfChanged(r.UpstreamsOutPath, yaml)
+		if err != nil {
+			mRenderErrTotal.Inc()
+			return false, matched, hosts, fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
+		}
 	}
 
 	mHosts.Set(float64(hosts))
@@ -328,7 +366,10 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	mLastRenderTS.SetToCurrentTime()
 	if changed {
 		mRenderChangedTotal.Inc()
-		if r.SignalReload {
+		// SignalReload only makes sense in sidecar mode — central mode
+		// has no co-located synapse process to signal. The proxy that
+		// mounts the rendered ConfigMap reloads via its own machinery.
+		if r.SignalReload && !r.usesConfigMapOutput() {
 			r.signalReload(ctx)
 		}
 		for _, ing := range matchedIngs {
@@ -426,8 +467,12 @@ func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkin
 	}
 }
 
-// backendAddr resolves an Ingress backend to "fqdn:port". Port-by-name
-// is resolved via a Service lookup; port-by-number is used directly.
+// backendAddr resolves an Ingress backend to a `host:port` string. The
+// `host` portion is the Service's `spec.clusterIP` when
+// `ResolveBackendClusterIPs` is set and a ClusterIP is available;
+// otherwise it falls back to the in-cluster FQDN
+// (`<svc>.<ns>.svc.<ClusterDomain>`). Port-by-name is resolved via a
+// Service lookup; port-by-number is used directly.
 func (r *IngressReconciler) backendAddr(ctx context.Context, ns string, b networkingv1.IngressBackend) (string, bool) {
 	if b.Service == nil {
 		return "", false
@@ -437,17 +482,42 @@ func (r *IngressReconciler) backendAddr(ctx context.Context, ns string, b networ
 		cd = "cluster.local"
 	}
 	fqdn := fmt.Sprintf("%s.%s.svc.%s", b.Service.Name, ns, cd)
-	if b.Service.Port.Number != 0 {
-		return fmt.Sprintf("%s:%d", fqdn, b.Service.Port.Number), true
-	}
-	if b.Service.Port.Name != "" {
-		var svc corev1.Service
+
+	// Whether we need a Service lookup at all: any of port-by-name or
+	// ResolveBackendClusterIPs forces it. Port-by-number with no
+	// resolution required can skip the API hit.
+	needLookup := b.Service.Port.Name != "" || r.ResolveBackendClusterIPs
+	var svc corev1.Service
+	if needLookup {
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: b.Service.Name}, &svc); err != nil {
+			// Service missing: port-by-name can't be resolved at all;
+			// port-by-number can fall back to the FQDN. Either way,
+			// no ClusterIP substitution is possible.
+			if b.Service.Port.Number != 0 {
+				return fmt.Sprintf("%s:%d", fqdn, b.Service.Port.Number), true
+			}
 			return "", false
 		}
+	}
+
+	host := fqdn
+	if r.ResolveBackendClusterIPs {
+		// "None" is the headless-Service sentinel; "" is also possible
+		// for ExternalName / not-yet-allocated. In both cases stick
+		// with the FQDN — synapse-proxy's in-process DNS cache will
+		// take it from there.
+		if ip := svc.Spec.ClusterIP; ip != "" && ip != corev1.ClusterIPNone {
+			host = ip
+		}
+	}
+
+	if b.Service.Port.Number != 0 {
+		return fmt.Sprintf("%s:%d", host, b.Service.Port.Number), true
+	}
+	if b.Service.Port.Name != "" {
 		for _, sp := range svc.Spec.Ports {
 			if sp.Name == b.Service.Port.Name {
-				return fmt.Sprintf("%s:%d", fqdn, sp.Port), true
+				return fmt.Sprintf("%s:%d", host, sp.Port), true
 			}
 		}
 	}
@@ -481,6 +551,55 @@ func writeIfChanged(path, content string) (bool, error) {
 	}
 	return true, nil
 }
+
+// writeConfigMapIfChanged is the central-mode analogue of
+// writeIfChanged: the rendered upstreams.yaml goes to the
+// `upstreams.yaml` key of `r.UpstreamsOutConfigMap`. Returns
+// (changed, error) — false-without-error when the existing value
+// already matches the rendered content. The ConfigMap is created if
+// missing and labelled so callers (and humans) can identify the
+// operator-managed output at a glance.
+func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content string) (bool, error) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      r.UpstreamsOutConfigMap.Name,
+			Namespace: r.UpstreamsOutConfigMap.Namespace,
+		},
+	}
+	var changed bool
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if cm.Labels == nil {
+			cm.Labels = map[string]string{}
+		}
+		cm.Labels[ingressUpstreamsManagedLabel] = "true"
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		if cur, ok := cm.Data[UpstreamsKey]; ok && cur == content {
+			return nil
+		}
+		cm.Data[UpstreamsKey] = content
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	// CreateOrUpdate reports Created/Updated/Unchanged; mirror that
+	// into `changed` for the metrics + reload flow upstream.
+	switch op {
+	case controllerutil.OperationResultCreated:
+		changed = true
+	case controllerutil.OperationResultUpdated:
+		// changed was already set inside the mutate fn
+	}
+	return changed, nil
+}
+
+// ingressUpstreamsManagedLabel marks a ConfigMap as written by the
+// central-mode IngressReconciler. Mirrors `ResolvedOutputLabel` from
+// upstreams_resolver.go so the two operator writers are distinguishable.
+const ingressUpstreamsManagedLabel = "synapse.gen0sec.com/ingress-upstreams"
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Any Ingress change triggers a full rebuild; a single dummy
