@@ -23,9 +23,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -234,6 +234,34 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			if host == "" || rule.HTTP == nil {
 				continue
 			}
+			// ssl-passthrough: synapse routes the raw TLS stream to a
+			// single TCP upstream (synapse sees no L7). Path-level
+			// settings on the Ingress are ignored — passthrough is
+			// SNI-only. Use the first resolvable path's backend as the
+			// passthrough target; warn on conflicts.
+			if a.passthrough {
+				var ptAddr string
+				for _, p := range rule.HTTP.Paths {
+					if addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
+						ptAddr = addr
+						break
+					}
+				}
+				if ptAddr == "" {
+					mBackendUnresolved.Inc()
+					r.emit(ing, corev1.EventTypeWarning, "BackendUnresolved",
+						"Ingress backend on passthrough host %q could not be resolved", host)
+					continue
+				}
+				if !m.addPassthroughHost(host, ptAddr) {
+					logger.Info("passthrough host claim ignored (first-writer-wins)",
+						"host", host, "ingress", ing.Namespace+"/"+ing.Name)
+					mRouteConflicts.Inc()
+					r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
+						"passthrough host %s already claimed (first-writer-wins, terminate route or earlier passthrough); this rule is ignored", host)
+				}
+				continue
+			}
 			for _, p := range rule.HTTP.Paths {
 				addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend)
 				if !ok {
@@ -266,6 +294,21 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 					r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
 						"host %s path %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, path)
 				}
+				// server-alias: program the same route under each alias host.
+				// Same FIRST-WRITER-WINS semantics on conflict; same backend
+				// and annotation-derived settings as the primary host.
+				for _, alias := range a.serverAliases {
+					if alias == "" || alias == host {
+						continue
+					}
+					if !m.addRoute(alias, path, []backend{{addr: addr}}, a, nil, nil) {
+						logger.Info("route conflict ignored on server-alias (first-writer-wins)",
+							"host", alias, "path", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
+						mRouteConflicts.Inc()
+						r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
+							"server-alias %s path %s already programmed by an earlier source (first-writer-wins); this alias is ignored", alias, path)
+					}
+				}
 			}
 		}
 	}
@@ -287,8 +330,18 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		hosts++
 		routes += len(paths)
 	}
+	hosts += len(m.passthroughHosts)
 
-	yaml := renderUpstreams(m)
+	// Schema selection: any SNI passthrough host forces v2 emission
+	// (the v1 schema has no passthrough representation). Otherwise
+	// keep emitting v1 so unrelated deployments see zero behaviour
+	// change.
+	var yaml string
+	if len(m.passthroughHosts) > 0 {
+		yaml = renderUpstreamsV2(m)
+	} else {
+		yaml = renderUpstreams(m)
+	}
 	var (
 		changed bool
 		err     error

@@ -153,7 +153,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
 					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
 				mUnsupportedMatch.Inc()
-				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", w)
+				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", "%s", w)
 			}
 			for _, path := range paths {
 				for _, h := range hostnames {

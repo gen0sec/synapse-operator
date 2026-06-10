@@ -683,3 +683,340 @@ func TestRender_FilePath_StillWorks(t *testing.T) {
 		t.Fatalf("file output missing or unexpected:\n%s", body)
 	}
 }
+
+// parseSize accepts bare bytes and k/m/g suffixes (case-insensitive,
+// nginx-compatible). Malformed inputs return nil so callers can fall back
+// to "no annotation set" — same contract as the rest of the parser.
+func TestParseSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want *uint64
+	}{
+		{"1048576", ptr[uint64](1048576)},
+		{"50m", ptr[uint64](50 * 1024 * 1024)},
+		{"50M", ptr[uint64](50 * 1024 * 1024)},
+		{"1g", ptr[uint64](1024 * 1024 * 1024)},
+		{"1G", ptr[uint64](1024 * 1024 * 1024)},
+		{"1024k", ptr[uint64](1024 * 1024)},
+		{"1024K", ptr[uint64](1024 * 1024)},
+		{"  10m  ", ptr[uint64](10 * 1024 * 1024)}, // whitespace tolerated
+		{"", nil},     // empty
+		{"abc", nil},  // non-numeric
+		{"50mb", nil}, // unsupported suffix
+		{"-5m", nil},  // negative
+	}
+	for _, c := range cases {
+		got := parseSize(c.in)
+		if (got == nil) != (c.want == nil) {
+			t.Fatalf("parseSize(%q): got %v want %v", c.in, got, c.want)
+		}
+		if got != nil && *got != *c.want {
+			t.Fatalf("parseSize(%q): got %d want %d", c.in, *got, *c.want)
+		}
+	}
+}
+
+// proxy-body-size annotation: synapse-key wins over nginx-key. Either
+// alone is enough.
+func TestParseAnnotations_ProxyBodySize(t *testing.T) {
+	// synapse-key takes precedence over nginx-key when both present
+	a := parseAnnotations(map[string]string{
+		annPrefix + "proxy-body-size":   "10m",
+		nginxPrefix + "proxy-body-size": "1g", // ignored when synapse-key present
+	})
+	if a.maxBodySize == nil || *a.maxBodySize != 10*1024*1024 {
+		t.Fatalf("synapse-key precedence: %+v", a.maxBodySize)
+	}
+
+	// nginx-key alone is the fallback path
+	n := parseAnnotations(map[string]string{
+		nginxPrefix + "proxy-body-size": "50m",
+	})
+	if n.maxBodySize == nil || *n.maxBodySize != 50*1024*1024 {
+		t.Fatalf("nginx-compat fallback: %+v", n.maxBodySize)
+	}
+
+	// Invalid value silently drops to nil (matches rest of parser)
+	bad := parseAnnotations(map[string]string{
+		annPrefix + "proxy-body-size": "garbage",
+	})
+	if bad.maxBodySize != nil {
+		t.Fatalf("invalid size must produce nil, got %d", *bad.maxBodySize)
+	}
+}
+
+// server-alias annotation: synapse-key wins over nginx-key. Either alone
+// is enough. csv() trims whitespace.
+func TestParseAnnotations_ServerAlias(t *testing.T) {
+	a := parseAnnotations(map[string]string{
+		annPrefix + "server-alias": "www.example.com, alt.example.com",
+	})
+	if len(a.serverAliases) != 2 ||
+		a.serverAliases[0] != "www.example.com" ||
+		a.serverAliases[1] != "alt.example.com" {
+		t.Fatalf("synapse-key csv parse: %+v", a.serverAliases)
+	}
+	// nginx-key fallback
+	n := parseAnnotations(map[string]string{
+		nginxPrefix + "server-alias": "x.example.com",
+	})
+	if len(n.serverAliases) != 1 || n.serverAliases[0] != "x.example.com" {
+		t.Fatalf("nginx-compat fallback: %+v", n.serverAliases)
+	}
+	// synapse-key wins over nginx-key when both present
+	both := parseAnnotations(map[string]string{
+		annPrefix + "server-alias":   "synapse.example.com",
+		nginxPrefix + "server-alias": "ignored.example.com",
+	})
+	if len(both.serverAliases) != 1 || both.serverAliases[0] != "synapse.example.com" {
+		t.Fatalf("synapse-key precedence: %+v", both.serverAliases)
+	}
+}
+
+// renderUpstreams emits each alias host as its own block with the same
+// settings as the primary host. Verified by addRoute over alias hosts.
+func TestRenderUpstreams_ServerAliasDuplicatesRoute(t *testing.T) {
+	m := newRenderModel()
+	a := annSettings{serverAliases: []string{"www.example.com", "alt.example.com"}}
+	// Caller (ingress_controller.go) iterates aliases after the primary
+	// addRoute; emulate that here.
+	m.addRoute("example.com", "/",
+		[]backend{{addr: "be:80"}}, a, nil, nil)
+	for _, alias := range a.serverAliases {
+		m.addRoute(alias, "/",
+			[]backend{{addr: "be:80"}}, a, nil, nil)
+	}
+	out := renderUpstreams(m)
+	for _, want := range []string{
+		`"example.com":`,
+		`"www.example.com":`,
+		`"alt.example.com":`,
+		`- "be:80"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// ssl-passthrough annotation: synapse-key wins over nginx-key. Either
+// alone is enough. False/missing leaves passthrough off.
+func TestParseAnnotations_SslPassthrough(t *testing.T) {
+	a := parseAnnotations(map[string]string{
+		annPrefix + "ssl-passthrough": "true",
+	})
+	if !a.passthrough {
+		t.Fatalf("synapse-key true: %+v", a.passthrough)
+	}
+	n := parseAnnotations(map[string]string{
+		nginxPrefix + "ssl-passthrough": "true",
+	})
+	if !n.passthrough {
+		t.Fatalf("nginx-compat fallback: %+v", n.passthrough)
+	}
+	z := parseAnnotations(map[string]string{
+		annPrefix + "ssl-passthrough": "false",
+	})
+	if z.passthrough {
+		t.Fatalf("false must stay off: %+v", z.passthrough)
+	}
+	if e := parseAnnotations(nil); e.passthrough {
+		t.Fatalf("missing must stay off: %+v", e.passthrough)
+	}
+}
+
+// addPassthroughHost FIRST-WRITER-WINS: a host already claimed by a
+// terminate route can't be replaced; nor can two passthrough Ingresses
+// share the same SNI. Both losers get false back so the caller can emit
+// a RouteConflict Event + bump the counter.
+func TestAddPassthroughHost_FirstWriterWins(t *testing.T) {
+	// passthrough wins when claimed first
+	m := newRenderModel()
+	if !m.addPassthroughHost("a.example.com", "10.0.0.1:443") {
+		t.Fatal("first passthrough must claim")
+	}
+	if m.addPassthroughHost("a.example.com", "10.0.0.2:443") {
+		t.Fatal("duplicate passthrough must lose")
+	}
+	if m.addRoute("a.example.com", "/", []backend{{addr: "be:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("terminate route on passthrough host must lose")
+	}
+	// terminate wins when claimed first
+	m2 := newRenderModel()
+	if !m2.addRoute("b.example.com", "/", []backend{{addr: "be:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("first terminate route must claim")
+	}
+	if m2.addPassthroughHost("b.example.com", "10.0.0.5:443") {
+		t.Fatal("passthrough on terminate host must lose")
+	}
+}
+
+// renderUpstreamsV2: when at least one passthrough host is present,
+// the whole file switches to v2 schema. Verifies passthrough block
+// shape, terminate block shape with all v1-compat knobs threaded, and
+// the top-level scaffolding (version, sticky, internal ACME).
+func TestRenderUpstreamsV2_MixedTerminateAndPassthrough(t *testing.T) {
+	m := newRenderModel()
+	m.sticky = true
+	m.acme = "10.0.0.99:8080" // ACME challenge backend
+	m.addPassthroughHost("pt.example.com", "10.0.0.1:443")
+	m.hostCert["app.example.com"] = "app.example.com"
+	tru := true
+	var ct uint64 = 7
+	var bs uint64 = 10485760
+	m.addRoute("app.example.com", "/",
+		[]backend{{addr: "be:80"}},
+		annSettings{
+			ssl:              &tru,
+			http2:            &tru,
+			forceHTTPS:       &tru,
+			disableAccessLog: &tru,
+			connectTimeout:   &ct,
+			maxBodySize:      &bs,
+			reqHeaders:       []string{"X-A: 1"},
+			respHeaders:      []string{"X-B: 2"},
+		}, nil, nil)
+	out := renderUpstreamsV2(m)
+	for _, want := range []string{
+		"version: 2",
+		"sticky_sessions:\n    enabled: true",
+		`"/.well-known/acme-challenge/*"`,
+		`upstream: "10.0.0.99:8080"`,
+		`"app.example.com":`,
+		"      terminate:",
+		`cert: "app.example.com"`,
+		`"pt.example.com":`,
+		"      passthrough: true",
+		`upstream: "10.0.0.1:443"`,
+		`upstream: "be:80"`,
+		"ssl_enabled: true",
+		"http2_enabled: true",
+		"force_https: true",
+		"disable_access_log: true",
+		"max_body_size: 10485760",
+		"connect: 7",
+		`- "X-A: 1"`,
+		`- "X-B: 2"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in v2 render:\n%s", want, out)
+		}
+	}
+}
+
+// permanent-redirect default is 301; permanent-redirect-code overrides.
+// nginx-compat fallback keys are honored. permanent wins over temporal
+// when both are set.
+func TestParseAnnotations_Redirect(t *testing.T) {
+	// permanent default 301
+	a := parseAnnotations(map[string]string{
+		annPrefix + "permanent-redirect": "https://example.com/new",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 301 ||
+		a.redirectLocation != "https://example.com/new" {
+		t.Fatalf("permanent default 301: %+v / %q", a.redirectStatus, a.redirectLocation)
+	}
+	// permanent-redirect-code override
+	a = parseAnnotations(map[string]string{
+		annPrefix + "permanent-redirect":      "https://example.com/new",
+		annPrefix + "permanent-redirect-code": "308",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 308 {
+		t.Fatalf("permanent-redirect-code override: %+v", a.redirectStatus)
+	}
+	// temporal default 302
+	a = parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect": "/somewhere",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 302 ||
+		a.redirectLocation != "/somewhere" {
+		t.Fatalf("temporal default 302: %+v / %q", a.redirectStatus, a.redirectLocation)
+	}
+	// temporal-redirect-code override
+	a = parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":      "/somewhere",
+		annPrefix + "temporal-redirect-code": "307",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 307 {
+		t.Fatalf("temporal-redirect-code override: %+v", a.redirectStatus)
+	}
+	// permanent wins over temporal when both set
+	a = parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":  "/old-temp",
+		annPrefix + "permanent-redirect": "/new-perm",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 301 ||
+		a.redirectLocation != "/new-perm" {
+		t.Fatalf("permanent must win over temporal: %+v / %q", a.redirectStatus, a.redirectLocation)
+	}
+	// nginx-compat fallback
+	n := parseAnnotations(map[string]string{
+		nginxPrefix + "permanent-redirect":      "/x",
+		nginxPrefix + "permanent-redirect-code": "301",
+	})
+	if n.redirectStatus == nil || *n.redirectStatus != 301 || n.redirectLocation != "/x" {
+		t.Fatalf("nginx-compat fallback: %+v / %q", n.redirectStatus, n.redirectLocation)
+	}
+}
+
+// renderUpstreams emits a redirect: block on the route when set, both
+// in v1 emission and v2 emission. Verified separately for each.
+func TestRenderUpstreams_RedirectEmitted(t *testing.T) {
+	st := uint64(301)
+	m := newRenderModel()
+	m.addRoute("example.com", "/old",
+		[]backend{{addr: "be:80"}},
+		annSettings{redirectStatus: &st, redirectLocation: "/new"}, nil, nil)
+	out := renderUpstreams(m)
+	for _, want := range []string{
+		"redirect:",
+		"status: 301",
+		`location: "/new"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("v1 missing %q in:\n%s", want, out)
+		}
+	}
+
+	// v2 emission (forced by adding a passthrough host)
+	m2 := newRenderModel()
+	m2.addPassthroughHost("pt.example.com", "10.0.0.1:443")
+	m2.addRoute("example.com", "/old",
+		[]backend{{addr: "be:80"}},
+		annSettings{redirectStatus: &st, redirectLocation: "/new"}, nil, nil)
+	out2 := renderUpstreamsV2(m2)
+	for _, want := range []string{
+		"redirect:",
+		"status: 301",
+		`location: "/new"`,
+	} {
+		if !strings.Contains(out2, want) {
+			t.Fatalf("v2 missing %q in:\n%s", want, out2)
+		}
+	}
+}
+
+// renderUpstreams emits max_body_size: <bytes> when the route carries one,
+// and omits the line otherwise (no regression for unannotated routes).
+func TestRenderUpstreams_MaxBodySizeEmitted(t *testing.T) {
+	m := newRenderModel()
+	cap := uint64(52428800) // 50 MiB
+	m.addRoute("app.example.com", "/",
+		[]backend{{addr: "a:80"}},
+		annSettings{maxBodySize: &cap}, nil, nil)
+	out := renderUpstreams(m)
+	if !strings.Contains(out, "max_body_size: 52428800") {
+		t.Fatalf("max_body_size line missing:\n%s", out)
+	}
+
+	// Route without the annotation must not emit the line — unannotated
+	// routes inherit synapse's no-cap default.
+	m2 := newRenderModel()
+	m2.addRoute("plain.example.com", "/",
+		[]backend{{addr: "b:80"}},
+		annSettings{}, nil, nil)
+	out2 := renderUpstreams(m2)
+	if strings.Contains(out2, "max_body_size") {
+		t.Fatalf("unannotated route emitted max_body_size:\n%s", out2)
+	}
+}

@@ -27,6 +27,28 @@ import (
 //   request-headers      csv         -> request_headers[]
 //   response-headers     csv         -> response_headers[]
 //   sticky-sessions      bool        -> top-level sticky_sessions
+//   proxy-body-size      size        -> max_body_size (per-route 413 cap)
+//   server-alias         csv(hosts)  -> duplicate route under each alias
+//   ssl-passthrough      bool        -> v2 tls.passthrough (SNI-route TCP)
+//   permanent-redirect   url         -> redirect { status: 301, location }
+//   permanent-redirect-code u16      -> override 301 (e.g. 308)
+//   temporal-redirect    url         -> redirect { status: 302, location }
+//   temporal-redirect-code  u16      -> override 302 (e.g. 307)
+//
+// ssl-passthrough switches the emitted file from v1 to v2 schema for
+// the WHOLE FILE (the v1 schema has no passthrough representation; the
+// v2 parser is schema-version-strict). Every other Ingress in the
+// cluster is then re-rendered in v2 form too. The v1 → v2 fidelity
+// for terminate hosts depends on synapse-utils carrying per-route
+// ssl_enabled, http2_enabled, disable_access_log, and max_body_size
+// in its v2 RawRoute (synapse PR feat(upstreams_v2): per-route v1-
+// compat knobs).
+//
+// Sizes for proxy-body-size accept nginx-style suffixes: "50m" = 50MiB,
+// "1g" = 1GiB, "1024k" = 1024KiB, bare bytes (e.g. "1048576"). Synapse
+// enforces with a Content-Length pre-check and a streaming counter; over
+// the cap returns 413 Payload Too Large. nginx-compat key
+// `nginx.ingress.kubernetes.io/proxy-body-size` is accepted as a fallback.
 //
 // All map onto fields the synapse legacy v1 upstreams schema already
 // supports (synapse-utils structs.rs). HTTPRoute backendRef weights
@@ -58,8 +80,15 @@ type routeCfg struct {
 	readTimeout      *uint64
 	writeTimeout     *uint64
 	idleTimeout      *uint64
+	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// redirect, when set, makes this route a 3xx short-circuit. Status is
+	// 301 (permanent) or 302 (temporal) by default; *-code annotations
+	// override. Mutually exclusive with rewriting/forwarding at the proxy:
+	// when set, synapse writes the redirect and never contacts upstream.
+	redirectStatus   *uint64
+	redirectLocation string
 }
 
 // annSettings is the subset parsed from an object's annotations,
@@ -74,8 +103,25 @@ type annSettings struct {
 	readTimeout      *uint64
 	writeTimeout     *uint64
 	idleTimeout      *uint64
+	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// serverAliases are extra hostnames the route should also answer on,
+	// programmed under each alias with the same backend + settings (first-
+	// writer-wins on alias collisions, same as primary-host conflicts).
+	// Matches nginx-ingress server-alias semantics: cert binding is NOT
+	// inferred — list the alias in spec.tls[].hosts to get TLS for it.
+	serverAliases []string
+	// passthrough, when true, makes every rule host on this Ingress an
+	// SNI-routed TCP passthrough host (synapse terminates nothing for
+	// these hosts). Triggers v2 schema emission for the whole file.
+	passthrough bool
+	// redirectStatus + redirectLocation drive the per-route redirect
+	// short-circuit. Populated by parseAnnotations from
+	// permanent-redirect / temporal-redirect (+ -code variants). When
+	// non-empty, addRoute writes a redirect-only route block.
+	redirectStatus   *uint64
+	redirectLocation string
 	sticky           bool
 }
 
@@ -97,14 +143,20 @@ type renderModel struct {
 	// certProjections is the set of Secrets to write into the
 	// certificates dir (keyed by stem, first-writer-wins).
 	certProjections map[string]certProjection
-	sticky          bool
+	// passthroughHosts maps SNI → upstream "addr:port". A non-empty
+	// map triggers v2 schema emission for the whole file (v1 has no
+	// passthrough representation). FIRST-WRITER-WINS against both
+	// terminate hosts in `hosts` and other passthrough entries.
+	passthroughHosts map[string]string
+	sticky           bool
 }
 
 func newRenderModel() *renderModel {
 	return &renderModel{
-		hosts:           map[string]map[string]*routeCfg{},
-		hostCert:        map[string]string{},
-		certProjections: map[string]certProjection{},
+		hosts:            map[string]map[string]*routeCfg{},
+		hostCert:         map[string]string{},
+		certProjections:  map[string]certProjection{},
+		passthroughHosts: map[string]string{},
 	}
 }
 
@@ -132,7 +184,12 @@ func (m *renderModel) addCert(host, stem, ns, name string) {
 // conflict (sources are iterated in a stable order — Ingresses, then
 // HTTPRoutes, each sorted by namespace/name — so Ingress beats Gateway
 // and the result is reproducible regardless of informer ordering).
+// A host already claimed for SNI passthrough is also "taken" — adding
+// a terminate route on top of it would silently lose either side.
 func (m *renderModel) addRoute(host, path string, servers []backend, a annSettings, extraReq, extraResp []string) bool {
+	if _, claimed := m.passthroughHosts[host]; claimed {
+		return false
+	}
 	if m.hosts[host] == nil {
 		m.hosts[host] = map[string]*routeCfg{}
 	}
@@ -150,13 +207,34 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 		readTimeout:      a.readTimeout,
 		writeTimeout:     a.writeTimeout,
 		idleTimeout:      a.idleTimeout,
+		maxBodySize:      a.maxBodySize,
 		reqHeaders:       append(append([]string{}, a.reqHeaders...), extraReq...),
 		respHeaders:      append(append([]string{}, a.respHeaders...), extraResp...),
+		redirectStatus:   a.redirectStatus,
+		redirectLocation: a.redirectLocation,
 	}
 	m.hosts[host][path] = rc
 	if a.sticky {
 		m.sticky = true
 	}
+	return true
+}
+
+// addPassthroughHost claims `host` as an SNI-routed TCP passthrough
+// upstream. FIRST-WRITER-WINS: returns false if any terminate route
+// already exists for the host, or another passthrough is already
+// registered. Triggers v2 schema emission for the whole file.
+func (m *renderModel) addPassthroughHost(host, upstream string) bool {
+	if host == "" || upstream == "" {
+		return false
+	}
+	if _, claimed := m.passthroughHosts[host]; claimed {
+		return false
+	}
+	if existing, ok := m.hosts[host]; ok && len(existing) > 0 {
+		return false
+	}
+	m.passthroughHosts[host] = upstream
 	return true
 }
 
@@ -173,6 +251,42 @@ func parseUint(s string) *uint64 {
 		return &n
 	}
 	return nil
+}
+
+// parseSize parses an nginx-style size string: bare bytes ("1048576"),
+// or with a single suffix k/K, m/M, g/G (case-insensitive) for KiB/MiB/GiB.
+// Whitespace tolerated. Returns nil on any malformed input — same contract
+// as parseUint / parseBool, so an invalid annotation silently fails to
+// register (matching the rest of the parser's "best-effort" semantics).
+// Overflow on the multiplier is treated as malformed.
+func parseSize(s string) *uint64 {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return nil
+	}
+	mul := uint64(1)
+	last := t[len(t)-1]
+	switch last {
+	case 'k', 'K':
+		mul = 1024
+		t = t[:len(t)-1]
+	case 'm', 'M':
+		mul = 1024 * 1024
+		t = t[:len(t)-1]
+	case 'g', 'G':
+		mul = 1024 * 1024 * 1024
+		t = t[:len(t)-1]
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(t), 10, 64)
+	if err != nil {
+		return nil
+	}
+	if mul > 1 && n > (^uint64(0))/mul {
+		// would overflow the multiplication; treat as malformed
+		return nil
+	}
+	out := n * mul
+	return &out
 }
 
 func csv(s string) []string {
@@ -239,12 +353,73 @@ func parseAnnotations(ann map[string]string) annSettings {
 	if v, ok := get("idle-timeout"); ok {
 		s.idleTimeout = parseUint(v)
 	}
+	// proxy-body-size: per-route 413 cap (synapse enforces in synapse-proxy).
+	// synapse-compat key first, then the nginx-compat key as a fallback so
+	// existing ingress-nginx annotations migrate cleanly.
+	if v, ok := get("proxy-body-size"); ok {
+		s.maxBodySize = parseSize(v)
+	} else if v, ok := ann[nginxPrefix+"proxy-body-size"]; ok {
+		s.maxBodySize = parseSize(v)
+	}
 	if v, ok := get("request-headers"); ok {
 		s.reqHeaders = csv(v)
 	}
 	if v, ok := get("response-headers"); ok {
 		s.respHeaders = csv(v)
 	}
+	// server-alias: extra hostnames the route also answers on. nginx-compat
+	// fallback honored. Bare commas, whitespace tolerated (csv() trims).
+	if v, ok := get("server-alias"); ok {
+		s.serverAliases = csv(v)
+	} else if v, ok := ann[nginxPrefix+"server-alias"]; ok {
+		s.serverAliases = csv(v)
+	}
+	// ssl-passthrough: route TLS connections straight to a TCP upstream
+	// without termination. Triggers v2 schema emission. synapse-compat
+	// key first, then nginx-compat.
+	if v, ok := get("ssl-passthrough"); ok {
+		if b := parseBool(v); b != nil {
+			s.passthrough = *b
+		}
+	} else if v, ok := ann[nginxPrefix+"ssl-passthrough"]; ok {
+		if b := parseBool(v); b != nil {
+			s.passthrough = *b
+		}
+	}
+	// permanent-redirect / temporal-redirect (+ -code variants). nginx
+	// semantics: permanent-redirect default 301; temporal-redirect
+	// default 302; -code overrides the default. If both permanent and
+	// temporal are set on the same Ingress, permanent wins (stronger
+	// commitment). synapse-prefixed keys take precedence over nginx-
+	// compat keys via the get() helper.
+	pickRedirect := func(urlKey, codeKey string, defaultStatus uint64) {
+		var loc string
+		if v, ok := get(urlKey); ok {
+			loc = strings.TrimSpace(v)
+		} else if v, ok := ann[nginxPrefix+urlKey]; ok {
+			loc = strings.TrimSpace(v)
+		}
+		if loc == "" {
+			return
+		}
+		status := defaultStatus
+		var codeStr string
+		if v, ok := get(codeKey); ok {
+			codeStr = v
+		} else if v, ok := ann[nginxPrefix+codeKey]; ok {
+			codeStr = v
+		}
+		if codeStr != "" {
+			if n := parseUint(codeStr); n != nil {
+				status = *n
+			}
+		}
+		s.redirectLocation = loc
+		s.redirectStatus = &status
+	}
+	// temporal first so permanent can clobber it (permanent wins on tie)
+	pickRedirect("temporal-redirect", "temporal-redirect-code", 302)
+	pickRedirect("permanent-redirect", "permanent-redirect-code", 301)
 	if v, ok := get("sticky-sessions"); ok {
 		if b := parseBool(v); b != nil {
 			s.sticky = *b
@@ -325,6 +500,13 @@ func renderUpstreams(m *renderModel) string {
 			if rc.idleTimeout != nil {
 				fmt.Fprintf(&b, "        idle_timeout: %d\n", *rc.idleTimeout)
 			}
+			if rc.maxBodySize != nil {
+				fmt.Fprintf(&b, "        max_body_size: %d\n", *rc.maxBodySize)
+			}
+			if rc.redirectStatus != nil && rc.redirectLocation != "" {
+				fmt.Fprintf(&b, "        redirect:\n          status: %d\n          location: %q\n",
+					*rc.redirectStatus, rc.redirectLocation)
+			}
 			writeHeaderList(&b, "request_headers", rc.reqHeaders)
 			writeHeaderList(&b, "response_headers", rc.respHeaders)
 		}
@@ -339,5 +521,145 @@ func writeHeaderList(b *strings.Builder, key string, hs []string) {
 	fmt.Fprintf(b, "        %s:\n", key)
 	for _, h := range hs {
 		fmt.Fprintf(b, "          - %q\n", h)
+	}
+}
+
+// renderUpstreamsV2 emits the v2 synapse upstreams schema. Used when
+// at least one host is SNI passthrough — v1 has no passthrough
+// representation, so the whole file switches to v2. Terminate hosts
+// are emitted with full per-route fidelity (ssl_enabled, http2_enabled,
+// disable_access_log, max_body_size, force_https, timeouts, headers),
+// which requires synapse's RawRoute to carry those four knobs (see
+// synapse feat(upstreams_v2): per-route v1-compat knobs).
+func renderUpstreamsV2(m *renderModel) string {
+	var b strings.Builder
+	b.WriteString("# Generated by synapse-operator ingress controller. Do not edit.\n")
+	b.WriteString("version: 2\n")
+
+	if m.sticky {
+		b.WriteString("proxy:\n  sticky_sessions:\n    enabled: true\n")
+	}
+
+	// ACME HTTP-01 challenge backend: v2 expresses internal paths as a
+	// top-level `internal:` list (the v1 `internal_paths:` override).
+	if m.acme != "" {
+		fmt.Fprintf(&b, "internal:\n  - path: \"/.well-known/acme-challenge/*\"\n    upstream: %q\n", m.acme)
+	}
+
+	// Stable iteration: terminate hosts first (sorted), then passthrough
+	// hosts (sorted). Single emission per host. Deterministic output
+	// keeps writeIfChanged from triggering spurious reloads.
+	hostKeys := make([]string, 0, len(m.hosts)+len(m.passthroughHosts))
+	for h := range m.hosts {
+		hostKeys = append(hostKeys, h)
+	}
+	for h := range m.passthroughHosts {
+		hostKeys = append(hostKeys, h)
+	}
+	sort.Strings(hostKeys)
+
+	if len(hostKeys) == 0 {
+		return b.String()
+	}
+	b.WriteString("hosts:\n")
+	for _, h := range hostKeys {
+		fmt.Fprintf(&b, "  %q:\n", h)
+		if upstream, ok := m.passthroughHosts[h]; ok {
+			b.WriteString("    tls:\n      passthrough: true\n")
+			fmt.Fprintf(&b, "    upstream: %q\n", upstream)
+			continue
+		}
+		// terminate path
+		b.WriteString("    tls:\n      terminate:\n")
+		if stem := m.hostCert[h]; stem != "" {
+			fmt.Fprintf(&b, "        cert: %q\n", stem)
+		}
+		paths := m.hosts[h]
+		pathKeys := make([]string, 0, len(paths))
+		for p := range paths {
+			pathKeys = append(pathKeys, p)
+		}
+		sort.Strings(pathKeys)
+		b.WriteString("    paths:\n")
+		for _, p := range pathKeys {
+			rc := paths[p]
+			fmt.Fprintf(&b, "      %q:\n", p)
+			writeRouteV2(&b, rc)
+		}
+	}
+	return b.String()
+}
+
+// writeRouteV2 emits one v2 route block. Field ordering and indentation
+// match the v2 schema (synapse-utils RawRoute) — anything else fails
+// the deny_unknown_fields parser.
+func writeRouteV2(b *strings.Builder, rc *routeCfg) {
+	if len(rc.servers) == 1 && rc.servers[0].weight == 0 {
+		fmt.Fprintf(b, "        upstream: %q\n", rc.servers[0].addr)
+	} else {
+		b.WriteString("        upstreams:\n")
+		for _, sv := range rc.servers {
+			if sv.weight > 0 {
+				fmt.Fprintf(b, "          - { addr: %q, weight: %d }\n", sv.addr, sv.weight)
+			} else {
+				fmt.Fprintf(b, "          - %q\n", sv.addr)
+			}
+		}
+	}
+	if rc.ssl != nil {
+		fmt.Fprintf(b, "        ssl_enabled: %t\n", *rc.ssl)
+	}
+	if rc.http2 != nil {
+		fmt.Fprintf(b, "        http2_enabled: %t\n", *rc.http2)
+	}
+	if rc.forceHTTPS != nil && *rc.forceHTTPS {
+		b.WriteString("        force_https: true\n")
+	}
+	if rc.healthcheck != nil && *rc.healthcheck {
+		// v2 requires a structured health_check. v1 had only a boolean,
+		// so fall back to the simplest type: TCP. Operators that need
+		// HTTP health checks can hand-edit upstreams.yaml or extend
+		// the annotation set later.
+		b.WriteString("        health_check:\n          type: tcp\n")
+	}
+	if rc.disableAccessLog != nil {
+		fmt.Fprintf(b, "        disable_access_log: %t\n", *rc.disableAccessLog)
+	}
+	if rc.maxBodySize != nil {
+		fmt.Fprintf(b, "        max_body_size: %d\n", *rc.maxBodySize)
+	}
+	if rc.redirectStatus != nil && rc.redirectLocation != "" {
+		fmt.Fprintf(b, "        redirect:\n          status: %d\n          location: %q\n",
+			*rc.redirectStatus, rc.redirectLocation)
+	}
+	if rc.connectTimeout != nil || rc.readTimeout != nil || rc.writeTimeout != nil || rc.idleTimeout != nil {
+		b.WriteString("        timeouts:\n")
+		if rc.connectTimeout != nil {
+			fmt.Fprintf(b, "          connect: %d\n", *rc.connectTimeout)
+		}
+		if rc.readTimeout != nil {
+			fmt.Fprintf(b, "          read: %d\n", *rc.readTimeout)
+		}
+		if rc.writeTimeout != nil {
+			fmt.Fprintf(b, "          write: %d\n", *rc.writeTimeout)
+		}
+		if rc.idleTimeout != nil {
+			fmt.Fprintf(b, "          idle: %d\n", *rc.idleTimeout)
+		}
+	}
+	if len(rc.reqHeaders) > 0 || len(rc.respHeaders) > 0 {
+		b.WriteString("        headers:\n")
+		if len(rc.reqHeaders) > 0 {
+			b.WriteString("          request:\n")
+			for _, h := range rc.reqHeaders {
+				fmt.Fprintf(b, "            - %q\n", h)
+			}
+		}
+		if len(rc.respHeaders) > 0 {
+			b.WriteString("          response:\n")
+			for _, h := range rc.respHeaders {
+				fmt.Fprintf(b, "            - %q\n", h)
+			}
+		}
 	}
 }
