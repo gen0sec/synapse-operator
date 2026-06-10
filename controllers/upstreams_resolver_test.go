@@ -52,7 +52,7 @@ upstreams:
         servers:
           - data-api.services.svc.cluster.local:80
 `
-	out, sum, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, sum, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestResolveYAML_MissingService_PassedThrough(t *testing.T) {
         servers:
           - auth-api.services.svc.cluster.local:80
 `
-	out, sum, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, sum, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestResolveYAML_IPLiteral_LeftAlone(t *testing.T) {
         servers:
           - 10.0.0.5:80
 `
-	out, sum, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, sum, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestResolveYAML_HeadlessService_PassedThrough(t *testing.T) {
         servers:
           - headless-api.services.svc.cluster.local:80
 `
-	out, _, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, _, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestResolveYAML_NonClusterDomain_PassedThrough(t *testing.T) {
         servers:
           - other.example.com:443
 `
-	out, _, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, _, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestResolveYAML_PreservesOtherPathFields(t *testing.T) {
         servers:
           - auth-api.services.svc.cluster.local:80
 `
-	out, _, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, _, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestResolveYAML_PreservesOtherPathFields(t *testing.T) {
 }
 
 func TestResolveYAML_ShortFormUsesDefaultNamespace(t *testing.T) {
-	r := resolverWithServices(t, svc("ingress-synapse", "telemetry-api", "10.0.0.9"))
+	r := resolverWithServices(t, svc("synapse-os", "telemetry-api", "10.0.0.9"))
 	in := `upstreams:
   api.gen0sec.com:
     paths:
@@ -184,7 +184,7 @@ func TestResolveYAML_ShortFormUsesDefaultNamespace(t *testing.T) {
         servers:
           - telemetry-api:80
 `
-	out, sum, err := r.resolveYAML(context.Background(), "ingress-synapse", in)
+	out, sum, err := r.resolveYAML(context.Background(), "synapse-os", in)
 	if err != nil {
 		t.Fatalf("resolveYAML: %v", err)
 	}

@@ -596,7 +596,7 @@ func TestRender_WritesConfigMap_AndCreatesIfMissing(t *testing.T) {
 		Client:                   c,
 		IngressClassName:         "synapse",
 		ClusterDomain:            "cluster.local",
-		UpstreamsOutConfigMap:    types.NamespacedName{Namespace: "ingress-synapse", Name: "synapse-ingress-rendered"},
+		UpstreamsOutConfigMap:    types.NamespacedName{Namespace: "synapse-os", Name: "synapse-ingress-rendered"},
 		ResolveBackendClusterIPs: true,
 	}
 	changed, matched, hosts, err := r.render(context.Background())
@@ -605,7 +605,7 @@ func TestRender_WritesConfigMap_AndCreatesIfMissing(t *testing.T) {
 	}
 	var got corev1.ConfigMap
 	if err := c.Get(context.Background(), types.NamespacedName{
-		Namespace: "ingress-synapse", Name: "synapse-ingress-rendered",
+		Namespace: "synapse-os", Name: "synapse-ingress-rendered",
 	}, &got); err != nil {
 		t.Fatalf("output ConfigMap not created: %v", err)
 	}
