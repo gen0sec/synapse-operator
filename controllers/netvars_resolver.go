@@ -67,6 +67,19 @@ const NetVarsSourceLabel = "synapse.gen0sec.com/resolve-netvars"
 // to its value verbatim (auto-discovery is skipped).
 const HomeNetOverrideAnnotation = "synapse.gen0sec.com/home-net"
 
+// NetVarsManagedAnnotation records how the operator is currently managing
+// HOME_NET on this ConfigMap, so a value the operator auto-derived is not
+// later mistaken for a user-pinned one. Without this marker, the first
+// auto-fill writes a concrete (non-"any") HOME_NET, and the next reconcile
+// would see that value and treat it as manual — freezing auto-discovery so
+// Node/Service changes never re-derive. Values: "auto" | "manual".
+const NetVarsManagedAnnotation = "synapse.gen0sec.com/netvars-managed"
+
+const (
+	managedAuto   = "auto"
+	managedManual = "manual"
+)
+
 // SynapseConfigKey is the ConfigMap key holding the synapse YAML config.
 const SynapseConfigKey = "config.yaml"
 
@@ -121,16 +134,29 @@ func (r *NetVarsResolverReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	newRaw, changed, err := setIdsAddressVars(raw, homeNet, "!$HOME_NET")
+	newRaw, configChanged, err := setIdsAddressVars(raw, homeNet, "!$HOME_NET")
 	if err != nil {
 		logger.Error(err, "failed to rewrite config.yaml address_vars")
 		return ctrl.Result{}, err
 	}
-	if !changed {
+
+	// Record the management mode so a future reconcile re-derives an auto value
+	// (instead of mistaking it for a manual pin). See NetVarsManagedAnnotation.
+	desiredManaged := managedAuto
+	if manual {
+		desiredManaged = managedManual
+	}
+	annotationChanged := cm.Annotations[NetVarsManagedAnnotation] != desiredManaged
+
+	if !configChanged && !annotationChanged {
 		return ctrl.Result{}, nil
 	}
 
 	cm.Data[SynapseConfigKey] = newRaw
+	if cm.Annotations == nil {
+		cm.Annotations = map[string]string{}
+	}
+	cm.Annotations[NetVarsManagedAnnotation] = desiredManaged
 	if err := r.Update(ctx, &cm); err != nil {
 		logger.Error(err, "failed to write HOME_NET/EXTERNAL_NET into ConfigMap")
 		return ctrl.Result{}, err
@@ -139,14 +165,24 @@ func (r *NetVarsResolverReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{}, nil
 }
 
-// desiredHomeNet decides HOME_NET: annotation override > non-"any" config
-// value (manual) > auto-discovery. Returns (value, manual?).
+// desiredHomeNet decides HOME_NET. Precedence:
+//  1. the home-net override annotation -> manual (verbatim);
+//  2. operator-managed auto (the netvars-managed=auto marker is present) ->
+//     re-derive from the cluster, even though the current value is non-"any";
+//  3. an empty / "any" value -> adopt auto;
+//  4. a non-"any" value with no auto marker -> a genuine user pin -> manual.
+//
+// Cases 2 and 4 are what the managed marker disambiguates: both have a concrete
+// HOME_NET in the config, but only case 4 was put there by a human.
 func (r *NetVarsResolverReconciler) desiredHomeNet(ctx context.Context, cm *corev1.ConfigMap, raw string) (string, bool, error) {
 	if ov, ok := cm.Annotations[HomeNetOverrideAnnotation]; ok && strings.TrimSpace(ov) != "" {
 		return strings.TrimSpace(ov), true, nil
 	}
-	if cur := currentHomeNet(raw); cur != "" && !strings.EqualFold(cur, "any") {
-		// User pinned it in the config — respect it verbatim.
+	cur := currentHomeNet(raw)
+	operatorManagedAuto := cm.Annotations[NetVarsManagedAnnotation] == managedAuto
+	userPinned := cur != "" && !strings.EqualFold(cur, "any") && !operatorManagedAuto
+	if userPinned {
+		// Concrete value the operator never wrote — respect it verbatim.
 		return cur, true, nil
 	}
 	auto, err := r.autoHomeNet(ctx)
