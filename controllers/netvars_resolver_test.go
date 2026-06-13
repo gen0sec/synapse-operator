@@ -9,8 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 )
 
@@ -99,6 +99,22 @@ func readBackNetVars(t *testing.T, r *NetVarsResolverReconciler) (string, string
 	return home, ext
 }
 
+// readBackHomeNetFrom extracts HOME_NET/EXTERNAL_NET from an already-fetched CM.
+func readBackHomeNetFrom(t *testing.T, cm *corev1.ConfigMap) (string, string) {
+	t.Helper()
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(cm.Data[SynapseConfigKey]), &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	av := nestedMap(root, "ids", "address_vars")
+	if av == nil {
+		return "", ""
+	}
+	home, _ := av["HOME_NET"].(string)
+	ext, _ := av["EXTERNAL_NET"].(string)
+	return home, ext
+}
+
 const labelOn = NetVarsSourceLabel
 
 func TestNetVars_AutoFromNodes(t *testing.T) {
@@ -111,7 +127,7 @@ func TestNetVars_AutoFromNodes(t *testing.T) {
 
 	for _, want := range []string{
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", // supernets
-		"203.0.113.5/32",   // node external IP as /32
+		"203.0.113.5/32",                 // node external IP as /32
 		"10.244.0.0/24", "10.244.1.0/24", // pod CIDRs
 	} {
 		if !strings.Contains(home, want) {
@@ -134,6 +150,65 @@ func TestNetVars_LoadBalancerIPIsHome(t *testing.T) {
 	home, _ := readBackNetVars(t, r)
 	if !strings.Contains(home, "203.0.113.200/32") {
 		t.Errorf("LoadBalancer VIP must be in HOME_NET; got %q", home)
+	}
+}
+
+func TestNetVars_AutoIsNotSticky_ReDerivesOnNodeChange(t *testing.T) {
+	// Regression for bug A: after auto-fill writes a concrete HOME_NET, a later
+	// reconcile must keep re-deriving (it must not mistake its own value for a
+	// manual pin). The netvars-managed=auto marker disambiguates.
+	cm := srcCM("ids:\n  enabled: true\n", map[string]string{labelOn: "true"}, nil)
+	r := netvarsWith(t, cm, node("n1", "10.0.0.30", "203.0.113.5", "10.244.0.0/24"))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "synapse-os", Name: "synapse-agent-config"}}
+
+	// First reconcile: auto-fill.
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	var after1 corev1.ConfigMap
+	_ = r.Get(context.Background(), req.NamespacedName, &after1)
+	if after1.Annotations[NetVarsManagedAnnotation] != managedAuto {
+		t.Fatalf("expected netvars-managed=auto, got %q", after1.Annotations[NetVarsManagedAnnotation])
+	}
+	home1, _ := readBackHomeNetFrom(t, &after1)
+	if !strings.Contains(home1, "203.0.113.5/32") {
+		t.Fatalf("first auto fill missing node IP: %q", home1)
+	}
+
+	// Add a node, reconcile again: must re-derive and include the new node IP.
+	n2 := node("n2", "10.0.0.31", "198.51.100.9", "10.244.1.0/24")
+	if err := r.Create(context.Background(), &n2); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	var after2 corev1.ConfigMap
+	_ = r.Get(context.Background(), req.NamespacedName, &after2)
+	home2, _ := readBackHomeNetFrom(t, &after2)
+	if !strings.Contains(home2, "198.51.100.9/32") {
+		t.Errorf("auto did not re-derive on node change (sticky bug); HOME_NET=%q", home2)
+	}
+}
+
+func TestNetVars_GenuineManualRespected_NoMarker(t *testing.T) {
+	// A concrete HOME_NET with NO managed marker is a real user pin -> verbatim,
+	// and the operator records managed=manual.
+	cm := srcCM("ids:\n  address_vars:\n    HOME_NET: \"[192.168.99.0/24]\"\n",
+		map[string]string{labelOn: "true"}, nil)
+	r := netvarsWith(t, cm, node("n1", "10.0.0.30", "203.0.113.5", "10.244.0.0/24"))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "synapse-os", Name: "synapse-agent-config"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var out corev1.ConfigMap
+	_ = r.Get(context.Background(), req.NamespacedName, &out)
+	home, _ := readBackHomeNetFrom(t, &out)
+	if home != "[192.168.99.0/24]" {
+		t.Errorf("manual HOME_NET not preserved: %q", home)
+	}
+	if out.Annotations[NetVarsManagedAnnotation] != managedManual {
+		t.Errorf("expected managed=manual, got %q", out.Annotations[NetVarsManagedAnnotation])
 	}
 }
 

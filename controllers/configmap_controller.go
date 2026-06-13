@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/yaml"
 )
 
 // ConfigMapReconciler watches Synapse config ConfigMaps/Secrets and forces a rollout on the workload when the config changes.
@@ -29,6 +30,14 @@ type ConfigMapReconciler struct {
 	ConfigHashAnnotation string
 	IgnoredConfigMapKeys map[string]struct{}
 	IgnoredSecretKeys    map[string]struct{}
+	// ExcludeHotReloadIdsFields, when true, canonicalizes the hot-reloadable
+	// thalamus IDS subtree out of config.yaml before hashing, so a change to
+	// ONLY those fields (HOME_NET/EXTERNAL_NET, enforce_block, rule_paths,
+	// port_vars, flow_timeout/max_flows) does NOT bump the config hash and thus
+	// does NOT roll the workload — the agent hot-reloads them in process. Other
+	// config.yaml changes still roll. Only safe once all agents run an image
+	// that hot-reloads these fields (synapse r32+).
+	ExcludeHotReloadIdsFields bool
 }
 
 // Reconcile reacts to ConfigMap/Secret updates by updating the pod template annotation on Synapse workloads.
@@ -125,7 +134,7 @@ func (r *ConfigMapReconciler) computeCombinedHash(ctx context.Context, namespace
 		return "", err
 	}
 
-	return hashConfigSources(configMaps.Items, secrets.Items, r.IgnoredConfigMapKeys, r.IgnoredSecretKeys), nil
+	return hashConfigSources(configMaps.Items, secrets.Items, r.IgnoredConfigMapKeys, r.IgnoredSecretKeys, r.ExcludeHotReloadIdsFields), nil
 }
 
 func (r *ConfigMapReconciler) patchDeployments(ctx context.Context, namespace, hash string, logger logr.Logger) error {
@@ -251,7 +260,7 @@ func patchStatefulSetHash(ctx context.Context, c client.Client, statefulSet *app
 	return true, c.Patch(ctx, statefulSet, client.MergeFrom(original))
 }
 
-func hashConfigSources(configMaps []corev1.ConfigMap, secrets []corev1.Secret, ignoredConfigMapKeys, ignoredSecretKeys map[string]struct{}) string {
+func hashConfigSources(configMaps []corev1.ConfigMap, secrets []corev1.Secret, ignoredConfigMapKeys, ignoredSecretKeys map[string]struct{}, excludeHotReloadIds bool) string {
 	type hashEntry struct {
 		key  string
 		hash string
@@ -260,7 +269,7 @@ func hashConfigSources(configMaps []corev1.ConfigMap, secrets []corev1.Secret, i
 	entries := make([]hashEntry, 0, len(configMaps)+len(secrets))
 	for i := range configMaps {
 		cfg := &configMaps[i]
-		hash := hashConfigMapContent(cfg, ignoredConfigMapKeys)
+		hash := hashConfigMapContent(cfg, ignoredConfigMapKeys, excludeHotReloadIds)
 		if hash == "" {
 			continue
 		}
@@ -300,7 +309,7 @@ func hashConfigSources(configMaps []corev1.ConfigMap, secrets []corev1.Secret, i
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-func hashConfigMapContent(cfg *corev1.ConfigMap, ignoredKeys map[string]struct{}) string {
+func hashConfigMapContent(cfg *corev1.ConfigMap, ignoredKeys map[string]struct{}, excludeHotReloadIds bool) string {
 	if len(cfg.Data) == 0 && len(cfg.BinaryData) == 0 {
 		return ""
 	}
@@ -328,10 +337,14 @@ func hashConfigMapContent(cfg *corev1.ConfigMap, ignoredKeys map[string]struct{}
 		switch {
 		case len(k) > 2 && k[0:2] == "s:":
 			key := k[2:]
+			value := cfg.Data[key]
+			if excludeHotReloadIds && key == SynapseConfigKey {
+				value = canonicalConfigSansHotReloadIds(value)
+			}
 			hasher.Write([]byte("s"))
 			hasher.Write([]byte(key))
 			hasher.Write([]byte{0})
-			hasher.Write([]byte(cfg.Data[key]))
+			hasher.Write([]byte(value))
 		case len(k) > 2 && k[0:2] == "b:":
 			key := k[2:]
 			hasher.Write([]byte("b"))
@@ -342,6 +355,54 @@ func hashConfigMapContent(cfg *corev1.ConfigMap, ignoredKeys map[string]struct{}
 		hasher.Write([]byte{0})
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// hotReloadIdsFields are the thalamus IDS config fields the synapse agent
+// applies in process (no restart) on a config reload. Stripping them from the
+// hash means a change to ONLY these does not roll the workload. Keep in sync
+// with synapse-idp's hot_reload_ids_runtime (ids_engine_fields_changed +
+// enforce_block).
+var hotReloadIdsFields = []string{
+	"address_vars",
+	"enforce_block",
+	"rule_paths",
+	"port_vars",
+	"flow_timeout_secs",
+	"max_flows",
+}
+
+// canonicalConfigSansHotReloadIds parses config.yaml, deletes the
+// hot-reloadable IDS fields (under both `ids` and the deprecated
+// `firewall.ids`), and re-marshals deterministically. If the content can't be
+// parsed it is returned unchanged (fail-safe: the workload still rolls).
+func canonicalConfigSansHotReloadIds(raw string) string {
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &root); err != nil || root == nil {
+		return raw
+	}
+	stripHotReloadIdsFields(idsSubtree(root, "ids"))
+	if fw, ok := root["firewall"].(map[string]any); ok {
+		stripHotReloadIdsFields(idsSubtree(fw, "ids"))
+	}
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return raw
+	}
+	return string(out)
+}
+
+func idsSubtree(parent map[string]any, key string) map[string]any {
+	ids, _ := parent[key].(map[string]any)
+	return ids
+}
+
+func stripHotReloadIdsFields(ids map[string]any) {
+	if ids == nil {
+		return
+	}
+	for _, f := range hotReloadIdsFields {
+		delete(ids, f)
+	}
 }
 
 func hashSecretContent(secret *corev1.Secret, ignoredKeys map[string]struct{}) string {
