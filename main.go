@@ -51,6 +51,7 @@ func main() {
 	var ignoredSecretKeys string
 	var ingressMode bool
 	var upstreamsResolver bool
+	var netvarsResolver bool
 	var renderOnce bool
 	var ingressClass string
 	var upstreamsOut string
@@ -81,6 +82,7 @@ func main() {
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
 	flag.BoolVar(&ingressMode, "ingress-mode", false, "Run as a Kubernetes Ingress + Gateway API controller (sidecar) instead of the config-hash controller: render class-matched Ingresses/HTTPRoutes into a synapse upstreams.yaml.")
 	flag.BoolVar(&upstreamsResolver, "upstreams-resolver", false, "Enable the UpstreamsResolverReconciler: watch ConfigMaps labelled synapse.gen0sec.com/resolve-upstreams=true, substitute backend Service DNS names with their ClusterIPs, write the result to a sibling ConfigMap. Composable with other modes.")
+	flag.BoolVar(&netvarsResolver, "netvars-resolver", false, "Enable the NetVarsResolverReconciler: watch synapse agent config ConfigMaps labelled synapse.gen0sec.com/resolve-netvars=true and fill ids.address_vars.HOME_NET/EXTERNAL_NET from cluster Node IPs + PodCIDRs + RFC1918 supernets (so inline IDS blocking never bans an internal IP). Honours a manual HOME_NET in the config or the synapse.gen0sec.com/home-net annotation. Composable with other modes.")
 	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode, sidecar layout: a shared volume synapse inotify-reloads). Ignored when --upstreams-out-configmap is set.")
@@ -231,6 +233,18 @@ func main() {
 			os.Exit(1)
 		}
 		ur.LogStartup(setupLog)
+	}
+
+	if netvarsResolver {
+		nr := &controllers.NetVarsResolverReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}
+		if err = nr.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "NetVarsResolver")
+			os.Exit(1)
+		}
+		nr.LogStartup(setupLog)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
