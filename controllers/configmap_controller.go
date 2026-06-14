@@ -38,6 +38,13 @@ type ConfigMapReconciler struct {
 	// config.yaml changes still roll. Only safe once all agents run an image
 	// that hot-reloads these fields (synapse r32+).
 	ExcludeHotReloadIdsFields bool
+	// PerWorkloadConfigHash, when true, stamps each workload with a hash of ONLY
+	// the labelled ConfigMaps/Secrets it actually references (volumes, envFrom,
+	// env valueFrom) instead of one combined hash over every labelled source in
+	// the namespace. This stops an unrelated config change (e.g. the agent's
+	// rules) from rolling other workloads (e.g. the proxy). A workload that
+	// references no labelled source is left untouched.
+	PerWorkloadConfigHash bool
 }
 
 // Reconcile reacts to ConfigMap/Secret updates by updating the pod template annotation on Synapse workloads.
@@ -58,22 +65,23 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	hash, err := r.computeCombinedHash(ctx, req.Namespace)
+	cms, secrets, err := r.listConfigSources(ctx, req.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if hash == "" {
+	combined := hashConfigSources(cms, secrets, r.IgnoredConfigMapKeys, r.IgnoredSecretKeys, r.ExcludeHotReloadIdsFields)
+	if combined == "" && !r.PerWorkloadConfigHash {
 		logger.Info("No config sources found, skipping rollout")
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.patchDeployments(ctx, req.Namespace, hash, logger); err != nil {
+	if err := r.patchDeployments(ctx, req.Namespace, cms, secrets, combined, logger); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.patchDaemonSets(ctx, req.Namespace, hash, logger); err != nil {
+	if err := r.patchDaemonSets(ctx, req.Namespace, cms, secrets, combined, logger); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.patchStatefulSets(ctx, req.Namespace, hash, logger); err != nil {
+	if err := r.patchStatefulSets(ctx, req.Namespace, cms, secrets, combined, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -113,7 +121,8 @@ func (r *ConfigMapReconciler) selector() labels.Selector {
 	return r.LabelSelector
 }
 
-func (r *ConfigMapReconciler) computeCombinedHash(ctx context.Context, namespace string) (string, error) {
+// listConfigSources returns all labelled ConfigMaps + Secrets in the namespace.
+func (r *ConfigMapReconciler) listConfigSources(ctx context.Context, namespace string) ([]corev1.ConfigMap, []corev1.Secret, error) {
 	configMaps := &corev1.ConfigMapList{}
 	if err := r.List(
 		ctx,
@@ -121,7 +130,7 @@ func (r *ConfigMapReconciler) computeCombinedHash(ctx context.Context, namespace
 		client.InNamespace(namespace),
 		client.MatchingLabelsSelector{Selector: r.selector()},
 	); err != nil {
-		return "", err
+		return nil, nil, err
 	}
 
 	secrets := &corev1.SecretList{}
@@ -131,13 +140,98 @@ func (r *ConfigMapReconciler) computeCombinedHash(ctx context.Context, namespace
 		client.InNamespace(namespace),
 		client.MatchingLabelsSelector{Selector: r.selector()},
 	); err != nil {
-		return "", err
+		return nil, nil, err
 	}
 
-	return hashConfigSources(configMaps.Items, secrets.Items, r.IgnoredConfigMapKeys, r.IgnoredSecretKeys, r.ExcludeHotReloadIdsFields), nil
+	return configMaps.Items, secrets.Items, nil
 }
 
-func (r *ConfigMapReconciler) patchDeployments(ctx context.Context, namespace, hash string, logger logr.Logger) error {
+// hashForWorkload returns the config hash to stamp on a workload. In combined
+// mode it's the namespace-wide hash. In per-workload mode it's a hash over only
+// the labelled sources the workload references (volumes/envFrom/env) — so an
+// unrelated config change doesn't roll it. Returns "" when per-workload mode
+// finds no referenced labelled source (caller leaves the workload untouched).
+func (r *ConfigMapReconciler) hashForWorkload(spec *corev1.PodSpec, cms []corev1.ConfigMap, secrets []corev1.Secret, combined string) string {
+	if !r.PerWorkloadConfigHash {
+		return combined
+	}
+	refCMs, refSecrets := referencedSources(spec)
+	fcms := filterConfigMaps(cms, refCMs)
+	fsecrets := filterSecrets(secrets, refSecrets)
+	return hashConfigSources(fcms, fsecrets, r.IgnoredConfigMapKeys, r.IgnoredSecretKeys, r.ExcludeHotReloadIdsFields)
+}
+
+// referencedSources collects ConfigMap/Secret names a pod spec references via
+// volumes (incl. projected), envFrom, and env valueFrom.
+func referencedSources(spec *corev1.PodSpec) (map[string]struct{}, map[string]struct{}) {
+	cms := map[string]struct{}{}
+	secs := map[string]struct{}{}
+	for i := range spec.Volumes {
+		v := &spec.Volumes[i]
+		if v.ConfigMap != nil {
+			cms[v.ConfigMap.Name] = struct{}{}
+		}
+		if v.Secret != nil {
+			secs[v.Secret.SecretName] = struct{}{}
+		}
+		if v.Projected != nil {
+			for _, s := range v.Projected.Sources {
+				if s.ConfigMap != nil {
+					cms[s.ConfigMap.Name] = struct{}{}
+				}
+				if s.Secret != nil {
+					secs[s.Secret.Name] = struct{}{}
+				}
+			}
+		}
+	}
+	containers := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+	for i := range containers {
+		c := &containers[i]
+		for _, ef := range c.EnvFrom {
+			if ef.ConfigMapRef != nil {
+				cms[ef.ConfigMapRef.Name] = struct{}{}
+			}
+			if ef.SecretRef != nil {
+				secs[ef.SecretRef.Name] = struct{}{}
+			}
+		}
+		for _, e := range c.Env {
+			if e.ValueFrom == nil {
+				continue
+			}
+			if e.ValueFrom.ConfigMapKeyRef != nil {
+				cms[e.ValueFrom.ConfigMapKeyRef.Name] = struct{}{}
+			}
+			if e.ValueFrom.SecretKeyRef != nil {
+				secs[e.ValueFrom.SecretKeyRef.Name] = struct{}{}
+			}
+		}
+	}
+	return cms, secs
+}
+
+func filterConfigMaps(cms []corev1.ConfigMap, names map[string]struct{}) []corev1.ConfigMap {
+	out := make([]corev1.ConfigMap, 0, len(names))
+	for i := range cms {
+		if _, ok := names[cms[i].Name]; ok {
+			out = append(out, cms[i])
+		}
+	}
+	return out
+}
+
+func filterSecrets(secrets []corev1.Secret, names map[string]struct{}) []corev1.Secret {
+	out := make([]corev1.Secret, 0, len(names))
+	for i := range secrets {
+		if _, ok := names[secrets[i].Name]; ok {
+			out = append(out, secrets[i])
+		}
+	}
+	return out
+}
+
+func (r *ConfigMapReconciler) patchDeployments(ctx context.Context, namespace string, cms []corev1.ConfigMap, secrets []corev1.Secret, combined string, logger logr.Logger) error {
 	deployments := &appsv1.DeploymentList{}
 	if err := r.List(
 		ctx,
@@ -151,6 +245,11 @@ func (r *ConfigMapReconciler) patchDeployments(ctx context.Context, namespace, h
 	for i := range deployments.Items {
 		deploy := &deployments.Items[i]
 		itemLogger := logger.WithValues("deployment", deploy.Name)
+		hash := r.hashForWorkload(&deploy.Spec.Template.Spec, cms, secrets, combined)
+		if hash == "" {
+			itemLogger.V(1).Info("Deployment references no labelled config, skipping")
+			continue
+		}
 		updated, err := patchDeploymentHash(ctx, r.Client, deploy, r.ConfigHashAnnotation, hash)
 		if err != nil {
 			itemLogger.Error(err, "failed to update deployment with new config hash")
@@ -166,7 +265,7 @@ func (r *ConfigMapReconciler) patchDeployments(ctx context.Context, namespace, h
 	return nil
 }
 
-func (r *ConfigMapReconciler) patchDaemonSets(ctx context.Context, namespace, hash string, logger logr.Logger) error {
+func (r *ConfigMapReconciler) patchDaemonSets(ctx context.Context, namespace string, cms []corev1.ConfigMap, secrets []corev1.Secret, combined string, logger logr.Logger) error {
 	daemonSets := &appsv1.DaemonSetList{}
 	if err := r.List(
 		ctx,
@@ -180,6 +279,11 @@ func (r *ConfigMapReconciler) patchDaemonSets(ctx context.Context, namespace, ha
 	for i := range daemonSets.Items {
 		daemonSet := &daemonSets.Items[i]
 		itemLogger := logger.WithValues("daemonset", daemonSet.Name)
+		hash := r.hashForWorkload(&daemonSet.Spec.Template.Spec, cms, secrets, combined)
+		if hash == "" {
+			itemLogger.V(1).Info("DaemonSet references no labelled config, skipping")
+			continue
+		}
 		updated, err := patchDaemonSetHash(ctx, r.Client, daemonSet, r.ConfigHashAnnotation, hash)
 		if err != nil {
 			itemLogger.Error(err, "failed to update daemonset with new config hash")
@@ -195,7 +299,7 @@ func (r *ConfigMapReconciler) patchDaemonSets(ctx context.Context, namespace, ha
 	return nil
 }
 
-func (r *ConfigMapReconciler) patchStatefulSets(ctx context.Context, namespace, hash string, logger logr.Logger) error {
+func (r *ConfigMapReconciler) patchStatefulSets(ctx context.Context, namespace string, cms []corev1.ConfigMap, secrets []corev1.Secret, combined string, logger logr.Logger) error {
 	statefulSets := &appsv1.StatefulSetList{}
 	if err := r.List(
 		ctx,
@@ -209,6 +313,11 @@ func (r *ConfigMapReconciler) patchStatefulSets(ctx context.Context, namespace, 
 	for i := range statefulSets.Items {
 		statefulSet := &statefulSets.Items[i]
 		itemLogger := logger.WithValues("statefulset", statefulSet.Name)
+		hash := r.hashForWorkload(&statefulSet.Spec.Template.Spec, cms, secrets, combined)
+		if hash == "" {
+			itemLogger.V(1).Info("StatefulSet references no labelled config, skipping")
+			continue
+		}
 		updated, err := patchStatefulSetHash(ctx, r.Client, statefulSet, r.ConfigHashAnnotation, hash)
 		if err != nil {
 			itemLogger.Error(err, "failed to update statefulset with new config hash")

@@ -53,6 +53,7 @@ func main() {
 	var upstreamsResolver bool
 	var netvarsResolver bool
 	var idsHotReloadHashExclude bool
+	var perWorkloadConfigHash bool
 	var renderOnce bool
 	var ingressClass string
 	var upstreamsOut string
@@ -85,6 +86,7 @@ func main() {
 	flag.BoolVar(&upstreamsResolver, "upstreams-resolver", false, "Enable the UpstreamsResolverReconciler: watch ConfigMaps labelled synapse.gen0sec.com/resolve-upstreams=true, substitute backend Service DNS names with their ClusterIPs, write the result to a sibling ConfigMap. Composable with other modes.")
 	flag.BoolVar(&netvarsResolver, "netvars-resolver", false, "Enable the NetVarsResolverReconciler: watch synapse agent config ConfigMaps labelled synapse.gen0sec.com/resolve-netvars=true and fill ids.address_vars.HOME_NET/EXTERNAL_NET from cluster Node IPs + PodCIDRs + LoadBalancer VIPs + RFC1918 supernets (so inline IDS blocking never bans an internal IP). Honours a manual HOME_NET in the config or the synapse.gen0sec.com/home-net annotation. Composable with other modes.")
 	flag.BoolVar(&idsHotReloadHashExclude, "ids-hot-reload-hash-exclude", false, "Exclude the hot-reloadable thalamus IDS fields (ids.address_vars/enforce_block/rule_paths/port_vars/flow_timeout_secs/max_flows) from the config-hash, so a change to ONLY those does not roll the workload (the agent hot-reloads them in process). Other config.yaml changes still roll. Only safe once all agents run a synapse image that hot-reloads these fields (r32+).")
+	flag.BoolVar(&perWorkloadConfigHash, "per-workload-config-hash", false, "Stamp each workload with a hash of ONLY the labelled ConfigMaps/Secrets it actually references (volumes/envFrom/env), instead of one combined hash over every labelled source in the namespace. Stops an unrelated config change (e.g. agent rules) from rolling other workloads (e.g. the proxy). A workload that references no labelled source is left untouched.")
 	flag.BoolVar(&renderOnce, "render-once", false, "Ingress-mode one-shot: render upstreams.yaml from current Ingresses/HTTPRoutes and exit (initContainer; primes the file before synapse starts).")
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode, sidecar layout: a shared volume synapse inotify-reloads). Ignored when --upstreams-out-configmap is set.")
@@ -220,6 +222,7 @@ func main() {
 		IgnoredConfigMapKeys:      ignoredConfigMapSet,
 		IgnoredSecretKeys:         ignoredSecretSet,
 		ExcludeHotReloadIdsFields: idsHotReloadHashExclude,
+		PerWorkloadConfigHash:     perWorkloadConfigHash,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ConfigMap")
 		os.Exit(1)
