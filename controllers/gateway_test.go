@@ -73,6 +73,17 @@ func TestRegexRouteRender(t *testing.T) {
 	}
 }
 
+// A path regex stored without a leading `^` (k8s requires the Ingress path to
+// begin with `/`) is anchored at the start by the renderer.
+func TestRegexAnchoring(t *testing.T) {
+	m := newRenderModel()
+	m.addRegexRoute("h", "/api/runs/[^/]+/stream$", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+	want := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
+	if out := renderUpstreams(m); !strings.Contains(out, want) {
+		t.Fatalf("unanchored path regex must be ^-anchored:\nwant %s\ngot:\n%s", want, out)
+	}
+}
+
 // Gateway API weight semantics: weight 0 ⇒ no traffic (excluded);
 // unset-with-others ⇒ default 1; no weights at all ⇒ unweighted.
 func TestRuleBackends_WeightSemantics(t *testing.T) {
