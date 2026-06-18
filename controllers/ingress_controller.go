@@ -274,6 +274,31 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				if path == "" {
 					path = "/"
 				}
+				// nginx `use-regex: "true"`: the path is a POSIX regex →
+				// render a synapse match_expr regex route (under the primary host
+				// and any server-aliases). Otherwise fall through to prefix/Exact.
+				if a.useRegex {
+					if !m.addRegexRoute(host, path, []backend{{addr: addr}}, a, nil, nil) {
+						logger.Info("regex route conflict ignored (first-writer-wins)",
+							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
+						mRouteConflicts.Inc()
+						r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
+							"host %s regex %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, path)
+					}
+					for _, alias := range a.serverAliases {
+						if alias == "" || alias == host {
+							continue
+						}
+						if !m.addRegexRoute(alias, path, []backend{{addr: addr}}, a, nil, nil) {
+							logger.Info("regex route conflict ignored on server-alias (first-writer-wins)",
+								"host", alias, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
+							mRouteConflicts.Inc()
+							r.emit(ing, corev1.EventTypeWarning, "RouteConflict",
+								"server-alias %s regex %s already programmed by an earlier source (first-writer-wins); this alias is ignored", alias, path)
+						}
+					}
+					continue
+				}
 				if p.PathType != nil && *p.PathType == networkingv1.PathTypeExact {
 					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse v1 matches longest-prefix)",
 						"ingress", ing.Namespace+"/"+ing.Name, "host", host, "path", path)

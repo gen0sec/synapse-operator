@@ -148,7 +148,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				continue
 			}
 			req, resp := headerFilters(rule.Filters)
-			paths, warns := rulePaths(rule)
+			paths, regexes, warns := rulePaths(rule)
 			for _, w := range warns {
 				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
 					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
@@ -170,6 +170,18 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 						mRouteConflicts.Inc()
 						r.emit(rt, corev1.EventTypeWarning, "RouteConflict",
 							"host %s path %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, path)
+					}
+				}
+			}
+			for _, rx := range regexes {
+				for _, h := range hostnames {
+					host := string(h)
+					if !m.addRegexRoute(host, rx, servers, a, req, resp) {
+						logger.Info("regex route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
+							"host", host, "regex", rx, "httproute", rt.Namespace+"/"+rt.Name)
+						mRouteConflicts.Inc()
+						r.emit(rt, corev1.EventTypeWarning, "RouteConflict",
+							"host %s regex %s already programmed by an earlier source (first-writer-wins); this rule is ignored", host, rx)
 					}
 				}
 			}
@@ -254,20 +266,20 @@ func (r *IngressReconciler) ruleBackends(ctx context.Context, rt *gwv1.HTTPRoute
 	return servers
 }
 
-// rulePaths extracts the path keys for a rule and reports any match
-// features synapse's host+prefix v1 model cannot represent, so the
-// caller warns instead of silently mis-routing:
+// rulePaths extracts the prefix path keys and regex paths for a rule, and
+// reports any match features synapse's host+path model cannot represent so
+// the caller warns instead of silently mis-routing:
 //
-//	PathPrefix           used as-is
+//	PathPrefix           used as-is (prefix route)
 //	Exact                used as a prefix (best-effort) + warning
-//	RegularExpression    dropped + warning (no regex path support)
+//	RegularExpression    rendered as a synapse match_expr regex route
 //	Headers/Method/Query path still used, constraint dropped + warning
 //
-// A rule with no matches means "match all" → ["/"]. A match with no
+// A rule with no matches means "match all" → prefix ["/"]. A match with no
 // Path defaults to PathPrefix "/" (Gateway API default).
-func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, warnings []string) {
+func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warnings []string) {
 	if len(rule.Matches) == 0 {
-		return []string{"/"}, nil
+		return []string{"/"}, nil, nil
 	}
 	for _, mt := range rule.Matches {
 		if len(mt.Headers) > 0 || mt.Method != nil || len(mt.QueryParams) > 0 {
@@ -286,8 +298,8 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, warnings []string) {
 		}
 		switch pt {
 		case gwv1.PathMatchRegularExpression:
-			warnings = append(warnings,
-				fmt.Sprintf("RegularExpression path match %q dropped (synapse v1 has no regex path support)", pv))
+			// Rendered as a synapse `match_expr` regex route (was dropped).
+			regexes = append(regexes, pv)
 			continue
 		case gwv1.PathMatchExact:
 			warnings = append(warnings,
@@ -295,7 +307,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, warnings []string) {
 		}
 		paths = append(paths, pv)
 	}
-	return paths, warnings
+	return paths, regexes, warnings
 }
 
 func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {

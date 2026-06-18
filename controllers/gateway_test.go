@@ -15,34 +15,61 @@ func TestRulePaths(t *testing.T) {
 		{Path: &gwv1.HTTPPathMatch{Value: ptr("/a")}},
 		{Path: &gwv1.HTTPPathMatch{Value: ptr("/.well-known/acme-challenge/t")}},
 	}}
-	got, warns := rulePaths(rule)
+	got, rx, warns := rulePaths(rule)
 	if len(got) != 2 || got[0] != "/a" || got[1] != "/.well-known/acme-challenge/t" {
 		t.Fatalf("rulePaths = %v", got)
+	}
+	if len(rx) != 0 {
+		t.Fatalf("plain prefix paths must not produce regexes: %v", rx)
 	}
 	if len(warns) != 0 {
 		t.Fatalf("plain prefix paths must not warn: %v", warns)
 	}
 	// No matches ⇒ match-all ⇒ ["/"] with no warning.
-	if p, w := rulePaths(gwv1.HTTPRouteRule{}); len(p) != 1 || p[0] != "/" || len(w) != 0 {
-		t.Fatalf("empty rule must default to [/] no warn: %v %v", p, w)
+	if p, rx, w := rulePaths(gwv1.HTTPRouteRule{}); len(p) != 1 || p[0] != "/" || len(rx) != 0 || len(w) != 0 {
+		t.Fatalf("empty rule must default to [/] no warn: %v %v %v", p, rx, w)
 	}
 	// Exact ⇒ used (approximated) + warning.
-	p, w := rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+	p, rx, w := rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
 		{Path: &gwv1.HTTPPathMatch{Type: ptr(gwv1.PathMatchExact), Value: ptr("/exact")}}}})
-	if len(p) != 1 || p[0] != "/exact" || len(w) != 1 || !strings.Contains(w[0], "Exact") {
-		t.Fatalf("Exact must be used + warn: p=%v w=%v", p, w)
+	if len(p) != 1 || p[0] != "/exact" || len(rx) != 0 || len(w) != 1 || !strings.Contains(w[0], "Exact") {
+		t.Fatalf("Exact must be used + warn: p=%v rx=%v w=%v", p, rx, w)
 	}
-	// RegularExpression ⇒ dropped + warning (NOT defaulted to "/").
-	p, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+	// RegularExpression ⇒ emitted as a regex (NOT dropped, NO warning, NOT "/").
+	p, rx, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
 		{Path: &gwv1.HTTPPathMatch{Type: ptr(gwv1.PathMatchRegularExpression), Value: ptr("/x.*")}}}})
-	if len(p) != 0 || len(w) != 1 || !strings.Contains(w[0], "RegularExpression") {
-		t.Fatalf("regex must be dropped + warn (no '/' default): p=%v w=%v", p, w)
+	if len(p) != 0 || len(rx) != 1 || rx[0] != "/x.*" || len(w) != 0 {
+		t.Fatalf("regex must be carried as a regex route (no drop/warn/'/' default): p=%v rx=%v w=%v", p, rx, w)
 	}
 	// Header-only match ⇒ default path "/" + header-dropped warning.
-	p, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
+	p, rx, w = rulePaths(gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{
 		{Headers: []gwv1.HTTPHeaderMatch{{Name: "X-Env", Value: "canary"}}}}})
-	if len(p) != 1 || p[0] != "/" || len(w) != 1 || !strings.Contains(w[0], "header") {
-		t.Fatalf("header-only match ⇒ ['/'] + warn: p=%v w=%v", p, w)
+	if len(p) != 1 || p[0] != "/" || len(rx) != 0 || len(w) != 1 || !strings.Contains(w[0], "header") {
+		t.Fatalf("header-only match ⇒ ['/'] + warn: p=%v rx=%v w=%v", p, rx, w)
+	}
+}
+
+// A regex route renders as a match_expr block under a label key, in both
+// the v1 and v2 schemas — proving regex Ingress/HTTPRoute paths survive.
+func TestRegexRouteRender(t *testing.T) {
+	m := newRenderModel()
+	if !m.addRegexRoute("api.example.com", "^/api/runs/[^/]+/stream$",
+		[]backend{{addr: "svc.ns.svc.cluster.local:8091"}}, annSettings{}, nil, nil) {
+		t.Fatal("addRegexRoute should succeed on a fresh model")
+	}
+	// Duplicate regex on the same host ⇒ first-writer-wins (no second add).
+	if m.addRegexRoute("api.example.com", "^/api/runs/[^/]+/stream$",
+		[]backend{{addr: "other:1"}}, annSettings{}, nil, nil) {
+		t.Fatal("duplicate regex route must be rejected (first-writer-wins)")
+	}
+	wantExpr := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
+	for _, out := range []string{renderUpstreams(m), renderUpstreamsV2(m)} {
+		if !strings.Contains(out, wantExpr) {
+			t.Fatalf("rendered config missing match_expr:\nwant substring: %s\ngot:\n%s", wantExpr, out)
+		}
+		if !strings.Contains(out, "svc.ns.svc.cluster.local:8091") {
+			t.Fatalf("rendered config missing backend:\n%s", out)
+		}
 	}
 }
 
