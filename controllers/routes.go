@@ -89,6 +89,11 @@ type routeCfg struct {
 	// when set, synapse writes the redirect and never contacts upstream.
 	redirectStatus   *uint64
 	redirectLocation string
+	// matchExpr, when non-empty, makes this a regex route: synapse matches
+	// it via `match_expr` (a wirefilter expression) instead of by the path
+	// key, which becomes just a unique label. Populated from a Gateway
+	// RegularExpression path match or an nginx `use-regex` Ingress path.
+	matchExpr string
 }
 
 // annSettings is the subset parsed from an object's annotations,
@@ -123,6 +128,10 @@ type annSettings struct {
 	redirectStatus   *uint64
 	redirectLocation string
 	sticky           bool
+	// useRegex mirrors nginx `nginx.ingress.kubernetes.io/use-regex: "true"`:
+	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
+	// regex routes rather than longest-prefix paths.
+	useRegex bool
 }
 
 // certProjection is one TLS Secret to materialize into the synapse
@@ -214,6 +223,63 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 		redirectLocation: a.redirectLocation,
 	}
 	m.hosts[host][path] = rc
+	if a.sticky {
+		m.sticky = true
+	}
+	return true
+}
+
+// regexRouteKey is the unique (host-scoped) path-map label for a regex
+// route. synapse ignores the key for matching when match_expr is set, but
+// it must be unique and stable; the regex itself makes it deterministic and
+// collision-free (same regex twice ⇒ same key ⇒ first-writer-wins).
+func regexRouteKey(regex string) string {
+	return "expr:" + regex
+}
+
+// pathRegexExpr renders the synapse wirefilter match expression for a path
+// regex, e.g. `http.request.path matches "^/api/runs/[^/]+/stream$"`.
+func pathRegexExpr(regex string) string {
+	return fmt.Sprintf("http.request.path matches %q", regex)
+}
+
+// addRegexRoute records a regex path route: it is matched by `match_expr`
+// (a wirefilter expression over the request path) rather than by longest-
+// prefix. Same FIRST-WRITER-WINS semantics as addRoute, keyed by the regex
+// so a host can carry multiple distinct regex routes deterministically.
+func (m *renderModel) addRegexRoute(host, regex string, servers []backend, a annSettings, extraReq, extraResp []string) bool {
+	if regex == "" {
+		return false
+	}
+	if _, claimed := m.passthroughHosts[host]; claimed {
+		return false
+	}
+	key := regexRouteKey(regex)
+	if m.hosts[host] == nil {
+		m.hosts[host] = map[string]*routeCfg{}
+	}
+	if _, exists := m.hosts[host][key]; exists {
+		return false
+	}
+	rc := &routeCfg{
+		servers:          servers,
+		ssl:              a.ssl,
+		http2:            a.http2,
+		forceHTTPS:       a.forceHTTPS,
+		healthcheck:      a.healthcheck,
+		disableAccessLog: a.disableAccessLog,
+		connectTimeout:   a.connectTimeout,
+		readTimeout:      a.readTimeout,
+		writeTimeout:     a.writeTimeout,
+		idleTimeout:      a.idleTimeout,
+		maxBodySize:      a.maxBodySize,
+		reqHeaders:       append(append([]string{}, a.reqHeaders...), extraReq...),
+		respHeaders:      append(append([]string{}, a.respHeaders...), extraResp...),
+		redirectStatus:   a.redirectStatus,
+		redirectLocation: a.redirectLocation,
+		matchExpr:        pathRegexExpr(regex),
+	}
+	m.hosts[host][key] = rc
 	if a.sticky {
 		m.sticky = true
 	}
@@ -327,6 +393,18 @@ func parseAnnotations(ann map[string]string) annSettings {
 	}
 	if v, ok := get("http2"); ok {
 		s.http2 = parseBool(v)
+	}
+	// use-regex: treat this Ingress's paths as POSIX regexes and render them
+	// as synapse `match_expr` regex routes (ingress-nginx parity). synapse-
+	// compat key first, then the nginx-compat key.
+	if v, ok := get("use-regex"); ok {
+		if b := parseBool(v); b != nil {
+			s.useRegex = *b
+		}
+	} else if v, ok := ann[nginxPrefix+"use-regex"]; ok {
+		if b := parseBool(v); b != nil {
+			s.useRegex = *b
+		}
 	}
 	if v, ok := get("force-https"); ok {
 		s.forceHTTPS = parseBool(v)
@@ -469,6 +547,9 @@ func renderUpstreams(m *renderModel) string {
 					fmt.Fprintf(&b, "          - %q\n", sv.addr)
 				}
 			}
+			if rc.matchExpr != "" {
+				fmt.Fprintf(&b, "        match_expr: %q\n", rc.matchExpr)
+			}
 			// ssl_enabled: explicit annotation wins; default false
 			// (plain HTTP to backend — unchanged prior behavior).
 			ssl := false
@@ -605,6 +686,9 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 				fmt.Fprintf(b, "          - %q\n", sv.addr)
 			}
 		}
+	}
+	if rc.matchExpr != "" {
+		fmt.Fprintf(b, "        match_expr: %q\n", rc.matchExpr)
 	}
 	if rc.ssl != nil {
 		fmt.Fprintf(b, "        ssl_enabled: %t\n", *rc.ssl)
