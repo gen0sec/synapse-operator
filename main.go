@@ -61,6 +61,7 @@ func main() {
 	var resolveBackendClusterIPs bool
 	var clusterDomain string
 	var certsOut string
+	var certsOutSecret string
 	var gatewayAPI bool
 	var publishStatusAddress string
 	var reloadProcessName string
@@ -94,6 +95,7 @@ func main() {
 	flag.BoolVar(&resolveBackendClusterIPs, "resolve-backend-cluster-ips", false, "Ingress-mode: emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port` for each backend, so synapse-proxy's HttpPeer skips DNS. Falls back to the FQDN for headless / ExternalName / not-yet-allocated Services.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
+	flag.StringVar(&certsOutSecret, "certs-out-secret", "", "Ingress-mode central layout: project referenced Ingress/Gateway TLS Secrets into this Secret (format namespace/name) as <stem>.crt/<stem>.key data keys, instead of a local dir. The separate synapse-proxy pod mounts this Secret as its certificates dir, so certs are auto-wired from Ingress TLS (no hand-maintained projected-volume list). Takes precedence over --certs-out.")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
 	flag.StringVar(&publishStatusAddress, "publish-status-address", "", "Comma-separated IPs/hostnames to publish on matched Ingresses' .status.loadBalancer.ingress (ingress-mode). Empty = do not publish.")
 	flag.StringVar(&reloadProcessName, "reload-process-name", "synapse", "argv0 basename of the co-located proxy process to SIGHUP on a changed render (ingress-mode).")
@@ -111,6 +113,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	outCertsSecret, err := parseNamespacedName(certsOutSecret)
+	if err != nil {
+		setupLog.Error(err, "--certs-out-secret")
+		os.Exit(1)
+	}
+
 	if ingressMode && renderOnce {
 		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 		if err != nil {
@@ -124,6 +132,7 @@ func main() {
 			UpstreamsOutConfigMap:    outCM,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
 			CertsOutDir:              certsOut,
+			CertsOutSecret:           outCertsSecret,
 			ClusterDomain:            clusterDomain,
 			GatewayAPI:               gatewayAPI,
 		}
@@ -179,6 +188,7 @@ func main() {
 			UpstreamsOutConfigMap:    outCM,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
 			CertsOutDir:              certsOut,
+			CertsOutSecret:           outCertsSecret,
 			ClusterDomain:            clusterDomain,
 			GatewayAPI:               gatewayAPI,
 			// SignalReload is the sidecar-mode reload mechanism. The

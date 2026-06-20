@@ -28,6 +28,9 @@ rules:
       - get
       - list
       - watch
+      - create
+      - update
+      - patch
   # NetVarsResolverReconciler (--netvars-resolver) reads Node IPs + PodCIDRs +
   # LoadBalancer Service VIPs to auto-fill ids.address_vars.HOME_NET/EXTERNAL_NET.
   - apiGroups:
