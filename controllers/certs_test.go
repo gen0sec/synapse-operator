@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -183,6 +184,69 @@ func TestProjectCerts(t *testing.T) {
 	rOff := &IngressReconciler{Client: c}
 	if ch, n, err := rOff.projectCerts(context.Background(), m); ch || n != 0 || err != nil {
 		t.Fatalf("CertsOutDir empty must be a no-op: ch=%v n=%d err=%v", ch, n, err)
+	}
+}
+
+// Central-mode cert projection: certs land in a Secret the separate
+// proxy pod mounts (mirrors projectCerts, which writes to a local dir).
+func TestProjectCertsToSecret(t *testing.T) {
+	src := tlsSecret("default", "g0s-tls", "CRT-A", "KEY-A")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(src).Build()
+	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out}
+
+	m := newRenderModel()
+	m.addCert("a.example.com", "a.example.com", "default", "g0s-tls")
+	ch, n, err := r.projectCertsToSecret(context.Background(), m)
+	if err != nil || !ch || n != 1 {
+		t.Fatalf("project: ch=%v n=%d err=%v", ch, n, err)
+	}
+	var got corev1.Secret
+	if err := c.Get(context.Background(), out, &got); err != nil {
+		t.Fatalf("output secret not created: %v", err)
+	}
+	if string(got.Data["a.example.com.crt"]) != "CRT-A" || string(got.Data["a.example.com.key"]) != "KEY-A" {
+		t.Fatalf("output secret data wrong: %v", got.Data)
+	}
+	if got.Labels[ingressCertsManagedLabel] != "true" {
+		t.Fatalf("managed label missing: %v", got.Labels)
+	}
+	if got.Type != corev1.SecretTypeOpaque {
+		t.Fatalf("type=%v", got.Type)
+	}
+	// Idempotent: same model ⇒ no change.
+	if ch, _, _ := r.projectCertsToSecret(context.Background(), m); ch {
+		t.Fatal("unchanged projection must report no change")
+	}
+	// Rotation: source Secret data changes ⇒ reprojected.
+	src.Data[corev1.TLSCertKey] = []byte("CRT-B")
+	_ = c.Update(context.Background(), src)
+	if ch, _, _ := r.projectCertsToSecret(context.Background(), m); !ch {
+		t.Fatal("rotated Secret must reproject")
+	}
+	_ = c.Get(context.Background(), out, &got)
+	if string(got.Data["a.example.com.crt"]) != "CRT-B" {
+		t.Fatalf("rotation not applied: %q", got.Data["a.example.com.crt"])
+	}
+	// Removal: empty model ⇒ stems pruned (Data emptied).
+	ch, n, _ = r.projectCertsToSecret(context.Background(), newRenderModel())
+	if !ch || n != 0 {
+		t.Fatalf("prune: ch=%v n=%d", ch, n)
+	}
+	_ = c.Get(context.Background(), out, &got)
+	if len(got.Data) != 0 {
+		t.Fatalf("unreferenced certs must be pruned from secret: %v", got.Data)
+	}
+	// Missing source Secret ⇒ skipped softly (no error, no change).
+	m2 := newRenderModel()
+	m2.addCert("z.example.com", "z.example.com", "default", "nope")
+	if ch, n, err := r.projectCertsToSecret(context.Background(), m2); err != nil || ch || n != 0 {
+		t.Fatalf("missing Secret must be skipped softly: ch=%v n=%d err=%v", ch, n, err)
+	}
+	// CertsOutSecret unset ⇒ disabled no-op.
+	rOff := &IngressReconciler{Client: c}
+	if ch, n, err := rOff.projectCertsToSecret(context.Background(), m); ch || n != 0 || err != nil {
+		t.Fatalf("CertsOutSecret empty must be a no-op: ch=%v n=%d err=%v", ch, n, err)
 	}
 }
 

@@ -49,7 +49,7 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingressclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -67,6 +67,15 @@ type IngressReconciler struct {
 	// dir synapse's `certificates` points at; synapse inotify-hot-
 	// reloads it). Empty ⇒ multi-cert disabled (legacy static mount).
 	CertsOutDir string
+	// CertsOutSecret is the central-mode analogue of CertsOutDir: when
+	// set, referenced Ingress/Gateway TLS Secrets are projected into this
+	// Secret as <stem>.crt/<stem>.key data keys (mirrors
+	// UpstreamsOutConfigMap). The separate synapse-proxy pod mounts this
+	// Secret as its certificates dir, so certs are operator-owned and
+	// auto-wired from Ingress TLS — no hand-maintained projected-volume
+	// list. The Secret's Data is replaced on every changed render, so
+	// removed certs are pruned. Takes precedence over CertsOutDir.
+	CertsOutSecret types.NamespacedName
 	// ClusterDomain for backend FQDNs (default cluster.local).
 	ClusterDomain string
 	// SignalReload: after a changed render, SIGHUP the co-located
@@ -125,6 +134,10 @@ type IngressReconciler struct {
 
 // usesConfigMapOutput reports whether the reconciler is in central
 // mode (writes to a ConfigMap instead of a file).
+func (r *IngressReconciler) usesCertsSecretOutput() bool {
+	return r.CertsOutSecret.Name != ""
+}
+
 func (r *IngressReconciler) usesConfigMapOutput() bool {
 	return r.UpstreamsOutConfigMap.Name != ""
 }
@@ -342,10 +355,17 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		matched += r.renderGateways(ctx, m)
 	}
 
-	// Project referenced TLS Secrets into the certificates dir
-	// (per-pod, never leader-gated — like the upstreams render;
-	// synapse inotify-hot-reloads certs independently of SIGHUP).
-	if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
+	// Project referenced TLS Secrets. Central mode (CertsOutSecret set)
+	// writes them into a Secret the separate proxy pod mounts; sidecar
+	// mode writes <stem>.crt/<stem>.key into the shared CertsOutDir. Both
+	// are per-pod, never leader-gated (mirrors the upstreams file-vs-CM
+	// split); synapse inotify-hot-reloads certs independently of SIGHUP.
+	if r.usesCertsSecretOutput() {
+		if _, _, cerr := r.projectCertsToSecret(ctx, m); cerr != nil {
+			mRenderErrTotal.Inc()
+			return false, matched, len(m.hosts), fmt.Errorf("project certs to secret: %w", cerr)
+		}
+	} else if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
 		mRenderErrTotal.Inc()
 		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
 	}
@@ -640,7 +660,7 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// named-port change must re-render (named ports are resolved
 		// via a Service lookup).
 		Watches(&corev1.Service{}, enqueueAll)
-	if r.CertsOutDir != "" {
+	if r.CertsOutDir != "" || r.usesCertsSecretOutput() {
 		// Re-project on TLS Secret changes (cert rotation/renewal)
 		// without waiting for an unrelated Ingress event. Filtered
 		// to kubernetes.io/tls to avoid watching every Secret.

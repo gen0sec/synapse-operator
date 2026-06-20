@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -9,9 +10,17 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// ingressCertsManagedLabel marks a Secret as written by the ingress
+// controller's central-mode cert projection. Mirrors
+// ingressUpstreamsManagedLabel so the operator's writers are
+// distinguishable.
+const ingressCertsManagedLabel = "synapse.gen0sec.com/ingress-certs"
 
 // Multi-cert TLS: the operator projects each referenced Kubernetes TLS
 // Secret (Ingress spec.tls / Gateway listener certificateRefs) into
@@ -115,6 +124,95 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 	}
 	mCerts.Set(float64(len(want)))
 	return changed, len(want), nil
+}
+
+// projectCertsToSecret is the central-mode analogue of projectCerts: it
+// materializes m.certProjections into the CertsOutSecret Secret as
+// <stem>.crt/<stem>.key data keys, which the separate synapse-proxy pod
+// mounts as its certificates dir. The Secret's Data is replaced wholesale
+// every render, so stems no longer referenced are pruned automatically (no
+// separate prune pass like the dir mode). A missing / non-TLS source
+// Secret is skipped (logged + metric) without failing the render.
+// CertsOutSecret unset ⇒ no-op. Returns (changed, projected, err).
+func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderModel) (bool, int, error) {
+	if r.CertsOutSecret.Name == "" {
+		return false, 0, nil
+	}
+	logger := ctrl.LoggerFrom(ctx).WithName("certs")
+
+	// Deterministic order so logs are reproducible.
+	stems := make([]string, 0, len(m.certProjections))
+	for s := range m.certProjections {
+		stems = append(stems, s)
+	}
+	sort.Strings(stems)
+
+	data := map[string][]byte{}
+	for _, stem := range stems {
+		cp := m.certProjections[stem]
+		var sec corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Namespace: cp.ns, Name: cp.name}, &sec); err != nil {
+			logger.Info("referenced TLS Secret unavailable; skipping cert (host will fall back to default)",
+				"secret", cp.ns+"/"+cp.name, "stem", stem, "err", err.Error())
+			mCertErrors.Inc()
+			continue
+		}
+		crt := sec.Data[corev1.TLSCertKey]       // "tls.crt"
+		key := sec.Data[corev1.TLSPrivateKeyKey] // "tls.key"
+		if len(crt) == 0 || len(key) == 0 {
+			logger.Info("referenced Secret is not a usable TLS Secret (missing tls.crt/tls.key); skipping",
+				"secret", cp.ns+"/"+cp.name, "type", string(sec.Type), "stem", stem)
+			mCertErrors.Inc()
+			continue
+		}
+		data[stem+".crt"] = crt
+		data[stem+".key"] = key
+	}
+
+	out := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name:      r.CertsOutSecret.Name,
+		Namespace: r.CertsOutSecret.Namespace,
+	}}
+	var changed bool
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, out, func() error {
+		if out.Labels == nil {
+			out.Labels = map[string]string{}
+		}
+		out.Labels[ingressCertsManagedLabel] = "true"
+		out.Type = corev1.SecretTypeOpaque
+		if !bytesMapEqual(out.Data, data) {
+			out.Data = data
+			changed = true
+		}
+		return nil
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	if op == controllerutil.OperationResultCreated {
+		changed = true
+	}
+	n := len(data) / 2
+	if changed {
+		logger.Info("projected TLS certs to secret",
+			"secret", r.CertsOutSecret.Namespace+"/"+r.CertsOutSecret.Name, "certs", n)
+	}
+	mCerts.Set(float64(n))
+	return changed, n, nil
+}
+
+// bytesMapEqual reports whether two map[string][]byte have identical
+// keys and values.
+func bytesMapEqual(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		if vb, ok := b[k]; !ok || !bytes.Equal(va, vb) {
+			return false
+		}
+	}
+	return true
 }
 
 // writeFileIfChanged writes content IN PLACE (no tmp+rename) only when
