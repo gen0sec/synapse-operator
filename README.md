@@ -106,6 +106,20 @@ The operator runs as **one** of two controllers per process, selected by `--ingr
 | One-shot initContainer prime | — | ✅ `--render-once` |
 | Multi-replica shared-status HA | — | ✅ `--status-leader-election` |
 
+### Path matching
+
+In `--ingress-mode`, each Ingress/HTTPRoute path is rendered into a Synapse route by path type:
+
+| Source | Rendered as |
+|---|---|
+| Ingress `Prefix` · Gateway `PathPrefix` | Synapse longest-prefix path (key = the path) |
+| Ingress `Exact` · Gateway `Exact` | Approximated as a prefix (Synapse matches longest-prefix) + a warning event |
+| Ingress `ImplementationSpecific` + `nginx.ingress.kubernetes.io/use-regex: "true"` | Regex route — `match_expr: http.request.path matches "<regex>"` |
+| Gateway `RegularExpression` | Regex route — `match_expr: http.request.path matches "<regex>"` |
+| `/.well-known/acme-challenge/*` | `internal_paths` (cert-manager HTTP-01 solver) |
+
+Regex paths are **anchored at the start** (`^`) since they match from the beginning of the request path (the Kubernetes Ingress spec also requires the stored path to begin with `/`, so the leading `^` is supplied by the renderer). The path-map key for a regex route is a unique label; matching is driven entirely by `match_expr`. Header / method / query-param match conditions are not representable in Synapse's host+path model and are dropped with a warning event.
+
 ---
 
 ## Architecture
@@ -163,7 +177,9 @@ flowchart TD
 |---|---|---|
 | `--render-once` | `false` | One-shot: render `upstreams.yaml` and exit (initContainer prime) |
 | `--ingress-class` | `synapse` | `spec.ingressClassName` this controller serves |
-| `--upstreams-out` | `/shared/upstreams.yaml` | Path of the rendered upstreams file |
+| `--upstreams-out` | `/shared/upstreams.yaml` | Path of the rendered upstreams file (sidecar layout) |
+| `--upstreams-out-configmap` | _(none)_ | Central layout: write the rendered `upstreams.yaml` to this ConfigMap (`namespace/name`) instead of a file. Only the `upstreams.yaml` key is updated; other keys are preserved. Synapse reloads from its ConfigMap mount. |
+| `--resolve-backend-cluster-ips` | `false` | Emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port`, so Synapse skips backend DNS (falls back to the FQDN for headless / ExternalName / unallocated Services) |
 | `--cluster-domain` | `cluster.local` | Cluster DNS domain for backend FQDNs |
 | `--certs-out` | _(disabled)_ | Directory to project referenced TLS Secrets into |
 | `--gateway-api` | `false` | Also reconcile Gateway API (requires the CRDs) |
