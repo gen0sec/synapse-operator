@@ -196,6 +196,19 @@ func (m *renderModel) addCert(host, stem, ns, name string) {
 // A host already claimed for SNI passthrough is also "taken" — adding
 // a terminate route on top of it would silently lose either side.
 func (m *renderModel) addRoute(host, path string, servers []backend, a annSettings, extraReq, extraResp []string) bool {
+	// Normalize away a trailing slash (except the bare root "/"). synapse's
+	// longest-prefix router (synapse-proxy gethosts.rs) truncates the request
+	// path at "/" boundaries and looks up each candidate by EXACT key, so a key
+	// stored WITH a trailing slash (e.g. "/docs/x/swagger/") can only ever be
+	// hit by an exact request to that slash — it never prefix-matches sub-paths
+	// like ".../index.html" (the truncation yields "/docs/x/swagger", which
+	// != the slashed key). Storing the de-slashed key lets the route cover its
+	// whole subtree. Regex routes (addRegexRoute) keep their literal form.
+	if path != "/" {
+		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
+			path = trimmed
+		}
+	}
 	if _, claimed := m.passthroughHosts[host]; claimed {
 		return false
 	}
