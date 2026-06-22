@@ -397,6 +397,38 @@ func TestAddRoute_FirstWriterWins(t *testing.T) {
 	}
 }
 
+// A trailing-slash path key can only be hit by an exact request to that
+// slash in synapse's longest-prefix router, so addRoute must de-slash it
+// (".../swagger/" -> ".../swagger") to cover the subtree, while preserving
+// the bare root "/". Regression for the /docs/<svc>/swagger 404s.
+func TestAddRoute_StripsTrailingSlash(t *testing.T) {
+	m := newRenderModel()
+	if !m.addRoute("h", "/docs/x/swagger/", []backend{{addr: "x:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("addRoute must succeed")
+	}
+	if _, ok := m.hosts["h"]["/docs/x/swagger"]; !ok {
+		t.Fatalf("trailing slash must be stripped; got keys %v", m.hosts["h"])
+	}
+	if _, ok := m.hosts["h"]["/docs/x/swagger/"]; ok {
+		t.Fatal("slashed key must not be stored")
+	}
+	s := renderUpstreams(m)
+	if !strings.Contains(s, `"/docs/x/swagger":`) || strings.Contains(s, `"/docs/x/swagger/":`) {
+		t.Fatalf("rendered key must be de-slashed:\n%s", s)
+	}
+	// Root "/" must be preserved verbatim.
+	if !m.addRoute("h2", "/", []backend{{addr: "r:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("root addRoute must succeed")
+	}
+	if _, ok := m.hosts["h2"]["/"]; !ok {
+		t.Fatal("root path must be preserved as \"/\"")
+	}
+	// Slashed and bare variants collapse to one key (first-writer-wins).
+	if m.addRoute("h", "/docs/x/swagger", []backend{{addr: "y:80"}}, annSettings{}, nil, nil) {
+		t.Fatal("slashed + bare variants must collapse to one key (conflict)")
+	}
+}
+
 // Fix #1: two Ingresses for the same host+path → deterministic
 // (ns/name-sorted, first kept) regardless of input order.
 func TestRender_DeterministicConflict(t *testing.T) {
