@@ -1,0 +1,79 @@
+# Operator deployment running the east-west PRODUCERS (identity + declared-edge).
+#
+# This is a standalone variant of config/manager.yaml with the two producer
+# modes enabled. It reuses the synapse-operator ServiceAccount/ClusterRole from
+# config/rbac.yaml (which now grants the pods/networkpolicies/namespaces reads
+# the producers need). It can run alongside, or instead of, the config-hash
+# manager — the modes are composable, so you may instead just add the three
+# producer args to config/manager.yaml's existing container.
+#
+# Wiring:
+#   - SYNAPSE_API_KEY: an API key holding `identity:write` (download-api upload).
+#   - --download-api-url: the download-api base (default https://api.gen0sec.com/v1).
+#
+# Create the API-key secret first:
+#   kubectl -n synapse-os create secret generic synapse-operator-api \
+#     --from-literal=api-key='<key-with-identity:write>'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synapse-operator-producers
+  namespace: synapse-os
+  labels:
+    app.kubernetes.io/name: synapse-operator
+    app.kubernetes.io/component: producers
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: synapse-operator
+      app.kubernetes.io/component: producers
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: synapse-operator
+        app.kubernetes.io/component: producers
+    spec:
+      serviceAccountName: synapse-operator
+      containers:
+        - name: manager
+          image: ghcr.io/gen0sec/synapse-operator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--leader-elect"
+            - "--identity-producer"
+            - "--edge-producer"
+            - "--download-api-url=https://api.gen0sec.com/v1"
+            - "--identity-producer-interval=60s"
+            - "--edge-producer-interval=60s"
+          env:
+            - name: SYNAPSE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: synapse-operator-api
+                  key: api-key
+          ports:
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

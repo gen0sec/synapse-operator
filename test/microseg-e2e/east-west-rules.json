@@ -1,0 +1,40 @@
+{
+  "_comment": "Staged east-west / microsegmentation smart_firewall_rules. Every expression is verified-parseable against the amygdala scheme (amygdala scheme_parses_basic_expressions test). Author these as smart_firewall_rules rows (config-generator -> config-api wirefilter bucket -> agent). action is block|allow; STAGE alert-first by deploying with ids.enforce_block=false (rules evaluate + increment block_count + log, but install no kernel drop), observe block_events_raw (layer=smart_firewall, source in {microseg,behavioral,ids}), then flip enforce_block=true to enforce. Thresholds are starting points to tune per cluster.",
+  "rules": [
+    {
+      "name": "ew-policy-violation",
+      "description": "Microsegmentation: a flow whose destination is governed by a NetworkPolicy (or whose source is egress-governed) and the workload->workload:port edge is NOT in the declared allow-list. The single highest-signal east-west rule. Requires the identity + policy-edges feeds.",
+      "action": "block",
+      "expression": "edge.policy_violation == 1",
+      "source": "microseg"
+    },
+    {
+      "name": "ew-undeclared-to-apiserver",
+      "description": "Lateral movement to the control plane: an internal workload reaching kube-apiserver on an edge no NetworkPolicy declares. Catches credential-theft / privilege-escalation pivots even where no explicit deny policy exists. Requires the identity + policy-edges feeds.",
+      "action": "block",
+      "expression": "id.dst_workload eq \"kube-apiserver\" and edge.declared == 0 and ids.src_home_net == 1",
+      "source": "microseg"
+    },
+    {
+      "name": "ew-internal-port-scan",
+      "description": "Internal reconnaissance: one internal source touching >= 25 distinct destination ports (east-west, both ends in HOME_NET). Behavioural only — no identity feed required, fires on Phase-1 flow signals.",
+      "action": "block",
+      "expression": "ids.src_home_net == 1 and ids.dst_home_net == 1 and flow.unique_dst_ports ge 25",
+      "source": "behavioral"
+    },
+    {
+      "name": "ew-internal-beacon",
+      "description": "Internal C2 beaconing: a high-rate, low-port-entropy internal flow (same dst:port hit repeatedly, >= 30 flows/min, dst_port_entropy <= 1.0). Tune the rate/entropy to the cluster's baseline. Behavioural only.",
+      "action": "block",
+      "expression": "ids.src_home_net == 1 and ids.dst_home_net == 1 and flow.flows_per_min ge 30 and flow.dst_port_entropy le 100",
+      "source": "behavioral"
+    },
+    {
+      "name": "ew-policy-violation-scanning",
+      "description": "High-confidence fusion: a policy violation that is ALSO fanning out (>= 10 distinct dst ports). A near-zero-false-positive candidate to enforce (drop) FIRST while the single-signal rules above stay alert-only longer.",
+      "action": "block",
+      "expression": "edge.policy_violation == 1 and flow.unique_dst_ports ge 10",
+      "source": "microseg"
+    }
+  ]
+}
