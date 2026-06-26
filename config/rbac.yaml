@@ -72,6 +72,27 @@ rules:
       - watch
       - patch
       - update
+  # IdentityProducerReconciler (--identity-producer) + EdgeProducerReconciler
+  # (--edge-producer) read Pods (IP->workload), NetworkPolicies (declared
+  # edges), and Namespaces (namespaceSelector resolution) to build the identity
+  # MMDB + declared-edge allow-list. Read-only.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - coordination.k8s.io
     resources:

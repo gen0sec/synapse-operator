@@ -69,6 +69,11 @@ func main() {
 	var statusLeaderElection bool
 	var statusLeaderElectionID string
 	var leaderElectionNamespace string
+	var identityProducer bool
+	var downloadAPIURL string
+	var identityProducerInterval time.Duration
+	var edgeProducer bool
+	var edgeProducerInterval time.Duration
 
 	opts := zap.Options{
 		Development: true,
@@ -94,6 +99,11 @@ func main() {
 	flag.StringVar(&upstreamsOutConfigMap, "upstreams-out-configmap", "", "Ingress-mode central layout: write the rendered upstreams.yaml to this ConfigMap (format namespace/name) instead of a file path. Disables SIGHUP signalling — synapse-proxy reloads via its own machinery on the ConfigMap mount.")
 	flag.BoolVar(&resolveBackendClusterIPs, "resolve-backend-cluster-ips", false, "Ingress-mode: emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port` for each backend, so synapse-proxy's HttpPeer skips DNS. Falls back to the FQDN for headless / ExternalName / not-yet-allocated Services.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
+	flag.BoolVar(&identityProducer, "identity-producer", false, "Enable the IdentityProducerReconciler: build a workload-identity MMDB (pod IP -> workload/namespace/app) from cluster Pods and upload it to the download-api (--download-api-url) so agents can pull it for east-west detection. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
+	flag.StringVar(&downloadAPIURL, "download-api-url", "https://api.gen0sec.com/v1", "download-api base URL the identity producer uploads to (uses {url}/identity/upload). Only used with --identity-producer.")
+	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 60*time.Second, "How often the identity producer rebuilds + (if changed) re-uploads the identity MMDB. Only used with --identity-producer.")
+	flag.BoolVar(&edgeProducer, "edge-producer", false, "Enable the EdgeProducerReconciler: compile cluster NetworkPolicy into a declared-edge allow-list (workload->workload:port + governed destinations) and upload it to the download-api (--download-api-url) for the agent's `edge.*` microsegmentation fields. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
+	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 60*time.Second, "How often the edge producer recompiles + (if changed) re-uploads the declared-edge allow-list. Only used with --edge-producer.")
 	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
 	flag.StringVar(&certsOutSecret, "certs-out-secret", "", "Ingress-mode central layout: project referenced Ingress/Gateway TLS Secrets into this Secret (format namespace/name) as <stem>.crt/<stem>.key data keys, instead of a local dir. The separate synapse-proxy pod mounts this Secret as its certificates dir, so certs are auto-wired from Ingress TLS (no hand-maintained projected-volume list). Takes precedence over --certs-out.")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
@@ -261,6 +271,36 @@ func main() {
 			os.Exit(1)
 		}
 		nr.LogStartup(setupLog)
+	}
+
+	if identityProducer {
+		ip := &controllers.IdentityProducerReconciler{
+			Client:    mgr.GetClient(),
+			Log:       ctrl.Log.WithName("identity-producer"),
+			UploadURL: downloadAPIURL,
+			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
+			Interval:  identityProducerInterval,
+		}
+		if err = mgr.Add(ip); err != nil {
+			setupLog.Error(err, "unable to add runnable", "controller", "IdentityProducer")
+			os.Exit(1)
+		}
+		ip.LogStartup(setupLog)
+	}
+
+	if edgeProducer {
+		ep := &controllers.EdgeProducerReconciler{
+			Client:    mgr.GetClient(),
+			Log:       ctrl.Log.WithName("edge-producer"),
+			UploadURL: downloadAPIURL,
+			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
+			Interval:  edgeProducerInterval,
+		}
+		if err = mgr.Add(ep); err != nil {
+			setupLog.Error(err, "unable to add runnable", "controller", "EdgeProducer")
+			os.Exit(1)
+		}
+		ep.LogStartup(setupLog)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
