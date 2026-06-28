@@ -74,6 +74,9 @@ func main() {
 	var identityProducerInterval time.Duration
 	var edgeProducer bool
 	var edgeProducerInterval time.Duration
+	var graphProducer bool
+	var graphProducerInterval time.Duration
+	var serviceGraphURL string
 
 	opts := zap.Options{
 		Development: true,
@@ -104,6 +107,9 @@ func main() {
 	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 60*time.Second, "How often the identity producer rebuilds + (if changed) re-uploads the identity MMDB. Only used with --identity-producer.")
 	flag.BoolVar(&edgeProducer, "edge-producer", false, "Enable the EdgeProducerReconciler: compile cluster NetworkPolicy into a declared-edge allow-list (workload->workload:port + governed destinations) and upload it to the download-api (--download-api-url) for the agent's `edge.*` microsegmentation fields. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 60*time.Second, "How often the edge producer recompiles + (if changed) re-uploads the declared-edge allow-list. Only used with --edge-producer.")
+	flag.BoolVar(&graphProducer, "graph-producer", false, "Enable the GraphProducerReconciler: upload workload identities + NetworkPolicy declared edges to service-graph-api (--service-graph-url), which writes them into the Apache AGE service_graph. The operator stays REST-only (no DB). Needs an API key with identity:write (env SYNAPSE_API_KEY). Leader-elected full snapshot. Composable with other modes.")
+	flag.StringVar(&serviceGraphURL, "service-graph-url", "http://service-graph-api.services.svc.cluster.local:9999", "service-graph-api base URL the graph producer uploads to (uses {url}/v1/service-graph). Only used with --graph-producer.")
+	flag.DurationVar(&graphProducerInterval, "graph-producer-interval", 60*time.Second, "How often the graph producer rebuilds + (if changed) re-uploads the service graph. Only used with --graph-producer.")
 	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
 	flag.StringVar(&certsOutSecret, "certs-out-secret", "", "Ingress-mode central layout: project referenced Ingress/Gateway TLS Secrets into this Secret (format namespace/name) as <stem>.crt/<stem>.key data keys, instead of a local dir. The separate synapse-proxy pod mounts this Secret as its certificates dir, so certs are auto-wired from Ingress TLS (no hand-maintained projected-volume list). Takes precedence over --certs-out.")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
@@ -301,6 +307,21 @@ func main() {
 			os.Exit(1)
 		}
 		ep.LogStartup(setupLog)
+	}
+
+	if graphProducer {
+		gp := &controllers.GraphProducerReconciler{
+			Client:    mgr.GetClient(),
+			Log:       ctrl.Log.WithName("graph-producer"),
+			UploadURL: serviceGraphURL,
+			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
+			Interval:  graphProducerInterval,
+		}
+		if err = mgr.Add(gp); err != nil {
+			setupLog.Error(err, "unable to add runnable", "controller", "GraphProducer")
+			os.Exit(1)
+		}
+		gp.LogStartup(setupLog)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
