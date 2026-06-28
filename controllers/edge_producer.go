@@ -102,87 +102,18 @@ func (r *EdgeProducerReconciler) buildAndUpload(ctx context.Context) {
 //	E <srcns>/<srcwl> > <dstns>/<dstwl> : <port>
 //	G <dstns>/<dstwl>
 func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace) (string, string, int) {
-	nsLabels := map[string]labels.Set{}
-	for i := range namespaces {
-		nsLabels[namespaces[i].Name] = labels.Set(namespaces[i].Labels)
-	}
-
 	edges := map[string]struct{}{}
 	governedDst := map[string]struct{}{}
 	governedSrc := map[string]struct{}{}
-	addEdge := func(src, dst string, ports []string) {
-		for _, port := range ports {
-			edges["E "+src+" > "+dst+" : "+port] = struct{}{}
-		}
-	}
-
-	for i := range nps {
-		np := &nps[i]
-		sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
-		if err != nil {
-			continue
-		}
-		// The policy's pods are the DESTINATION for its ingress rules and the
-		// SOURCE for its egress rules.
-		selPods := podsMatching(pods, np.Namespace, sel)
-		selWls := workloadSet(selPods)
-		if len(selWls) == 0 {
-			continue
-		}
-
-		if policyHasIngress(np) {
-			for wl := range selWls {
-				governedDst[np.Namespace+"/"+wl] = struct{}{}
+	walkPolicyEdges(nps, pods, namespaces,
+		func(src, dst string, ports []string) {
+			for _, port := range ports {
+				edges["E "+src+" > "+dst+" : "+port] = struct{}{}
 			}
-			for ri := range np.Spec.Ingress {
-				rule := &np.Spec.Ingress[ri]
-				// Ingress named ports resolve against the destination (selected) pods.
-				ports := portStrings(rule.Ports, selPods)
-				var srcRefs []string
-				if len(rule.From) == 0 {
-					srcRefs = []string{"*/*"} // empty from = allow-from-all
-				} else {
-					for pi := range rule.From {
-						srcRefs = append(srcRefs, peerWorkloadRefs(&rule.From[pi], np.Namespace, pods, nsLabels)...)
-					}
-				}
-				for dstWl := range selWls {
-					dst := np.Namespace + "/" + dstWl
-					for _, src := range srcRefs {
-						addEdge(src, dst, ports)
-					}
-				}
-			}
-		}
-
-		if policyHasEgress(np) {
-			for wl := range selWls {
-				governedSrc[np.Namespace+"/"+wl] = struct{}{}
-			}
-			for ri := range np.Spec.Egress {
-				rule := &np.Spec.Egress[ri]
-				var dstRefs []string
-				var toPods []corev1.Pod
-				if len(rule.To) == 0 {
-					dstRefs = []string{"*/*"} // empty to = allow-to-all
-				} else {
-					for pi := range rule.To {
-						toPods = append(toPods, peerPods(&rule.To[pi], np.Namespace, pods, nsLabels)...)
-						dstRefs = append(dstRefs, peerWorkloadRefs(&rule.To[pi], np.Namespace, pods, nsLabels)...)
-					}
-				}
-				// Egress named ports resolve against the `to` peer (destination)
-				// pods; numeric ports stay exact, unresolved named ports widen.
-				ports := portStrings(rule.Ports, toPods)
-				for srcWl := range selWls {
-					src := np.Namespace + "/" + srcWl
-					for _, dst := range dstRefs {
-						addEdge(src, dst, ports)
-					}
-				}
-			}
-		}
-	}
+		},
+		func(ref string) { governedDst[ref] = struct{}{} },
+		func(ref string) { governedSrc[ref] = struct{}{} },
+	)
 
 	lines := make([]string, 0, len(edges)+len(governedDst)+len(governedSrc))
 	for e := range edges {
@@ -206,6 +137,89 @@ func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespace
 		b.WriteByte('\n')
 	}
 	return b.String(), version, len(edges)
+}
+
+// walkPolicyEdges walks NetworkPolicies and invokes emit(src,dst,ports) for
+// every declared edge, and markGovDst/markGovSrc(ref) for governed workload
+// refs (ns/workload). Shared by buildEdgeDoc (the agent allow-list doc) and the
+// graph producer, so both derive edges from one NetworkPolicy interpretation.
+func walkPolicyEdges(
+	nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace,
+	emit func(src, dst string, ports []string),
+	markGovDst, markGovSrc func(ref string),
+) {
+	nsLabels := map[string]labels.Set{}
+	for i := range namespaces {
+		nsLabels[namespaces[i].Name] = labels.Set(namespaces[i].Labels)
+	}
+
+	for i := range nps {
+		np := &nps[i]
+		sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+		if err != nil {
+			continue
+		}
+		// The policy's pods are the DESTINATION for its ingress rules and the
+		// SOURCE for its egress rules.
+		selPods := podsMatching(pods, np.Namespace, sel)
+		selWls := workloadSet(selPods)
+		if len(selWls) == 0 {
+			continue
+		}
+
+		if policyHasIngress(np) {
+			for wl := range selWls {
+				markGovDst(np.Namespace + "/" + wl)
+			}
+			for ri := range np.Spec.Ingress {
+				rule := &np.Spec.Ingress[ri]
+				// Ingress named ports resolve against the destination (selected) pods.
+				ports := portStrings(rule.Ports, selPods)
+				var srcRefs []string
+				if len(rule.From) == 0 {
+					srcRefs = []string{"*/*"} // empty from = allow-from-all
+				} else {
+					for pi := range rule.From {
+						srcRefs = append(srcRefs, peerWorkloadRefs(&rule.From[pi], np.Namespace, pods, nsLabels)...)
+					}
+				}
+				for dstWl := range selWls {
+					dst := np.Namespace + "/" + dstWl
+					for _, src := range srcRefs {
+						emit(src, dst, ports)
+					}
+				}
+			}
+		}
+
+		if policyHasEgress(np) {
+			for wl := range selWls {
+				markGovSrc(np.Namespace + "/" + wl)
+			}
+			for ri := range np.Spec.Egress {
+				rule := &np.Spec.Egress[ri]
+				var dstRefs []string
+				var toPods []corev1.Pod
+				if len(rule.To) == 0 {
+					dstRefs = []string{"*/*"} // empty to = allow-to-all
+				} else {
+					for pi := range rule.To {
+						toPods = append(toPods, peerPods(&rule.To[pi], np.Namespace, pods, nsLabels)...)
+						dstRefs = append(dstRefs, peerWorkloadRefs(&rule.To[pi], np.Namespace, pods, nsLabels)...)
+					}
+				}
+				// Egress named ports resolve against the `to` peer (destination)
+				// pods; numeric ports stay exact, unresolved named ports widen.
+				ports := portStrings(rule.Ports, toPods)
+				for srcWl := range selWls {
+					src := np.Namespace + "/" + srcWl
+					for _, dst := range dstRefs {
+						emit(src, dst, ports)
+					}
+				}
+			}
+		}
+	}
 }
 
 func policyHasEgress(np *networkingv1.NetworkPolicy) bool {
