@@ -81,6 +81,7 @@ rules:
     resources:
       - pods
       - namespaces
+      - services
     verbs:
       - get
       - list
@@ -89,6 +90,7 @@ rules:
       - networking.k8s.io
     resources:
       - networkpolicies
+      - ingresses
     verbs:
       - get
       - list
