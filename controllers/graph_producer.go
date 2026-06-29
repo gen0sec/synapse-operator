@@ -47,11 +47,17 @@ type graphPayload struct {
 }
 
 // graphWorkload is a vertex: one workload identity, keyed by "namespace/name".
+// Role/InternetExposed/ControlPlane are classification derived from pure
+// Kubernetes state (Services/Ingress + control-plane heuristics) — they drive
+// the visualizer's node colours/badges.
 type graphWorkload struct {
-	Ref       string `json:"ref"`
-	Namespace string `json:"namespace"`
-	Workload  string `json:"workload"`
-	App       string `json:"app"`
+	Ref             string `json:"ref"`
+	Namespace       string `json:"namespace"`
+	Workload        string `json:"workload"`
+	App             string `json:"app"`
+	Role            string `json:"role,omitempty"`
+	InternetExposed bool   `json:"internet_exposed,omitempty"`
+	ControlPlane    bool   `json:"control_plane,omitempty"`
 }
 
 // declaredEdge is a directed src->dst edge between workload refs.
@@ -103,11 +109,22 @@ func (r *GraphProducerReconciler) buildAndUpload(ctx context.Context) {
 		r.Log.Error(err, "graph-producer: list namespaces failed")
 		return
 	}
+	// Services + Ingresses drive internet-exposed classification. A failure
+	// here is non-fatal — we still upload identities + declared edges.
+	var svcList corev1.ServiceList
+	if err := r.List(ctx, &svcList); err != nil {
+		r.Log.Error(err, "graph-producer: list services failed (classification degraded)")
+	}
+	var ingList networkingv1.IngressList
+	if err := r.List(ctx, &ingList); err != nil {
+		r.Log.Error(err, "graph-producer: list ingresses failed (classification degraded)")
+	}
 
 	workloads := collectGraphWorkloads(pods.Items)
 	if len(workloads) == 0 {
 		return
 	}
+	classifyWorkloads(workloads, pods.Items, svcList.Items, ingList.Items)
 	edges := collectDeclaredEdges(nps.Items, pods.Items, nsList.Items)
 
 	version := graphVersion(workloads, edges)
@@ -168,6 +185,112 @@ func collectGraphWorkloads(pods []corev1.Pod) []graphWorkload {
 	return out
 }
 
+// classifyWorkloads sets Role / InternetExposed / ControlPlane on each workload
+// from pure Kubernetes state: control-plane via namespace/component heuristics,
+// internet-exposed via LoadBalancer/NodePort Services or Ingress-backed Services
+// whose selector matches the workload's pods. Mutates workloads in place.
+func classifyWorkloads(workloads []graphWorkload, pods []corev1.Pod, services []corev1.Service, ingresses []networkingv1.Ingress) {
+	// Services referenced by an Ingress backend expose their (usually ClusterIP)
+	// Service to the internet.
+	ingressBacked := map[string]bool{}
+	for i := range ingresses {
+		ing := &ingresses[i]
+		if ing.Spec.DefaultBackend != nil && ing.Spec.DefaultBackend.Service != nil {
+			ingressBacked[ing.Namespace+"/"+ing.Spec.DefaultBackend.Service.Name] = true
+		}
+		for _, rule := range ing.Spec.Rules {
+			if rule.HTTP == nil {
+				continue
+			}
+			for _, p := range rule.HTTP.Paths {
+				if p.Backend.Service != nil {
+					ingressBacked[ing.Namespace+"/"+p.Backend.Service.Name] = true
+				}
+			}
+		}
+	}
+
+	// Exposing selectors: LB/NodePort services + any Ingress-backed service.
+	// Empty selectors (headless/external) select nothing and are skipped.
+	type nsSelector struct {
+		namespace string
+		selector  map[string]string
+	}
+	var exposing []nsSelector
+	for i := range services {
+		s := &services[i]
+		if len(s.Spec.Selector) == 0 {
+			continue
+		}
+		if s.Spec.Type == corev1.ServiceTypeLoadBalancer ||
+			s.Spec.Type == corev1.ServiceTypeNodePort ||
+			ingressBacked[s.Namespace+"/"+s.Name] {
+			exposing = append(exposing, nsSelector{namespace: s.Namespace, selector: s.Spec.Selector})
+		}
+	}
+
+	internetExposed := map[string]bool{}
+	for i := range pods {
+		p := &pods[i]
+		workload, _ := workloadIdentity(p)
+		if workload == "" {
+			continue
+		}
+		ref := p.Namespace + "/" + workload
+		for _, sel := range exposing {
+			if sel.namespace == p.Namespace && selectorMatches(sel.selector, p.Labels) {
+				internetExposed[ref] = true
+				break
+			}
+		}
+	}
+
+	for i := range workloads {
+		w := &workloads[i]
+		w.ControlPlane = isControlPlane(w.Namespace, w.Workload)
+		w.InternetExposed = internetExposed[w.Ref]
+		switch {
+		case w.ControlPlane:
+			w.Role = "control-plane"
+		case w.InternetExposed:
+			w.Role = "internet-exposed"
+		default:
+			w.Role = "internal"
+		}
+	}
+}
+
+// selectorMatches reports whether every key/value in a non-empty selector is
+// present in labels (label-selector subset match).
+func selectorMatches(selector, labels map[string]string) bool {
+	if len(selector) == 0 {
+		return false
+	}
+	for k, v := range selector {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+var controlPlaneNamespaces = map[string]bool{"kube-system": true}
+
+// isControlPlane marks Kubernetes control-plane workloads: anything in
+// kube-system, or a named core component running elsewhere.
+func isControlPlane(namespace, workload string) bool {
+	if controlPlaneNamespaces[namespace] {
+		return true
+	}
+	w := strings.ToLower(workload)
+	for _, c := range []string{"kube-apiserver", "etcd", "kube-controller-manager", "kube-scheduler"} {
+		if strings.Contains(w, c) {
+			return true
+		}
+	}
+	return false
+}
+
 // collectDeclaredEdges derives deduped src->dst workload edges from
 // NetworkPolicy, reusing walkPolicyEdges. Wildcard (allow-all) peers and
 // self-edges are dropped — they aren't concrete workload-to-workload edges.
@@ -200,7 +323,7 @@ func collectDeclaredEdges(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, n
 func graphVersion(workloads []graphWorkload, edges []declaredEdge) string {
 	h := sha256.New()
 	for _, w := range workloads {
-		fmt.Fprintf(h, "W %s %s\n", w.Ref, w.App)
+		fmt.Fprintf(h, "W %s %s %s %t %t\n", w.Ref, w.App, w.Role, w.InternetExposed, w.ControlPlane)
 	}
 	for _, e := range edges {
 		fmt.Fprintf(h, "E %s>%s\n", e.Src, e.Dst)
