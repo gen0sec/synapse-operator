@@ -247,7 +247,7 @@ func classifyWorkloads(workloads []graphWorkload, pods []corev1.Pod, services []
 
 	for i := range workloads {
 		w := &workloads[i]
-		w.ControlPlane = isControlPlane(w.Namespace, w.Workload)
+		w.ControlPlane = isControlPlane(w.Workload)
 		w.InternetExposed = internetExposed[w.Ref]
 		switch {
 		case w.ControlPlane:
@@ -274,21 +274,22 @@ func selectorMatches(selector, labels map[string]string) bool {
 	return true
 }
 
-var controlPlaneNamespaces = map[string]bool{"kube-system": true}
+// controlPlaneComponents are short workload names matched EXACTLY — substring
+// matching would wrongly catch add-ons (e.g. ccm-proportional-autoscaler).
+var controlPlaneComponents = map[string]bool{"etcd": true, "ccm": true}
 
-// isControlPlane marks Kubernetes control-plane workloads: anything in
-// kube-system, or a named core component running elsewhere.
-func isControlPlane(namespace, workload string) bool {
-	if controlPlaneNamespaces[namespace] {
-		return true
-	}
+// isControlPlane marks the true Kubernetes control plane — API server, etcd,
+// controller-manager, scheduler, and the cloud controller — by component name.
+// Add-ons that merely live in kube-system (cert-manager, CNI, autoscalers,
+// DNS, kube-proxy) are NOT control-plane.
+func isControlPlane(workload string) bool {
 	w := strings.ToLower(workload)
-	for _, c := range []string{"kube-apiserver", "etcd", "kube-controller-manager", "kube-scheduler"} {
+	for _, c := range []string{"kube-apiserver", "kube-controller-manager", "kube-scheduler", "cloud-controller-manager"} {
 		if strings.Contains(w, c) {
 			return true
 		}
 	}
-	return false
+	return controlPlaneComponents[w]
 }
 
 // collectDeclaredEdges derives deduped src->dst workload edges from
