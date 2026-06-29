@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/go-logr/logr v1.4.3
 	github.com/maxmind/mmdbwriter v1.2.0
-	github.com/oschwald/maxminddb-golang/v2 v2.1.1
+	github.com/oschwald/maxminddb-golang/v2 v2.4.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	k8s.io/api v0.36.2
@@ -59,7 +59,7 @@ require (
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.39.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
