@@ -16,6 +16,7 @@ import (
 	"github.com/maxmind/mmdbwriter"
 	"github.com/maxmind/mmdbwriter/mmdbtype"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -68,12 +69,16 @@ func (r *IdentityProducerReconciler) LogStartup(log logr.Logger) {
 		"uploadURL", r.UploadURL, "interval", r.Interval.String())
 }
 
-// identityEntry is one resolved IP -> identity row.
+// identityEntry is one resolved IP -> identity row. The classification flags
+// (internetExposed/controlPlane) are k8s context the agent folds into the
+// declared graph layer.
 type identityEntry struct {
-	ip        string
-	workload  string
-	namespace string
-	app       string
+	ip              string
+	workload        string
+	namespace       string
+	app             string
+	internetExposed bool
+	controlPlane    bool
 }
 
 func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
@@ -82,9 +87,27 @@ func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
 		r.Log.Error(err, "identity-producer: list pods failed")
 		return
 	}
+	// Services + Ingresses drive internet-exposed classification. Failures are
+	// non-fatal — identity still uploads, just without the exposure flag.
+	var svcs corev1.ServiceList
+	if err := r.List(ctx, &svcs); err != nil {
+		r.Log.Error(err, "identity-producer: list services failed (classification degraded)")
+	}
+	var ings networkingv1.IngressList
+	if err := r.List(ctx, &ings); err != nil {
+		r.Log.Error(err, "identity-producer: list ingresses failed (classification degraded)")
+	}
+
 	entries := resolveIdentityEntries(pods.Items)
 	if len(entries) == 0 {
 		return
+	}
+	// Stamp k8s classification onto each entry (by workload ref).
+	exposed := internetExposedRefs(pods.Items, svcs.Items, ings.Items)
+	for i := range entries {
+		ref := entries[i].namespace + "/" + entries[i].workload
+		entries[i].internetExposed = exposed[ref]
+		entries[i].controlPlane = isControlPlane(entries[i].workload)
 	}
 	version := identityVersion(entries)
 	if version == r.lastVersion {
@@ -208,7 +231,7 @@ func trimReplicaSetHash(name string) string {
 func identityVersion(entries []identityEntry) string {
 	rows := make([]string, len(entries))
 	for i, e := range entries {
-		rows[i] = e.ip + "|" + e.namespace + "|" + e.workload + "|" + e.app
+		rows[i] = fmt.Sprintf("%s|%s|%s|%s|%t|%t", e.ip, e.namespace, e.workload, e.app, e.internetExposed, e.controlPlane)
 	}
 	sort.Strings(rows)
 	h := sha256.Sum256([]byte(strings.Join(rows, "\n")))
@@ -216,7 +239,8 @@ func identityVersion(entries []identityEntry) string {
 }
 
 // buildIdentityMMDB writes an MMDB keyed by pod IP /32 (or /128) -> identity.
-// Field names (workload/namespace/app) mirror the agent's MmdbIdentityRecord.
+// Field names (workload/namespace/app/internet_exposed/control_plane) mirror
+// the agent's MmdbIdentityRecord.
 func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 	writer, err := mmdbwriter.New(mmdbwriter.Options{
 		DatabaseType: "Workload-Identity",
@@ -246,9 +270,11 @@ func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
 		}
 		rec := mmdbtype.Map{
-			"workload":  mmdbtype.String(e.workload),
-			"namespace": mmdbtype.String(e.namespace),
-			"app":       mmdbtype.String(e.app),
+			"workload":         mmdbtype.String(e.workload),
+			"namespace":        mmdbtype.String(e.namespace),
+			"app":              mmdbtype.String(e.app),
+			"internet_exposed": mmdbtype.Bool(e.internetExposed),
+			"control_plane":    mmdbtype.Bool(e.controlPlane),
 		}
 		if err := writer.Insert(ipNet, rec); err != nil {
 			return nil, fmt.Errorf("insert %s: %w", e.ip, err)

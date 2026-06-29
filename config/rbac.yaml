@@ -74,8 +74,9 @@ rules:
       - update
   # IdentityProducerReconciler (--identity-producer) + EdgeProducerReconciler
   # (--edge-producer) read Pods (IP->workload), NetworkPolicies (declared
-  # edges), and Namespaces (namespaceSelector resolution) to build the identity
-  # MMDB + declared-edge allow-list. Read-only.
+  # edges), Namespaces (namespaceSelector resolution), and Services/Ingresses
+  # (internet-exposed classification folded into the identity MMDB) to build the
+  # identity MMDB + declared-edge allow-list. Read-only.
   - apiGroups:
       - ""
     resources:
