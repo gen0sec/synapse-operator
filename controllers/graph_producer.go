@@ -51,13 +51,19 @@ type graphPayload struct {
 // Kubernetes state (Services/Ingress + control-plane heuristics) — they drive
 // the visualizer's node colours/badges.
 type graphWorkload struct {
-	Ref             string `json:"ref"`
-	Namespace       string `json:"namespace"`
-	Workload        string `json:"workload"`
-	App             string `json:"app"`
-	Role            string `json:"role,omitempty"`
-	InternetExposed bool   `json:"internet_exposed,omitempty"`
-	ControlPlane    bool   `json:"control_plane,omitempty"`
+	Ref             string   `json:"ref"`
+	Namespace       string   `json:"namespace"`
+	Workload        string   `json:"workload"`
+	App             string   `json:"app"`
+	Role            string   `json:"role,omitempty"`
+	InternetExposed bool     `json:"internet_exposed,omitempty"`
+	ControlPlane    bool     `json:"control_plane,omitempty"`
+	// IPs are this workload's pod IPs. The agent owns the observed layer but has
+	// no k8s identity (it must work on-prem), so it publishes observed edges by
+	// raw IP; service-graph-api resolves those IPs to this ref through an index
+	// built from these IPs. The operator is the only producer that knows the
+	// IP->workload mapping, so it must ship it here.
+	IPs []string `json:"ips,omitempty"`
 }
 
 // declaredEdge is a directed src->dst edge between workload refs.
@@ -171,14 +177,26 @@ func (r *GraphProducerReconciler) upload(ctx context.Context, p graphPayload) er
 // per workload (namespace/name), reusing the identity producer's resolution.
 func collectGraphWorkloads(pods []corev1.Pod) []graphWorkload {
 	seen := map[string]graphWorkload{}
+	// Aggregate every IP that resolves to a ref so the observed layer can map
+	// traffic back to this workload. dedup keeps the IP list stable/idempotent.
+	ips := map[string]map[string]struct{}{}
 	for _, e := range resolveIdentityEntries(pods) {
 		ref := e.namespace + "/" + e.workload
 		if _, ok := seen[ref]; !ok {
 			seen[ref] = graphWorkload{Ref: ref, Namespace: e.namespace, Workload: e.workload, App: e.app}
+			ips[ref] = map[string]struct{}{}
+		}
+		if e.ip != "" {
+			ips[ref][e.ip] = struct{}{}
 		}
 	}
 	out := make([]graphWorkload, 0, len(seen))
-	for _, w := range seen {
+	for ref, w := range seen {
+		w.IPs = make([]string, 0, len(ips[ref]))
+		for ip := range ips[ref] {
+			w.IPs = append(w.IPs, ip)
+		}
+		sort.Strings(w.IPs)
 		out = append(out, w)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
@@ -324,7 +342,7 @@ func collectDeclaredEdges(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, n
 func graphVersion(workloads []graphWorkload, edges []declaredEdge) string {
 	h := sha256.New()
 	for _, w := range workloads {
-		fmt.Fprintf(h, "W %s %s %s %t %t\n", w.Ref, w.App, w.Role, w.InternetExposed, w.ControlPlane)
+		fmt.Fprintf(h, "W %s %s %s %t %t %v\n", w.Ref, w.App, w.Role, w.InternetExposed, w.ControlPlane, w.IPs)
 	}
 	for _, e := range edges {
 		fmt.Fprintf(h, "E %s>%s\n", e.Src, e.Dst)
