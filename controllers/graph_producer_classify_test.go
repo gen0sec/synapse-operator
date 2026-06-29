@@ -13,7 +13,8 @@ func TestClassifyWorkloads(t *testing.T) {
 		{Ref: "shop/frontend", Namespace: "shop", Workload: "frontend", App: "frontend"},
 		{Ref: "data/mysql", Namespace: "data", Workload: "mysql", App: "mysql"},
 		{Ref: "api/api", Namespace: "api", Workload: "api", App: "api"},
-		{Ref: "kube-system/coredns", Namespace: "kube-system", Workload: "coredns", App: "coredns"},
+		{Ref: "kube-system/kube-apiserver", Namespace: "kube-system", Workload: "kube-apiserver", App: "kube-apiserver"},
+		{Ref: "kube-system/cert-manager", Namespace: "kube-system", Workload: "cert-manager", App: "cert-manager"},
 	}
 	pods := []corev1.Pod{
 		pod("frontend-abc", "shop", map[string]string{"app": "frontend"}, ""),
@@ -53,8 +54,9 @@ func TestClassifyWorkloads(t *testing.T) {
 				ref, w.Role, w.InternetExposed, w.ControlPlane, role, ie, cp)
 		}
 	}
-	check("shop/frontend", "internet-exposed", true, false)    // LoadBalancer
-	check("api/api", "internet-exposed", true, false)          // Ingress-backed ClusterIP
-	check("data/mysql", "internal", false, false)              // ClusterIP only
-	check("kube-system/coredns", "control-plane", false, true) // kube-system
+	check("shop/frontend", "internet-exposed", true, false)           // LoadBalancer
+	check("api/api", "internet-exposed", true, false)                 // Ingress-backed ClusterIP
+	check("data/mysql", "internal", false, false)                     // ClusterIP only
+	check("kube-system/kube-apiserver", "control-plane", false, true) // true control plane
+	check("kube-system/cert-manager", "internal", false, false)       // kube-system add-on, NOT control-plane
 }
