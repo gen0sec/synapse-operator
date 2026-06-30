@@ -162,16 +162,16 @@ func workloadIdentity(p *corev1.Pod) (workload, app string) {
 	for _, o := range p.OwnerReferences {
 		if o.Controller != nil && *o.Controller {
 			name := o.Name
-			switch o.Kind {
-			case "ReplicaSet":
+			if o.Kind == "ReplicaSet" {
 				// Deployment replicas are interchangeable — aggregate them under
 				// the deployment name (strip the pod-template hash).
 				name = trimReplicaSetHash(name)
-			case "StatefulSet":
-				// StatefulSet replicas have stable per-ordinal identities and talk
-				// to EACH OTHER (DB streaming replication, inter-broker traffic),
-				// so key them per-pod (core-0/core-1/core-2). Aggregating to the set
-				// name would collapse that traffic into a self-loop and hide it.
+			} else if isOrdinalPod(p.Name, o.Name) {
+				// Ordinal-stable controllers (StatefulSet, Strimzi's StrimziPodSet,
+				// …) name pods "<controller>-<ordinal>" and the replicas have stable
+				// identities that talk to EACH OTHER (DB streaming replication,
+				// inter-broker traffic). Key them per-pod (core-0/core-1/core-2) so
+				// that traffic is real edges, not a self-loop on the controller name.
 				name = p.Name
 			}
 			workload = name
@@ -190,6 +190,23 @@ func workloadIdentity(p *corev1.Pod) (workload, app string) {
 		app = workload
 	}
 	return workload, app
+}
+
+// isOrdinalPod reports whether podName is "<controllerName>-<ordinal>" (a stable
+// ordinal pod, as StatefulSets and StrimziPodSets create). Such pods are keyed
+// per-pod so their mutual traffic isn't collapsed into a self-loop. A Deployment
+// pod ("<rs>-<random>") fails this (the suffix isn't all digits) and aggregates.
+func isOrdinalPod(podName, controllerName string) bool {
+	suffix := strings.TrimPrefix(podName, controllerName+"-")
+	if suffix == podName || suffix == "" {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // trimReplicaSetHash removes the trailing "-<hash>" a Deployment's ReplicaSet
