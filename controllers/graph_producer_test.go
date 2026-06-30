@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // collectGraphWorkloads must roll every pod IP of a workload into one vertex's
@@ -30,6 +31,45 @@ func TestCollectGraphWorkloadsAggregatesIPs(t *testing.T) {
 	}
 	if want := []string{"10.0.1.7"}; !reflect.DeepEqual(got["shop/db"], want) {
 		t.Errorf("shop/db IPs = %v, want %v", got["shop/db"], want)
+	}
+}
+
+// collectNodeWorkloads must emit node/<name> vertices carrying Internal+External
+// IPs (deduped/sorted) so node-level observed traffic resolves, and flag
+// control-plane nodes.
+func TestCollectNodeWorkloads(t *testing.T) {
+	node := func(name string, cp bool, addrs ...corev1.NodeAddress) corev1.Node {
+		n := corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     corev1.NodeStatus{Addresses: addrs},
+		}
+		if cp {
+			n.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+		}
+		return n
+	}
+	nodes := []corev1.Node{
+		node("worker-1", false,
+			corev1.NodeAddress{Type: corev1.NodeExternalIP, Address: "203.0.113.5"},
+			corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+			corev1.NodeAddress{Type: corev1.NodeHostName, Address: "worker-1"}, // ignored
+		),
+		node("cp-1", true,
+			corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.0.0.1"}),
+	}
+	got := map[string]graphWorkload{}
+	for _, w := range collectNodeWorkloads(nodes) {
+		got[w.Ref] = w
+	}
+	w := got["node/worker-1"]
+	if !reflect.DeepEqual(w.IPs, []string{"10.0.0.5", "203.0.113.5"}) {
+		t.Errorf("worker-1 IPs = %v, want [10.0.0.5 203.0.113.5] (internal+external, sorted, hostname dropped)", w.IPs)
+	}
+	if w.Role != "node" || w.ControlPlane {
+		t.Errorf("worker-1 role=%q cp=%v, want node/false", w.Role, w.ControlPlane)
+	}
+	if cp := got["node/cp-1"]; !cp.ControlPlane || cp.Role != "control-plane" {
+		t.Errorf("cp-1 role=%q cp=%v, want control-plane/true", cp.Role, cp.ControlPlane)
 	}
 }
 

@@ -125,12 +125,22 @@ func (r *GraphProducerReconciler) buildAndUpload(ctx context.Context) {
 	if err := r.List(ctx, &ingList); err != nil {
 		r.Log.Error(err, "graph-producer: list ingresses failed (classification degraded)")
 	}
+	// Nodes carry the host IPs the agent actually observes on an overlay
+	// cluster (pod-to-pod traffic is VXLAN-encapsulated, so the host-network
+	// agent sees node IPs + NodePort/control-plane flows). Declaring them lets
+	// the observed layer resolve node-to-node edges to named node vertices.
+	var nodeList corev1.NodeList
+	if err := r.List(ctx, &nodeList); err != nil {
+		r.Log.Error(err, "graph-producer: list nodes failed (node layer degraded)")
+	}
 
 	workloads := collectGraphWorkloads(pods.Items)
 	if len(workloads) == 0 {
 		return
 	}
 	classifyWorkloads(workloads, pods.Items, svcList.Items, ingList.Items)
+	// Append node vertices after classification (they carry their own role).
+	workloads = append(workloads, collectNodeWorkloads(nodeList.Items)...)
 	edges := collectDeclaredEdges(nps.Items, pods.Items, nsList.Items)
 
 	version := graphVersion(workloads, edges)
@@ -198,6 +208,48 @@ func collectGraphWorkloads(pods []corev1.Pod) []graphWorkload {
 		}
 		sort.Strings(w.IPs)
 		out = append(out, w)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
+	return out
+}
+
+// collectNodeWorkloads turns each Kubernetes Node into a vertex keyed
+// `node/<name>`, carrying its Internal + External IPs so the observed layer can
+// resolve node-level traffic (the only east-west the host-network agent sees on
+// an overlay cluster) to a named node. Control-plane nodes are flagged.
+func collectNodeWorkloads(nodes []corev1.Node) []graphWorkload {
+	out := make([]graphWorkload, 0, len(nodes))
+	for i := range nodes {
+		n := &nodes[i]
+		ips := make([]string, 0, len(n.Status.Addresses))
+		for _, a := range n.Status.Addresses {
+			if a.Type == corev1.NodeInternalIP || a.Type == corev1.NodeExternalIP {
+				if a.Address != "" {
+					ips = append(ips, a.Address)
+				}
+			}
+		}
+		if len(ips) == 0 {
+			continue
+		}
+		sort.Strings(ips)
+		_, cp := n.Labels["node-role.kubernetes.io/control-plane"]
+		if _, m := n.Labels["node-role.kubernetes.io/master"]; m {
+			cp = true
+		}
+		role := "node"
+		if cp {
+			role = "control-plane"
+		}
+		out = append(out, graphWorkload{
+			Ref:          "node/" + n.Name,
+			Namespace:    "node",
+			Workload:     n.Name,
+			App:          "node",
+			Role:         role,
+			ControlPlane: cp,
+			IPs:          ips,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
 	return out
