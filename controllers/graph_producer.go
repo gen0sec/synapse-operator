@@ -66,10 +66,12 @@ type graphWorkload struct {
 	IPs []string `json:"ips,omitempty"`
 }
 
-// declaredEdge is a directed src->dst edge between workload refs.
+// declaredEdge is a directed src->dst edge between workload refs, on a port
+// ("*" when the NetworkPolicy puts no port restriction on the rule).
 type declaredEdge struct {
-	Src string `json:"src"`
-	Dst string `json:"dst"`
+	Src  string `json:"src"`
+	Dst  string `json:"dst"`
+	Port string `json:"port,omitempty"`
 }
 
 // Start implements manager.Runnable: an initial upload then a periodic loop.
@@ -368,11 +370,16 @@ func isControlPlane(workload string) bool {
 func collectDeclaredEdges(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace) []declaredEdge {
 	set := map[declaredEdge]struct{}{}
 	walkPolicyEdges(nps, pods, namespaces,
-		func(src, dst string, _ []string) {
+		func(src, dst string, ports []string) {
 			if src == "*/*" || dst == "*/*" || src == dst {
 				return
 			}
-			set[declaredEdge{Src: src, Dst: dst}] = struct{}{}
+			if len(ports) == 0 {
+				ports = []string{"*"} // no port restriction = any port
+			}
+			for _, p := range ports {
+				set[declaredEdge{Src: src, Dst: dst, Port: p}] = struct{}{}
+			}
 		},
 		func(string) {}, func(string) {},
 	)
@@ -384,7 +391,10 @@ func collectDeclaredEdges(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, n
 		if out[i].Src != out[j].Src {
 			return out[i].Src < out[j].Src
 		}
-		return out[i].Dst < out[j].Dst
+		if out[i].Dst != out[j].Dst {
+			return out[i].Dst < out[j].Dst
+		}
+		return out[i].Port < out[j].Port
 	})
 	return out
 }
@@ -397,7 +407,7 @@ func graphVersion(workloads []graphWorkload, edges []declaredEdge) string {
 		fmt.Fprintf(h, "W %s %s %s %t %t %v\n", w.Ref, w.App, w.Role, w.InternetExposed, w.ControlPlane, w.IPs)
 	}
 	for _, e := range edges {
-		fmt.Fprintf(h, "E %s>%s\n", e.Src, e.Dst)
+		fmt.Fprintf(h, "E %s>%s:%s\n", e.Src, e.Dst, e.Port)
 	}
 	return "graph-" + hex.EncodeToString(h.Sum(nil))[:16]
 }
