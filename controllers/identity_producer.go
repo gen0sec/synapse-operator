@@ -162,8 +162,17 @@ func workloadIdentity(p *corev1.Pod) (workload, app string) {
 	for _, o := range p.OwnerReferences {
 		if o.Controller != nil && *o.Controller {
 			name := o.Name
-			if o.Kind == "ReplicaSet" {
+			switch o.Kind {
+			case "ReplicaSet":
+				// Deployment replicas are interchangeable — aggregate them under
+				// the deployment name (strip the pod-template hash).
 				name = trimReplicaSetHash(name)
+			case "StatefulSet":
+				// StatefulSet replicas have stable per-ordinal identities and talk
+				// to EACH OTHER (DB streaming replication, inter-broker traffic),
+				// so key them per-pod (core-0/core-1/core-2). Aggregating to the set
+				// name would collapse that traffic into a self-loop and hide it.
+				name = p.Name
 			}
 			workload = name
 			break
