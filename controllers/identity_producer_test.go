@@ -42,7 +42,8 @@ func TestWorkloadIdentity(t *testing.T) {
 		t.Errorf("deployment: got workload=%q app=%q, want frontend/frontend", w, app)
 	}
 
-	// StatefulSet pod: owner name kept verbatim.
+	// StatefulSet pod: keyed per-pod (ordinal) so replicas are distinct nodes and
+	// their replication/inter-broker traffic is a real edge, not a self-loop.
 	sts := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "postgres-0",
@@ -52,8 +53,8 @@ func TestWorkloadIdentity(t *testing.T) {
 			},
 		},
 	}
-	if w, _ := workloadIdentity(sts); w != "postgres" {
-		t.Errorf("statefulset: got workload=%q, want postgres", w)
+	if w, _ := workloadIdentity(sts); w != "postgres-0" {
+		t.Errorf("statefulset: got workload=%q, want postgres-0", w)
 	}
 
 	// Bare pod (no controller): falls back to app label.
