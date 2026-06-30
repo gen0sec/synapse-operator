@@ -57,6 +57,21 @@ func TestWorkloadIdentity(t *testing.T) {
 		t.Errorf("statefulset: got workload=%q, want postgres-0", w)
 	}
 
+	// StrimziPodSet (kafka brokers): ordinal pods under a non-StatefulSet
+	// controller — still keyed per-pod via the <controller>-<ordinal> shape.
+	kafka := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "core-kafka-2",
+			Namespace: "kafka",
+			OwnerReferences: []metav1.OwnerReference{
+				{Kind: "StrimziPodSet", Name: "core-kafka", Controller: boolPtr(true)},
+			},
+		},
+	}
+	if w, _ := workloadIdentity(kafka); w != "core-kafka-2" {
+		t.Errorf("strimzipodset: got workload=%q, want core-kafka-2", w)
+	}
+
 	// Bare pod (no controller): falls back to app label.
 	bare := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
