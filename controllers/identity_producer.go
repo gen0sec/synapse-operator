@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"github.com/maxmind/mmdbwriter"
 	"github.com/maxmind/mmdbwriter/mmdbtype"
 	corev1 "k8s.io/api/core/v1"
+	toolscache "k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -26,46 +29,94 @@ import (
 // so it is the producer (core/platform is multi-tenant SaaS with no direct
 // cluster access).
 //
-// It runs as a manager.Runnable on an interval — identity changes don't need
-// instant propagation (agents poll version.txt on their own refresh interval) —
-// and only re-uploads when the resolved IP->identity set actually changes
-// (content-hashed version), so a steady cluster produces no churn.
+// It is event-driven off the Pod informer: on any pod add/update/delete it emits
+// a small coalesced *delta* (changed IP->identity upserts + removed IPs) so
+// agents stay fresh in ~sub-second without rebuilding/redistributing the whole
+// table. The full MMDB is still uploaded, but only as an infrequent cold-start /
+// resync *baseline* (Interval, e.g. 5m) — it is no longer the per-change unit of
+// work. Deltas carry an (epoch, seq): epoch is the operator-start nonce, seq is
+// monotonic; an agent that sees a gap re-pulls the baseline.
 type IdentityProducerReconciler struct {
 	client.Client
-	Log        logr.Logger
-	UploadURL  string // download-api base, e.g. https://api.gen0sec.com/v1
-	APIKey     string
-	Interval   time.Duration
-	HTTPClient *http.Client
+	Cache         cache.Cache // Pod informer source for event-driven deltas
+	Log           logr.Logger
+	UploadURL     string // download-api base, e.g. https://api.gen0sec.com/v1
+	APIKey        string
+	Interval      time.Duration // full-MMDB baseline interval (cold-start/resync)
+	DeltaDebounce time.Duration // coalescing window for deltas
+	HTTPClient    *http.Client
+
+	epoch uint64                   // operator-start nonce (agents resync on change)
+	seq   uint64                   // monotonic delta sequence within the epoch
+	index map[string]identityEntry // last-emitted IP -> identity (delta diff base)
 
 	lastVersion string
 }
 
-// Start implements manager.Runnable: an initial build then a periodic loop.
+// Start implements manager.Runnable: an initial baseline, then an event-driven
+// delta loop with a periodic baseline refresh.
 func (r *IdentityProducerReconciler) Start(ctx context.Context) error {
 	if r.HTTPClient == nil {
 		r.HTTPClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	if r.Interval <= 0 {
-		r.Interval = 60 * time.Second
+		r.Interval = 5 * time.Minute
 	}
+	if r.DeltaDebounce <= 0 {
+		r.DeltaDebounce = 200 * time.Millisecond
+	}
+	r.epoch = uint64(time.Now().UnixNano())
+	r.index = map[string]identityEntry{}
+
+	// Initial full baseline (also seeds r.index so the first delta diffs against it).
 	r.buildAndUpload(ctx)
-	ticker := time.NewTicker(r.Interval)
-	defer ticker.Stop()
+
+	// Any Pod change signals a coalesced delta flush.
+	dirty := make(chan struct{}, 1)
+	signal := func() {
+		select {
+		case dirty <- struct{}{}:
+		default:
+		}
+	}
+	if r.Cache != nil {
+		inf, err := r.Cache.GetInformer(ctx, &corev1.Pod{})
+		if err != nil {
+			return fmt.Errorf("identity-producer: get pod informer: %w", err)
+		}
+		if _, err := inf.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+			AddFunc:    func(interface{}) { signal() },
+			UpdateFunc: func(_, _ interface{}) { signal() },
+			DeleteFunc: func(interface{}) { signal() },
+		}); err != nil {
+			return fmt.Errorf("identity-producer: add pod event handler: %w", err)
+		}
+	}
+
+	baseline := time.NewTicker(r.Interval)
+	defer baseline.Stop()
+	var debounce <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			r.buildAndUpload(ctx)
+		case <-baseline.C:
+			r.buildAndUpload(ctx) // periodic cold-start/resync baseline
+		case <-dirty:
+			if debounce == nil {
+				debounce = time.After(r.DeltaDebounce)
+			}
+		case <-debounce:
+			debounce = nil
+			r.flushDelta(ctx)
 		}
 	}
 }
 
 // LogStartup announces the producer configuration at boot.
 func (r *IdentityProducerReconciler) LogStartup(log logr.Logger) {
-	log.Info("IdentityProducer enabled: building pod->workload identity MMDB and uploading to download-api",
-		"uploadURL", r.UploadURL, "interval", r.Interval.String())
+	log.Info("IdentityProducer enabled: event-driven identity deltas + periodic MMDB baseline to download-api",
+		"uploadURL", r.UploadURL, "baselineInterval", r.Interval.String())
 }
 
 // identityEntry is one resolved IP -> identity row.
@@ -74,6 +125,50 @@ type identityEntry struct {
 	workload  string
 	namespace string
 	app       string
+	labels    map[string]string
+}
+
+// filterLabels drops the k8s-internal churn labels (pod-template-hash and
+// friends) that change on every rollout and would thrash the identity delta
+// stream, keeping only user-defined labels for identity.k8s.*_label rules.
+func filterLabels(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		switch k {
+		case "pod-template-hash",
+			"controller-revision-hash",
+			"pod-template-generation",
+			"statefulset.kubernetes.io/pod-name",
+			"apps.kubernetes.io/pod-index",
+			"controller-uid",
+			"batch.kubernetes.io/controller-uid",
+			"batch.kubernetes.io/job-name",
+			"job-name":
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// equalTo compares two identity entries (the labels map makes the struct
+// non-comparable with ==), so the delta diff can detect real changes.
+func (e identityEntry) equalTo(o identityEntry) bool {
+	if e.ip != o.ip || e.workload != o.workload || e.namespace != o.namespace || e.app != o.app {
+		return false
+	}
+	if len(e.labels) != len(o.labels) {
+		return false
+	}
+	for k, v := range e.labels {
+		if o.labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
@@ -83,6 +178,9 @@ func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
 		return
 	}
 	entries := resolveIdentityEntries(pods.Items)
+	// Reseed the delta diff-base from the baseline snapshot; deltas emitted after
+	// this baseline diff against the current full state (self-heals any drift).
+	r.index = indexEntries(entries)
 	if len(entries) == 0 {
 		return
 	}
@@ -104,9 +202,109 @@ func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
 		"version", version, "entries", len(entries), "bytes", len(mmdb))
 }
 
+// IdentityEntry is one wire-format IP -> identity row in a delta.
+type IdentityEntry struct {
+	IP        string            `json:"ip"`
+	Workload  string            `json:"workload"`
+	Namespace string            `json:"namespace"`
+	App       string            `json:"app"`
+	Labels    map[string]string `json:"labels,omitempty"`
+}
+
+// IdentityDelta is an incremental change to the IP->identity table: upserted rows
+// plus removed IPs, tagged with (epoch, seq) for agent-side gap detection.
+type IdentityDelta struct {
+	Epoch   uint64          `json:"epoch"`
+	Seq     uint64          `json:"seq"`
+	Upserts []IdentityEntry `json:"upserts,omitempty"`
+	Removes []string        `json:"removes,omitempty"`
+}
+
+// indexEntries keys the resolved entries by IP for diffing.
+func indexEntries(entries []identityEntry) map[string]identityEntry {
+	m := make(map[string]identityEntry, len(entries))
+	for _, e := range entries {
+		m[e.ip] = e
+	}
+	return m
+}
+
+// flushDelta re-resolves the current identity table from the informer cache,
+// diffs it against the last-emitted state, and POSTs a delta of just the
+// changes. r.index/r.seq advance only on a successful POST, so a failed relay
+// re-emits the same diff (with the same next seq) on the following flush.
+func (r *IdentityProducerReconciler) flushDelta(ctx context.Context) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods); err != nil {
+		r.Log.Error(err, "identity-producer: list pods failed (delta)")
+		return
+	}
+	newIndex := indexEntries(resolveIdentityEntries(pods.Items))
+
+	var upserts []IdentityEntry
+	for ip, e := range newIndex {
+		if prev, ok := r.index[ip]; !ok || !prev.equalTo(e) {
+			upserts = append(upserts, IdentityEntry{IP: e.ip, Workload: e.workload, Namespace: e.namespace, App: e.app, Labels: e.labels})
+		}
+	}
+	var removes []string
+	for ip := range r.index {
+		if _, ok := newIndex[ip]; !ok {
+			removes = append(removes, ip)
+		}
+	}
+	if len(upserts) == 0 && len(removes) == 0 {
+		return
+	}
+
+	delta := IdentityDelta{Epoch: r.epoch, Seq: r.seq + 1, Upserts: upserts, Removes: removes}
+	if err := r.postDelta(ctx, delta); err != nil {
+		r.Log.Error(err, "identity-producer: post delta failed", "seq", delta.Seq)
+		return
+	}
+	r.seq = delta.Seq
+	r.index = newIndex
+	r.Log.Info("identity-producer: delta emitted",
+		"epoch", r.epoch, "seq", r.seq, "upserts", len(upserts), "removes", len(removes))
+}
+
+// postDelta relays a delta to the download-api, which fans it to agents over SSE.
+func (r *IdentityProducerReconciler) postDelta(ctx context.Context, d IdentityDelta) error {
+	base := strings.TrimSuffix(r.UploadURL, "/")
+	body, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/identity/delta", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.APIKey)
+	}
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("delta returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // resolveIdentityEntries maps each pod's IP(s) to a workload identity.
+//
+// Entries are keyed by IP so a recycled IP resolves to a single owner. Only
+// serving pods claim an IP, and on conflict the most-recently-started pod wins
+// (last-writer-by-startTime). This is the pod-restart / IP-recycle guard: k8s
+// hands a terminating pod's IP to a new pod, and a dying pod that still reports
+// that IP must not shadow the live owner (observed in prod: a demo pod's IP
+// resolved to a terminating CronJob pod).
 func resolveIdentityEntries(pods []corev1.Pod) []identityEntry {
-	var out []identityEntry
+	byIP := map[string]identityEntry{}
+	start := map[string]time.Time{}
 	for i := range pods {
 		p := &pods[i]
 		// Host-network pods share the node IP; their identity would be the
@@ -114,20 +312,57 @@ func resolveIdentityEntries(pods []corev1.Pod) []identityEntry {
 		if p.Spec.HostNetwork {
 			continue
 		}
+		if !podServing(p) {
+			continue
+		}
 		workload, app := workloadIdentity(p)
 		if workload == "" {
 			continue
 		}
+		var st time.Time
+		if p.Status.StartTime != nil {
+			st = p.Status.StartTime.Time
+		}
 		for _, ip := range podIPs(p) {
-			out = append(out, identityEntry{
+			// A pod that started at the same time or later owns the IP; an
+			// equal/earlier pod (e.g. still-terminating) does not overwrite it.
+			if prev, ok := start[ip]; ok && !st.After(prev) {
+				continue
+			}
+			byIP[ip] = identityEntry{
 				ip:        ip,
 				workload:  workload,
 				namespace: p.Namespace,
 				app:       app,
-			})
+				labels:    filterLabels(p.Labels),
+			}
+			start[ip] = st
 		}
 	}
+	out := make([]identityEntry, 0, len(byIP))
+	for _, e := range byIP {
+		out = append(out, e)
+	}
 	return out
+}
+
+// podServing reports whether a pod should own its IP for identity resolution: it
+// must be Running, Ready, and not terminating. A Terminating/Pending/Completed
+// pod that still reports an IP must not win that IP over the live pod that
+// recycled it — this closes the IP-recycle race.
+func podServing(p *corev1.Pod) bool {
+	if p.DeletionTimestamp != nil {
+		return false
+	}
+	if p.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func podIPs(p *corev1.Pod) []string {
@@ -275,6 +510,13 @@ func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 			"workload":  mmdbtype.String(e.workload),
 			"namespace": mmdbtype.String(e.namespace),
 			"app":       mmdbtype.String(e.app),
+		}
+		if len(e.labels) > 0 {
+			lm := mmdbtype.Map{}
+			for k, v := range e.labels {
+				lm[mmdbtype.String(k)] = mmdbtype.String(v)
+			}
+			rec["labels"] = lm
 		}
 		if err := writer.Insert(ipNet, rec); err != nil {
 			return nil, fmt.Errorf("insert %s: %w", e.ip, err)
