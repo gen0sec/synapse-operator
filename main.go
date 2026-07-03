@@ -74,6 +74,7 @@ func main() {
 	var identityProducerInterval time.Duration
 	var edgeProducer bool
 	var edgeProducerInterval time.Duration
+	var clusterID string
 
 	opts := zap.Options{
 		Development: true,
@@ -101,6 +102,7 @@ func main() {
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.BoolVar(&identityProducer, "identity-producer", false, "Enable the IdentityProducerReconciler: build a workload-identity MMDB (pod IP -> workload/namespace/app) from cluster Pods and upload it to the download-api (--download-api-url) so agents can pull it for east-west detection. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.StringVar(&downloadAPIURL, "download-api-url", "https://api.gen0sec.com/v1", "download-api base URL the identity producer uploads to (uses {url}/identity/upload). Only used with --identity-producer.")
+	flag.StringVar(&clusterID, "cluster-id", "", "Cluster identifier that scopes this cluster's identity/edge baseline in the download-api, so multiple clusters sharing one workspace don't overwrite each other's MMDB (last-writer-wins). Empty = the legacy shared global path. To isolate, set a stable unique value here AND the matching platform.identity.cluster on every agent in this cluster.")
 	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 5*time.Minute, "How often the identity producer re-uploads the full MMDB *baseline* (cold-start/resync source). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --identity-producer.")
 	flag.BoolVar(&edgeProducer, "edge-producer", false, "Enable the EdgeProducerReconciler: compile cluster NetworkPolicy into a declared-edge allow-list (workload->workload:port + governed destinations) and upload it to the download-api (--download-api-url) for the agent's `edge.*` microsegmentation fields. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 5*time.Minute, "How often the edge producer re-uploads the full declared-edge allow-list *baseline* (cold-start/resync). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --edge-producer.")
@@ -281,6 +283,7 @@ func main() {
 			UploadURL: downloadAPIURL,
 			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
 			Interval:  identityProducerInterval,
+			ClusterID: clusterID,
 		}
 		if err = mgr.Add(ip); err != nil {
 			setupLog.Error(err, "unable to add runnable", "controller", "IdentityProducer")
@@ -297,6 +300,7 @@ func main() {
 			UploadURL: downloadAPIURL,
 			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
 			Interval:  edgeProducerInterval,
+			ClusterID: clusterID,
 		}
 		if err = mgr.Add(ep); err != nil {
 			setupLog.Error(err, "unable to add runnable", "controller", "EdgeProducer")

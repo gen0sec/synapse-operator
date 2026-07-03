@@ -46,6 +46,10 @@ type IdentityProducerReconciler struct {
 	Interval      time.Duration // full-MMDB baseline interval (cold-start/resync)
 	DeltaDebounce time.Duration // coalescing window for deltas
 	HTTPClient    *http.Client
+	// ClusterID isolates this cluster's baseline in the download-api so a second
+	// cluster sharing the workspace can't overwrite it. Empty at construction;
+	// resolved in Start() to the kube-system namespace UID unless overridden.
+	ClusterID string
 
 	epoch uint64                   // operator-start nonce (agents resync on change)
 	seq   uint64                   // monotonic delta sequence within the epoch
@@ -68,6 +72,10 @@ func (r *IdentityProducerReconciler) Start(ctx context.Context) error {
 	}
 	r.epoch = uint64(time.Now().UnixNano())
 	r.index = map[string]identityEntry{}
+
+	if r.ClusterID != "" {
+		r.Log.Info("identity-producer: cluster-scoped baseline", "clusterID", r.ClusterID)
+	}
 
 	// Initial full baseline (also seeds r.index so the first delta diffs against it).
 	r.buildAndUpload(ctx)
@@ -561,7 +569,7 @@ func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 // upload PUTs the MMDB to the download-api identity upload endpoint.
 func (r *IdentityProducerReconciler) upload(ctx context.Context, mmdb []byte, version string) error {
 	base := strings.TrimSuffix(r.UploadURL, "/")
-	url := fmt.Sprintf("%s/identity/upload?version=%s", base, version)
+	url := fmt.Sprintf("%s/identity/upload?version=%s%s", base, version, clusterQuery("&", r.ClusterID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(mmdb))
 	if err != nil {
 		return err
@@ -579,4 +587,14 @@ func (r *IdentityProducerReconciler) upload(ctx context.Context, mmdb []byte, ve
 		return fmt.Errorf("upload returned status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// clusterQuery renders the cluster scope as a URL query fragment with the given
+// separator ("?" or "&"). An empty id yields an empty string, preserving the
+// legacy global upload/download path.
+func clusterQuery(sep, clusterID string) string {
+	if clusterID == "" {
+		return ""
+	}
+	return sep + "cluster=" + clusterID
 }
