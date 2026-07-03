@@ -53,6 +53,9 @@ type EdgeProducerReconciler struct {
 	Interval      time.Duration // full-doc baseline interval (cold-start/resync)
 	DeltaDebounce time.Duration
 	HTTPClient    *http.Client
+	// ClusterID isolates this cluster's edge baseline in the download-api.
+	// Empty at construction; resolved in Start() (kube-system UID unless set).
+	ClusterID string
 
 	epoch uint64
 	seq   uint64
@@ -543,7 +546,7 @@ func resolveNamedPort(pods []corev1.Pod, name string) []int32 {
 
 func (r *EdgeProducerReconciler) upload(ctx context.Context, body []byte, version string) error {
 	base := strings.TrimSuffix(r.UploadURL, "/")
-	url := fmt.Sprintf("%s/policy-edges/upload?version=%s", base, version)
+	url := fmt.Sprintf("%s/policy-edges/upload?version=%s%s", base, version, clusterQuery("&", r.ClusterID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return err
