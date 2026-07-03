@@ -15,6 +15,8 @@ func TestCollectGraphWorkloadsAggregatesIPs(t *testing.T) {
 	withIP := func(name, ns string, labels map[string]string, rsOwner, ip string) corev1.Pod {
 		p := pod(name, ns, labels, rsOwner)
 		p.Status.PodIP = ip
+		p.Status.Phase = corev1.PodRunning
+		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		return p
 	}
 	pods := []corev1.Pod{
