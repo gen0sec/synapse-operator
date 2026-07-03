@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	toolscache "k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -31,13 +34,29 @@ import (
 // allow-from-all (`*/*`); numeric ports (named ports and ipBlock peers widen to
 // any-port `*` / are skipped, conservatively avoiding false violations). Egress
 // rules are a follow-up.
+// EdgeDelta is an incremental change to the declared-edge allow-list: allow-list
+// lines added and removed, tagged with (epoch, seq) for gap detection. Edge lines
+// (E/G/S ...) are the unit of content, so a delta is a line-level set diff.
+type EdgeDelta struct {
+	Epoch   uint64   `json:"epoch"`
+	Seq     uint64   `json:"seq"`
+	Upserts []string `json:"upserts,omitempty"`
+	Removes []string `json:"removes,omitempty"`
+}
+
 type EdgeProducerReconciler struct {
 	client.Client
-	Log        logr.Logger
-	UploadURL  string
-	APIKey     string
-	Interval   time.Duration
-	HTTPClient *http.Client
+	Cache         cache.Cache // NetworkPolicy/Pod/Namespace informer source for deltas
+	Log           logr.Logger
+	UploadURL     string
+	APIKey        string
+	Interval      time.Duration // full-doc baseline interval (cold-start/resync)
+	DeltaDebounce time.Duration
+	HTTPClient    *http.Client
+
+	epoch uint64
+	seq   uint64
+	index map[string]struct{} // last-emitted set of allow-list lines (diff base)
 
 	lastVersion string
 }
@@ -47,44 +66,100 @@ func (r *EdgeProducerReconciler) Start(ctx context.Context) error {
 		r.HTTPClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	if r.Interval <= 0 {
-		r.Interval = 60 * time.Second
+		r.Interval = 5 * time.Minute
 	}
+	if r.DeltaDebounce <= 0 {
+		r.DeltaDebounce = 200 * time.Millisecond
+	}
+	r.epoch = uint64(time.Now().UnixNano())
+	r.index = map[string]struct{}{}
+
 	r.buildAndUpload(ctx)
-	ticker := time.NewTicker(r.Interval)
-	defer ticker.Stop()
+
+	// Edges depend on NetworkPolicies, Pods (label->workload, named ports), and
+	// Namespaces (namespaceSelector) — a change to any signals a delta flush.
+	dirty := make(chan struct{}, 1)
+	signal := func() {
+		select {
+		case dirty <- struct{}{}:
+		default:
+		}
+	}
+	if r.Cache != nil {
+		for _, obj := range []client.Object{&networkingv1.NetworkPolicy{}, &corev1.Pod{}, &corev1.Namespace{}} {
+			inf, err := r.Cache.GetInformer(ctx, obj)
+			if err != nil {
+				return fmt.Errorf("edge-producer: get informer for %T: %w", obj, err)
+			}
+			if _, err := inf.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+				AddFunc:    func(interface{}) { signal() },
+				UpdateFunc: func(_, _ interface{}) { signal() },
+				DeleteFunc: func(interface{}) { signal() },
+			}); err != nil {
+				return fmt.Errorf("edge-producer: add event handler for %T: %w", obj, err)
+			}
+		}
+	}
+
+	baseline := time.NewTicker(r.Interval)
+	defer baseline.Stop()
+	var debounce <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-baseline.C:
 			r.buildAndUpload(ctx)
+		case <-dirty:
+			if debounce == nil {
+				debounce = time.After(r.DeltaDebounce)
+			}
+		case <-debounce:
+			debounce = nil
+			r.flushDelta(ctx)
 		}
 	}
 }
 
 func (r *EdgeProducerReconciler) LogStartup(log logr.Logger) {
-	log.Info("EdgeProducer enabled: compiling NetworkPolicy -> declared-edge allow-list and uploading to download-api",
-		"uploadURL", r.UploadURL, "interval", r.Interval.String())
+	log.Info("EdgeProducer enabled: event-driven declared-edge deltas + periodic allow-list baseline to download-api",
+		"uploadURL", r.UploadURL, "baselineInterval", r.Interval.String())
+}
+
+// edgeInputs lists the cluster state edges are derived from.
+func (r *EdgeProducerReconciler) edgeInputs(ctx context.Context) (nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace, err error) {
+	var npl networkingv1.NetworkPolicyList
+	if err = r.List(ctx, &npl); err != nil {
+		return nil, nil, nil, fmt.Errorf("list networkpolicies: %w", err)
+	}
+	var podl corev1.PodList
+	if err = r.List(ctx, &podl); err != nil {
+		return nil, nil, nil, fmt.Errorf("list pods: %w", err)
+	}
+	var nsl corev1.NamespaceList
+	if err = r.List(ctx, &nsl); err != nil {
+		return nil, nil, nil, fmt.Errorf("list namespaces: %w", err)
+	}
+	return npl.Items, podl.Items, nsl.Items, nil
+}
+
+func lineSet(lines []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(lines))
+	for _, l := range lines {
+		m[l] = struct{}{}
+	}
+	return m
 }
 
 func (r *EdgeProducerReconciler) buildAndUpload(ctx context.Context) {
-	var nps networkingv1.NetworkPolicyList
-	if err := r.List(ctx, &nps); err != nil {
-		r.Log.Error(err, "edge-producer: list networkpolicies failed")
+	nps, pods, namespaces, err := r.edgeInputs(ctx)
+	if err != nil {
+		r.Log.Error(err, "edge-producer: list inputs failed")
 		return
 	}
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods); err != nil {
-		r.Log.Error(err, "edge-producer: list pods failed")
-		return
-	}
-	var nsList corev1.NamespaceList
-	if err := r.List(ctx, &nsList); err != nil {
-		r.Log.Error(err, "edge-producer: list namespaces failed")
-		return
-	}
-
-	doc, version, edges := buildEdgeDoc(nps.Items, pods.Items, nsList.Items)
+	doc, version, edges := buildEdgeDoc(nps, pods, namespaces)
+	lines, _ := computeEdgeLines(nps, pods, namespaces)
+	r.index = lineSet(lines) // reseed delta diff-base from the baseline
 	if version == r.lastVersion {
 		return
 	}
@@ -93,15 +168,80 @@ func (r *EdgeProducerReconciler) buildAndUpload(ctx context.Context) {
 		return
 	}
 	r.lastVersion = version
-	r.Log.Info("edge-producer: uploaded edge-set", "version", version, "edges", edges, "policies", len(nps.Items))
+	r.Log.Info("edge-producer: uploaded edge-set", "version", version, "edges", edges, "policies", len(nps))
 }
 
-// buildEdgeDoc returns the serialized allow-list, a content-hash version, and
-// the edge count. The doc format matches the agent's edge_set parser:
+// flushDelta recomputes the allow-list, diffs it against the last-emitted set,
+// and POSTs added/removed lines. r.index/r.seq advance only on a successful POST.
+func (r *EdgeProducerReconciler) flushDelta(ctx context.Context) {
+	nps, pods, namespaces, err := r.edgeInputs(ctx)
+	if err != nil {
+		r.Log.Error(err, "edge-producer: list inputs failed (delta)")
+		return
+	}
+	lines, _ := computeEdgeLines(nps, pods, namespaces)
+	newSet := lineSet(lines)
+
+	var upserts []string
+	for l := range newSet {
+		if _, ok := r.index[l]; !ok {
+			upserts = append(upserts, l)
+		}
+	}
+	var removes []string
+	for l := range r.index {
+		if _, ok := newSet[l]; !ok {
+			removes = append(removes, l)
+		}
+	}
+	if len(upserts) == 0 && len(removes) == 0 {
+		return
+	}
+
+	delta := EdgeDelta{Epoch: r.epoch, Seq: r.seq + 1, Upserts: upserts, Removes: removes}
+	if err := r.postDelta(ctx, delta); err != nil {
+		r.Log.Error(err, "edge-producer: post delta failed", "seq", delta.Seq)
+		return
+	}
+	r.seq = delta.Seq
+	r.index = newSet
+	r.Log.Info("edge-producer: delta emitted",
+		"epoch", r.epoch, "seq", r.seq, "upserts", len(upserts), "removes", len(removes))
+}
+
+func (r *EdgeProducerReconciler) postDelta(ctx context.Context, d EdgeDelta) error {
+	base := strings.TrimSuffix(r.UploadURL, "/")
+	body, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/policy-edges/delta", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+r.APIKey)
+	}
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("delta returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// computeEdgeLines returns the sorted allow-list lines (the edge-set's unit of
+// content) plus the edge count. The line format matches the agent's edge_set
+// parser:
 //
 //	E <srcns>/<srcwl> > <dstns>/<dstwl> : <port>
 //	G <dstns>/<dstwl>
-func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace) (string, string, int) {
+//	S <srcns>/<srcwl>
+func computeEdgeLines(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace) ([]string, int) {
 	edges := map[string]struct{}{}
 	governedDst := map[string]struct{}{}
 	governedSrc := map[string]struct{}{}
@@ -126,6 +266,13 @@ func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespace
 		lines = append(lines, "S "+s)
 	}
 	sort.Strings(lines)
+	return lines, len(edges)
+}
+
+// buildEdgeDoc returns the serialized allow-list, a content-hash version, and
+// the edge count.
+func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespaces []corev1.Namespace) (string, string, int) {
+	lines, edgeCount := computeEdgeLines(nps, pods, namespaces)
 
 	h := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	version := "edges-" + hex.EncodeToString(h[:])[:16]
@@ -136,7 +283,7 @@ func buildEdgeDoc(nps []networkingv1.NetworkPolicy, pods []corev1.Pod, namespace
 		b.WriteString(l)
 		b.WriteByte('\n')
 	}
-	return b.String(), version, len(edges)
+	return b.String(), version, edgeCount
 }
 
 // walkPolicyEdges walks NetworkPolicies and invokes emit(src,dst,ports) for
