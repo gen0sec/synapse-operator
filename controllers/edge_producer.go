@@ -38,8 +38,10 @@ import (
 // lines added and removed, tagged with (epoch, seq) for gap detection. Edge lines
 // (E/G/S ...) are the unit of content, so a delta is a line-level set diff.
 type EdgeDelta struct {
-	Epoch   uint64   `json:"epoch"`
-	Seq     uint64   `json:"seq"`
+	Epoch uint64 `json:"epoch"`
+	Seq   uint64 `json:"seq"`
+	// Cluster tags the delta with its source cluster (see IdentityDelta).
+	Cluster string   `json:"cluster,omitempty"`
 	Upserts []string `json:"upserts,omitempty"`
 	Removes []string `json:"removes,omitempty"`
 }
@@ -201,7 +203,7 @@ func (r *EdgeProducerReconciler) flushDelta(ctx context.Context) {
 		return
 	}
 
-	delta := EdgeDelta{Epoch: r.epoch, Seq: r.seq + 1, Upserts: upserts, Removes: removes}
+	delta := EdgeDelta{Epoch: r.epoch, Seq: r.seq + 1, Cluster: r.ClusterID, Upserts: upserts, Removes: removes}
 	if err := r.postDelta(ctx, delta); err != nil {
 		r.Log.Error(err, "edge-producer: post delta failed", "seq", delta.Seq)
 		return
