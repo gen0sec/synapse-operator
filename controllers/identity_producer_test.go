@@ -3,6 +3,7 @@ package controllers
 import (
 	"net/netip"
 	"testing"
+	"time"
 
 	maxminddb "github.com/oschwald/maxminddb-golang/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -10,6 +11,18 @@ import (
 )
 
 func boolPtr(b bool) *bool { return &b }
+
+// servingStatus builds a Running+Ready pod status with the given IP so
+// resolveIdentityEntries' podServing gate accepts it.
+func servingStatus(ip string) corev1.PodStatus {
+	return corev1.PodStatus{
+		PodIP: ip,
+		Phase: corev1.PodRunning,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		},
+	}
+}
 
 func TestTrimReplicaSetHash(t *testing.T) {
 	cases := map[string]string{
@@ -98,12 +111,61 @@ func TestResolveSkipsHostNetwork(t *testing.T) {
 				Labels:          map[string]string{"app": "web"},
 				OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "web-abc123", Controller: boolPtr(true)}},
 			},
-			Status: corev1.PodStatus{PodIP: "192.168.1.10"},
+			Status: servingStatus("192.168.1.10"),
 		},
 	}
 	entries := resolveIdentityEntries(pods)
 	if len(entries) != 1 || entries[0].ip != "192.168.1.10" || entries[0].workload != "web" {
 		t.Fatalf("resolveIdentityEntries skipped host-network wrong: %+v", entries)
+	}
+}
+
+// TestResolveRecycleGuard is the regression for the IP-recycle race: a
+// terminating pod that still reports an IP must not shadow the live pod that
+// recycled it, and among serving pods the most-recently-started wins.
+func TestResolveRecycleGuard(t *testing.T) {
+	old := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	recent := metav1.NewTime(time.Now())
+
+	// Dying CronJob pod: Running+Ready but has a DeletionTimestamp, still on .150.
+	dyingStatus := servingStatus("192.168.7.150")
+	dyingStatus.StartTime = &old
+	dying := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scorer-old", Namespace: "scorer",
+			DeletionTimestamp: &old,
+			Labels:            map[string]string{"app": "scorer"},
+			OwnerReferences:   []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "scorer-abc123", Controller: boolPtr(true)}},
+		},
+		Status: dyingStatus,
+	}
+	// Live pod that recycled .150, started later.
+	liveStatus := servingStatus("192.168.7.150")
+	liveStatus.StartTime = &recent
+	live := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "demo-db-xyz", Namespace: "demo-database",
+			Labels:          map[string]string{"app": "demo-db"},
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "demo-db-77b4b4f7dd", Controller: boolPtr(true)}},
+		},
+		Status: liveStatus,
+	}
+
+	// Order-independent: the terminating pod is skipped, the live pod owns .150.
+	for _, order := range [][]corev1.Pod{{dying, live}, {live, dying}} {
+		entries := resolveIdentityEntries(order)
+		if len(entries) != 1 || entries[0].namespace != "demo-database" || entries[0].workload != "demo-db" {
+			t.Fatalf("recycle guard: .150 should resolve to live demo-db, got %+v", entries)
+		}
+	}
+
+	// A pending (not-yet-Ready) pod does not claim an IP.
+	pending := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "boot", Namespace: "x", Labels: map[string]string{"app": "boot"}},
+		Status:     corev1.PodStatus{PodIP: "192.168.9.9", Phase: corev1.PodPending},
+	}
+	if entries := resolveIdentityEntries([]corev1.Pod{pending}); len(entries) != 0 {
+		t.Fatalf("pending pod should not claim an IP, got %+v", entries)
 	}
 }
 

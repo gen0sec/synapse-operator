@@ -101,9 +101,9 @@ func main() {
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.BoolVar(&identityProducer, "identity-producer", false, "Enable the IdentityProducerReconciler: build a workload-identity MMDB (pod IP -> workload/namespace/app) from cluster Pods and upload it to the download-api (--download-api-url) so agents can pull it for east-west detection. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.StringVar(&downloadAPIURL, "download-api-url", "https://api.gen0sec.com/v1", "download-api base URL the identity producer uploads to (uses {url}/identity/upload). Only used with --identity-producer.")
-	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 60*time.Second, "How often the identity producer rebuilds + (if changed) re-uploads the identity MMDB. Only used with --identity-producer.")
+	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 5*time.Minute, "How often the identity producer re-uploads the full MMDB *baseline* (cold-start/resync source). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --identity-producer.")
 	flag.BoolVar(&edgeProducer, "edge-producer", false, "Enable the EdgeProducerReconciler: compile cluster NetworkPolicy into a declared-edge allow-list (workload->workload:port + governed destinations) and upload it to the download-api (--download-api-url) for the agent's `edge.*` microsegmentation fields. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
-	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 60*time.Second, "How often the edge producer recompiles + (if changed) re-uploads the declared-edge allow-list. Only used with --edge-producer.")
+	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 5*time.Minute, "How often the edge producer re-uploads the full declared-edge allow-list *baseline* (cold-start/resync). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --edge-producer.")
 	flag.StringVar(&certsOut, "certs-out", "", "Ingress-mode: directory to project referenced Ingress/Gateway TLS Secrets into as <stem>.crt/<stem>.key (synapse's certificates dir; operator-owned, inotify-hot-reloaded). Empty = multi-cert disabled (legacy static mount).")
 	flag.StringVar(&certsOutSecret, "certs-out-secret", "", "Ingress-mode central layout: project referenced Ingress/Gateway TLS Secrets into this Secret (format namespace/name) as <stem>.crt/<stem>.key data keys, instead of a local dir. The separate synapse-proxy pod mounts this Secret as its certificates dir, so certs are auto-wired from Ingress TLS (no hand-maintained projected-volume list). Takes precedence over --certs-out.")
 	flag.BoolVar(&gatewayAPI, "gateway-api", false, "Also reconcile Gateway API (GatewayClass/Gateway/HTTPRoute) into the same upstreams.yaml (ingress-mode; requires the Gateway API CRDs).")
@@ -276,6 +276,7 @@ func main() {
 	if identityProducer {
 		ip := &controllers.IdentityProducerReconciler{
 			Client:    mgr.GetClient(),
+			Cache:     mgr.GetCache(),
 			Log:       ctrl.Log.WithName("identity-producer"),
 			UploadURL: downloadAPIURL,
 			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
@@ -291,6 +292,7 @@ func main() {
 	if edgeProducer {
 		ep := &controllers.EdgeProducerReconciler{
 			Client:    mgr.GetClient(),
+			Cache:     mgr.GetCache(),
 			Log:       ctrl.Log.WithName("edge-producer"),
 			UploadURL: downloadAPIURL,
 			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
