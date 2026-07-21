@@ -3,7 +3,7 @@ module synapse-operator
 go 1.26.0
 
 require (
-	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/logr v1.4.4
 	github.com/maxmind/mmdbwriter v1.2.0
 	github.com/oschwald/maxminddb-golang/v2 v2.4.1
 	github.com/prometheus/client_golang v1.23.2
