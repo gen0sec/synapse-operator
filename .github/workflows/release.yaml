@@ -1,4 +1,4 @@
-﻿name: Release
+name: Release
 permissions:
   # Allow this action to create releases.
   contents: write
@@ -120,6 +120,12 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - docker-build
+    permissions:
+      contents: read
+      packages: write
+      # Keyless signing trades this OIDC token with Fulcio for a short-lived
+      # certificate; without it cosign has no identity to bind a signature to.
+      id-token: write
     steps:
       - name: Download meta bake definition
         uses: actions/download-artifact@v5
@@ -153,6 +159,28 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect ${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}:$(jq -r '.target."docker-metadata-action".args.DOCKER_META_VERSION' ${{ runner.temp }}/synapse-bake-meta.json)
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign and verify the image
+        env:
+          IMAGE: ${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}
+        run: |
+          set -euo pipefail
+          # Sign the manifest-list digest, never a tag: tags are mutable, so a
+          # tag signature does not pin the bytes a verifier will pull.
+          tag=$(jq -r '.target."docker-metadata-action".args.DOCKER_META_VERSION' ${{ runner.temp }}/synapse-bake-meta.json)
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}}')
+          echo "Signing ${IMAGE}@${digest}"
+          cosign sign --yes "${IMAGE}@${digest}"
+
+          # Verify with the same constraints a consumer would apply, so an
+          # unverifiable signature fails the release here rather than in
+          # somebody else's admission controller.
+          cosign verify "${IMAGE}@${digest}" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
       - name: Release
         uses: softprops/action-gh-release@v2.2.1
