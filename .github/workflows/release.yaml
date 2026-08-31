@@ -178,9 +178,12 @@ jobs:
           # Verify with the same constraints a consumer would apply, so an
           # unverifiable signature fails the release here rather than in
           # somebody else's admission controller.
+          # Exact identity, not a regexp: the run knows its own ref, and the
+          # certificate Fulcio issued names exactly this workflow at this ref.
+          # Anything else means the signature did not come from this run.
           cosign verify "${IMAGE}@${digest}" \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com
 
       - name: Release
         uses: softprops/action-gh-release@v2.2.1
