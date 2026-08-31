@@ -6,7 +6,7 @@ permissions:
   discussions: write
 
 on:
-  create:
+  push:
     tags:
     - 'v*'
   workflow_dispatch:
