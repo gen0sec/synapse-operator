@@ -13,24 +13,23 @@ on:
         - main
         - 'release/**'
 
+env:
+  GO_VERSION: '1.26'
+
+# Each job is one check on a pull request, named for what it proves.
 jobs:
-  build-amd64:
-    timeout-minutes: 30
-    name: Build amd64
+  verify:
+    timeout-minutes: 15
+    name: Verify (tidy, vet, generated files)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: [ '1.26' ]
     steps:
       - uses: actions/checkout@v5
-      - name: Setup Go ${{ matrix.go-version }}
+      - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      - name: Display Go version
-        run: go version
       - name: Check go.mod is tidy
         run: |
           go mod tidy
@@ -39,67 +38,79 @@ jobs:
         run: go vet ./...
       - name: Check generated files are up to date
         run: make verify-generated
-      - name: Cache the test API server binaries
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.local/share/kubebuilder-envtest
-          key: envtest-amd64-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
-      - name: Run tests
-        # Every package: a bare `go test` only covers the root one.
-        run: go test -v ./...
-      - name: Run the API tests on the oldest supported Kubernetes
-        run: go test -count=1 ./api/...
-        env:
-          ENVTEST_K8S_VERSION: "1.30.3"
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build image
-        run: docker buildx bake image-local
-      - name: Check the image
-        # The binary must be built for the platform the image claims, and it
-        # must start.
-        run: |
-          arch=$(docker image inspect synapse-operator:local --format '{{.Architecture}}')
-          cid=$(docker create synapse-operator:local)
-          docker cp "${cid}:/app/manager" "${RUNNER_TEMP}/manager"
-          docker rm "${cid}" >/dev/null
-          go version -m "${RUNNER_TEMP}/manager" | grep -F "GOARCH=${arch}"
-          docker run --rm synapse-operator:local -h >/dev/null
 
-
-  build-arm64:
+  test:
     timeout-minutes: 30
-    name: Build arm64
-    runs-on: ubuntu-24.04-arm
+    name: Test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [ '1.26' ]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
-      - name: Setup Go ${{ matrix.go-version }}
+      - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      - name: Display Go version
-        run: go version
-      - name: Check go.mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-      - name: Vet
-        run: go vet ./...
-      - name: Check generated files are up to date
-        run: make verify-generated
       - name: Cache the test API server binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/kubebuilder-envtest
-          key: envtest-arm64-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
+          key: envtest-${{ matrix.arch }}-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
       - name: Run tests
         # Every package: a bare `go test` only covers the root one.
         run: go test -v ./...
+
+  test-oldest-kubernetes:
+    timeout-minutes: 30
+    # The oldest version the CRD's validation rules are meant to work on.
+    name: Test (Kubernetes 1.30)
+    runs-on: ubuntu-latest
+    env:
+      ENVTEST_K8S_VERSION: "1.30.3"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Cache the test API server binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: envtest-oldest-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
+      - name: Run tests
+        run: go test -v ./...
+
+  image:
+    timeout-minutes: 30
+    name: Image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      # For `go version -m` below; nothing is compiled outside the image.
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build image
