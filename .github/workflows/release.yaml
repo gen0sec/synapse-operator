@@ -28,14 +28,33 @@ env:
   SYNAPSE_OPERATOR_REGISTRY_IMAGE: ghcr.io/gen0sec/synapse-operator
 
 jobs:
+  # Nothing is built for publication, let alone signed, until the same checks
+  # a pull request gets have passed on this very commit.
+  checks:
+    uses: ./.github/workflows/build.yaml
+    permissions:
+      contents: read
+
   docker-prepare:
     timeout-minutes: 15
     runs-on: ubuntu-latest
+    needs:
+      - checks
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
+      final: ${{ steps.ref.outputs.final }}
+      prerelease: ${{ steps.ref.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Classify the ref
+        id: ref
+        # final:      vX.Y.Z and nothing after it. Only this moves `latest`
+        #             and the X.Y / X tags.
+        # prerelease: vX.Y.Z-anything, e.g. v0.2.0-rc.1. It is published
+        #             under its own tag only.
+        run: .github/scripts/classify-ref.sh >> "${GITHUB_OUTPUT}"
 
       - name: Create matrix
         id: platforms
@@ -51,13 +70,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.SYNAPSE_OPERATOR_REGISTRY_IMAGE }}
+          # `latest` is set below and nowhere else: left to itself the
+          # action adds it for any tag a pattern matches.
+          flavor: |
+            latest=false
+          # The patterns are anchored. Unanchored, v0.2.0-rc.1 matched the
+          # first three and was published as 0.2.0, 0.2 and 0.
           tags: |
             type=sha,format=short
             type=ref,event=branch
-            type=match,pattern=v(\d+\.\d+\.\d+),group=1
-            type=match,pattern=v(\d+\.\d+),group=1
-            type=match,pattern=v(\d+),group=1
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=match,pattern=^v(\d+\.\d+\.\d+)$,group=1
+            type=match,pattern=^v(\d+\.\d+)\.\d+$,group=1
+            type=match,pattern=^v(\d+)\.\d+\.\d+$,group=1
+            type=match,pattern=^v(\d+\.\d+\.\d+-.+)$,group=1
+            type=raw,value=latest,enable=${{ steps.ref.outputs.final }}
 
       - name: Rename meta bake definition file
         run: |
@@ -136,6 +162,7 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     needs:
+      - docker-prepare
       - docker-build
     permissions:
       # MUST be write: this job also creates the GitHub release, and
@@ -207,12 +234,22 @@ jobs:
             --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}" \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com
 
+      - name: Checkout
+        # For the CRDs attached to the release.
+        if: needs.docker-prepare.outputs.final == 'true' || needs.docker-prepare.outputs.prerelease == 'true'
+        uses: actions/checkout@v4
+
       - name: Release
         # Only a version tag is a release; a branch build stops at the image.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # A pre-release tag is marked as one and never becomes the latest.
+        if: needs.docker-prepare.outputs.final == 'true' || needs.docker-prepare.outputs.prerelease == 'true'
         uses: softprops/action-gh-release@v2.2.1
         with:
           draft: true
           discussion_category_name: Releases
           generate_release_notes: true
-          make_latest: true
+          prerelease: ${{ needs.docker-prepare.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.docker-prepare.outputs.final }}
+          # The image does not carry the CRDs; this is where they ship.
+          files: config/crd/bases/*.yaml
+          fail_on_unmatched_files: true
