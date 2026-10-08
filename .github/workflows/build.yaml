@@ -3,6 +3,9 @@ on:
   pull_request:
       branches:
         - main
+        # A large change is collected on a release branch before it reaches
+        # main; pull requests into one get the same checks.
+        - 'release/**'
 
 jobs:
   build-amd64:
