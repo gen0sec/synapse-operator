@@ -32,6 +32,11 @@ func Start() (*rest.Config, func() error, error) {
 		CRDDirectoryPaths:     []string{filepath.Join(root, "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
+	// Off by default, and on in some distributions, OpenShift among them:
+	// whoever makes an object depend on an owner must be allowed to update
+	// that owner's finalizers. The operator has to work with it on.
+	env.ControlPlane.GetAPIServer().Configure().
+		Append("enable-admission-plugins", "OwnerReferencesPermissionEnforcement")
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		dir, err := envtest.SetupEnvtestDefaultBinaryAssetsDirectory()
 		if err != nil {

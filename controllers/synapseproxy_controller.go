@@ -70,14 +70,10 @@ const collisionRetry = time.Minute
 // this controller is the only thing that restarts them, and it has to cover
 // everything they read at start.
 //
-// +kubebuilder:rbac:groups=synapse.gen0sec.com,resources=synapseproxies,verbs=get;list;watch
-// +kubebuilder:rbac:groups=synapse.gen0sec.com,resources=synapseproxies/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=synapse.gen0sec.com,resources=synapseproxies/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=services;serviceaccounts;secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// What it needs to be allowed is in config/rbac-proxy-controller.yaml, with
+// SynapseRouteReconciler's. A change here that asks the API server for
+// something new has to add it there, and one that stops asking has to take
+// it out: the role's tests fail on both.
 type SynapseProxyReconciler struct {
 	client.Client
 	// Recorder emits Events on the SynapseProxy. May be nil.
