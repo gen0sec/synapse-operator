@@ -25,6 +25,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 	"synapse-operator/controllers"
 )
 
@@ -39,6 +40,7 @@ func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(networkingv1.AddToScheme(scheme))
 	utilruntime.Must(gwv1.AddToScheme(scheme))
+	utilruntime.Must(synapsev1alpha1.AddToScheme(scheme))
 }
 
 func main() {
