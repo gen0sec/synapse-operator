@@ -42,8 +42,8 @@ func proxyCertsName(proxy *synapsev1alpha1.SynapseProxy) types.NamespacedName {
 //
 // The rendering itself is IngressReconciler's, run once per proxy.
 //
-// +kubebuilder:rbac:groups=synapse.gen0sec.com,resources=synapseproxies,verbs=get;list;watch
-// +kubebuilder:rbac:groups=synapse.gen0sec.com,resources=synapseproxies/finalizers,verbs=update
+// What it needs to be allowed is in config/rbac-proxy-controller.yaml; see
+// SynapseProxyReconciler.
 type SynapseRouteReconciler struct {
 	client.Client
 	// ClusterDomain for backend FQDNs (default cluster.local).

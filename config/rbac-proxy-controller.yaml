@@ -1,0 +1,139 @@
+# What the operator needs, on top of config/rbac.yaml, to run SynapseProxy
+# resources. It is a role of its own so that an operator that does not run
+# them is not handed it.
+#
+# Two grants are wide because RBAC cannot narrow them:
+#   - Secrets, in every namespace: read, because a proxy's certificates come
+#     from the TLS Secrets of its Ingresses, wherever those are; write and
+#     delete, for the configuration and certificates Secrets it keeps for each
+#     proxy.
+#   - Deployments, in every namespace: create and patch. Whoever may do that
+#     can run a pod under any ServiceAccount of that namespace.
+#
+# Every grant here is one the controllers have been seen to use, and none is
+# missing: the tests in controllers/synapseproxy_rbac_test.go run them as this
+# ServiceAccount, holding this role, and fail on either.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: synapse-operator-proxy-controller
+rules:
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseproxies
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseproxies/status
+    verbs:
+      - patch
+  # Everything written for a proxy is owned by it. A cluster that enforces
+  # owner-reference permissions, as OpenShift does, asks for this before it
+  # lets an object depend on its owner.
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseproxies/finalizers
+    verbs:
+      - update
+  # The proxy itself. Applied server-side, which is a patch, and a create as
+  # well the first time.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - serviceaccounts
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+  # Which configuration Secrets are still mounted by pods of an earlier
+  # rollout, and so must be kept.
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  # Read: the Secret an API key is in, and the TLS Secrets of the Ingresses.
+  # Written: each proxy's configuration (created and patched, then deleted
+  # once no pod mounts it) and its certificates (created and updated).
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # Each proxy's routes.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+  # Where the routes come from, and which proxy serves which class.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+  # The proxy's address, published on the Ingresses it serves.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: synapse-operator-proxy-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: synapse-operator-proxy-controller
+subjects:
+  - kind: ServiceAccount
+    name: synapse-operator
+    namespace: synapse-os
