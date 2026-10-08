@@ -95,7 +95,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
-	flag.StringVar(&labelSelector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads.")
+	flag.StringVar(&labelSelector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads. Objects controlled by one of the operator's own resources are left alone even when they match.")
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")

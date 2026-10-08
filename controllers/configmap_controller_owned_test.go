@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 const (
@@ -200,5 +201,97 @@ func TestConfigHash_WatchesOnlyUnownedLabelledSources(t *testing.T) {
 				t.Errorf("isConfigSource = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The hash is a function of which objects are sources as much as of what
+// they hold. An update has to get through when the object was a source
+// before it or is one after it: one that stops being a source, by losing the
+// label or by gaining an owner, moves the hash just like a content change.
+func TestConfigHash_SourceEvents(t *testing.T) {
+	p := newOwnedTestReconciler(t).sourcePredicate()
+
+	source := func() *corev1.ConfigMap { return &corev1.ConfigMap{ObjectMeta: labelledMeta("cfg")} }
+	owned := func() *corev1.ConfigMap { return resourceOwned(source()) }
+	unlabelled := func() *corev1.ConfigMap {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: ownedTestNS}}
+	}
+
+	updates := []struct {
+		name     string
+		old, new client.Object
+		want     bool
+	}{
+		{"a source changes", source(), source(), true},
+		{"a source gains an owner", source(), owned(), true},
+		{"a source loses its label", source(), unlabelled(), true},
+		{"an owned object is released", owned(), source(), true},
+		{"an object gains the label", unlabelled(), source(), true},
+		{"an owned object changes", owned(), owned(), false},
+		{"an unlabelled object changes", unlabelled(), unlabelled(), false},
+	}
+	for _, tc := range updates {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("Update = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	others := []struct {
+		name string
+		obj  client.Object
+		want bool
+	}{
+		{"a source", source(), true},
+		{"an owned object", owned(), false},
+		{"an unlabelled object", unlabelled(), false},
+	}
+	for _, tc := range others {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Create(event.CreateEvent{Object: tc.obj}); got != tc.want {
+				t.Errorf("Create = %v, want %v", got, tc.want)
+			}
+			if got := p.Delete(event.DeleteEvent{Object: tc.obj}); got != tc.want {
+				t.Errorf("Delete = %v, want %v", got, tc.want)
+			}
+			if got := p.Generic(event.GenericEvent{Object: tc.obj}); got != tc.want {
+				t.Errorf("Generic = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// What the reconcile let through above then has to do: drop the object from
+// the hash at once, not at whatever unrelated event comes next.
+func TestConfigHash_RecomputesWhenASourceGainsAnOwner(t *testing.T) {
+	ctx := context.Background()
+	a := &corev1.ConfigMap{ObjectMeta: labelledMeta("cfg"), Data: map[string]string{"config.yaml": "mode: proxy"}}
+	b := &corev1.ConfigMap{ObjectMeta: labelledMeta("extra"), Data: map[string]string{"extra.yaml": "x: 1"}}
+	deploy := &appsv1.Deployment{ObjectMeta: labelledMeta("plain")}
+
+	r := newOwnedTestReconciler(t, a, b, deploy)
+	reconcileOwnedTest(t, r)
+	both := stampedHash(t, r, deploy)
+
+	alone := newOwnedTestReconciler(t, a.DeepCopy(), &appsv1.Deployment{ObjectMeta: labelledMeta("plain")})
+	reconcileOwnedTest(t, alone)
+	onlyA := stampedHash(t, alone, &appsv1.Deployment{ObjectMeta: labelledMeta("plain")})
+	if both == onlyA {
+		t.Fatal("the second ConfigMap does not contribute to the hash; the test proves nothing")
+	}
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(b), b); err != nil {
+		t.Fatal(err)
+	}
+	resourceOwned(b)
+	if err := r.Update(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := stampedHash(t, r, deploy); got != onlyA {
+		t.Errorf("hash = %s, want %s: the hash of the remaining source alone", got, onlyA)
 	}
 }
