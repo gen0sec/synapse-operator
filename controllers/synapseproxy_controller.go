@@ -70,7 +70,7 @@ const collisionRetry = time.Minute
 // this controller is the only thing that restarts them, and it has to cover
 // everything they read at start.
 //
-// What it needs to be allowed is in config/rbac-proxy-controller.yaml, with
+// What it needs to be allowed is in config/proxy-controller/rbac.yaml, with
 // SynapseRouteReconciler's. A change here that asks the API server for
 // something new has to add it there, and one that stops asking has to take
 // it out: the role's tests fail on both.

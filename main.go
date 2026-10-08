@@ -85,6 +85,7 @@ func main() {
 	var edgeProducer bool
 	var edgeProducerInterval time.Duration
 	var clusterID string
+	var proxyController bool
 
 	opts := zap.Options{
 		Development: true,
@@ -132,9 +133,15 @@ func main() {
 	flag.StringVar(&ensureFiles, "ensure-files", "upstreams.yaml", "config-sync: comma-separated filenames that must exist in --out-dir before synapse starts. Missing ones get a minimal valid document, because synapse-proxy aborts its whole background service (and never establishes a file watch) if the initial upstreams read fails.")
 	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
 	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
+	flag.BoolVar(&proxyController, "proxy-controller", false, "Run SynapseProxy resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its Deployment, Service and ServiceAccount, and render the routes and certificates of the Ingresses whose IngressClass names it in spec.parameters. Needs the CRD and the role in config/proxy-controller. Composable with the config-hash controller and the resolvers; cannot be combined with --ingress-mode or --config-sync.")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if conflict := proxyControllerConflict(proxyController, ingressMode, configSync); conflict != "" {
+		setupLog.Error(nil, conflict)
+		os.Exit(1)
+	}
 
 	outCM, err := parseNamespacedName(upstreamsOutConfigMap)
 	if err != nil {
@@ -294,6 +301,20 @@ func main() {
 		}
 	}
 
+	if proxyController {
+		// Before the manager: one that cannot read SynapseProxy resources
+		// would wait for them forever and start nothing.
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "--proxy-controller: client")
+			os.Exit(1)
+		}
+		if err := controllers.CheckProxyAccess(context.Background(), cl, watchedNamespace); err != nil {
+			setupLog.Error(err, "--proxy-controller cannot run")
+			os.Exit(1)
+		}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -389,6 +410,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if proxyController {
+		if err = controllers.SetupProxyControllers(mgr, clusterDomain); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "SynapseProxy")
+			os.Exit(1)
+		}
+		setupLog.Info("SynapseProxy controllers enabled")
+	}
+
 	if upstreamsResolver {
 		ur := &controllers.UpstreamsResolverReconciler{
 			Client:        mgr.GetClient(),
@@ -467,6 +496,23 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// proxyControllerConflict says why --proxy-controller cannot run with the
+// other modes chosen, or returns "".
+func proxyControllerConflict(proxyController, ingressMode, configSync bool) string {
+	switch {
+	case !proxyController:
+		return ""
+	case ingressMode:
+		// Both render Ingresses, into different places, and would each
+		// publish an address on the same ones.
+		return "--proxy-controller cannot be combined with --ingress-mode"
+	case configSync:
+		// A sidecar in a proxy's pod, with that pod's permissions.
+		return "--proxy-controller cannot be combined with --config-sync"
+	}
+	return ""
 }
 
 func parseLabelSelector(value string) (labels.Selector, error) {
