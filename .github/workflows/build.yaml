@@ -22,10 +22,29 @@ jobs:
           cache-dependency-path: go.sum
       - name: Display Go version
         run: go version
-      - name: Run tests
+      - name: Check go.mod is tidy
         run: |
           go mod tidy
-          go test -v
+          git diff --exit-code -- go.mod go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Run tests
+        # Every package: a bare `go test` only covers the root one.
+        run: go test -v ./...
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker buildx bake image-local
+      - name: Check the image
+        # The binary must be built for the platform the image claims, and it
+        # must start.
+        run: |
+          arch=$(docker image inspect synapse-operator:local --format '{{.Architecture}}')
+          cid=$(docker create synapse-operator:local)
+          docker cp "${cid}:/app/manager" "${RUNNER_TEMP}/manager"
+          docker rm "${cid}" >/dev/null
+          go version -m "${RUNNER_TEMP}/manager" | grep -F "GOARCH=${arch}"
+          docker run --rm synapse-operator:local -h >/dev/null
 
 
   build-arm64:
@@ -45,7 +64,26 @@ jobs:
           cache-dependency-path: go.sum
       - name: Display Go version
         run: go version
-      - name: Run tests
+      - name: Check go.mod is tidy
         run: |
           go mod tidy
-          go test -v
+          git diff --exit-code -- go.mod go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Run tests
+        # Every package: a bare `go test` only covers the root one.
+        run: go test -v ./...
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker buildx bake image-local
+      - name: Check the image
+        # The binary must be built for the platform the image claims, and it
+        # must start.
+        run: |
+          arch=$(docker image inspect synapse-operator:local --format '{{.Architecture}}')
+          cid=$(docker create synapse-operator:local)
+          docker cp "${cid}:/app/manager" "${RUNNER_TEMP}/manager"
+          docker rm "${cid}" >/dev/null
+          go version -m "${RUNNER_TEMP}/manager" | grep -F "GOARCH=${arch}"
+          docker run --rm synapse-operator:local -h >/dev/null
