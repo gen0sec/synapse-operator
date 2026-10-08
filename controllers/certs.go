@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -126,6 +127,11 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 	return changed, len(want), nil
 }
 
+// maxCertsSecretBytes is how much certificate material goes into the output
+// Secret. The API server limits a Secret to 1 MiB; this leaves room for the
+// rest of the object.
+const maxCertsSecretBytes = 1000 * 1000
+
 // projectCertsToSecret is the central-mode analogue of projectCerts: it
 // materializes m.certProjections into the CertsOutSecret Secret as
 // <stem>.crt/<stem>.key data keys, which the separate synapse-proxy pod
@@ -148,8 +154,18 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 	sort.Strings(stems)
 
 	data := map[string][]byte{}
+	size := 0
 	for _, stem := range stems {
 		cp := m.certProjections[stem]
+		// A Secret that the API server refuses takes every certificate with
+		// it, and with them the whole render. So one that cannot be stored is
+		// left out, and its host falls back to the default certificate.
+		if problems := validation.IsConfigMapKey(stem + ".crt"); len(problems) > 0 {
+			logger.Info("certificate cannot be stored under its name; skipping (host will fall back to default)",
+				"secret", cp.ns+"/"+cp.name, "stem", stem, "why", strings.Join(problems, "; "))
+			mCertErrors.Inc()
+			continue
+		}
 		var sec corev1.Secret
 		if err := r.Get(ctx, types.NamespacedName{Namespace: cp.ns, Name: cp.name}, &sec); err != nil {
 			logger.Info("referenced TLS Secret unavailable; skipping cert (host will fall back to default)",
@@ -165,6 +181,16 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 			mCertErrors.Inc()
 			continue
 		}
+		// Stems are taken in name order, so which certificates are left out
+		// when the Secret is full does not change from one render to the next.
+		entry := len(crt) + len(key) + 2*len(stem) + len(".crt") + len(".key")
+		if size+entry > maxCertsSecretBytes {
+			logger.Info("certificates Secret is full; skipping cert (host will fall back to default)",
+				"secret", cp.ns+"/"+cp.name, "stem", stem, "limitBytes", maxCertsSecretBytes)
+			mCertErrors.Inc()
+			continue
+		}
+		size += entry
 		data[stem+".crt"] = crt
 		data[stem+".key"] = key
 	}

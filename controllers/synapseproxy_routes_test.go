@@ -311,6 +311,8 @@ func TestRoutes_DeletedProxy(t *testing.T) {
 		t.Fatalf("hosts gauge = %v before deletion, want 1", got)
 	}
 
+	mProxyRenderErrors.WithLabelValues("synapse-os", "edge").Inc()
+
 	if err := r.Delete(context.Background(), edge); err != nil {
 		t.Fatal(err)
 	}
@@ -323,11 +325,20 @@ func TestRoutes_DeletedProxy(t *testing.T) {
 	}
 }
 
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
+}
+
 // proxySeries counts the per-proxy gauge series that exist for one proxy.
 func proxySeries(t *testing.T, namespace, name string) int {
 	t.Helper()
 	n := 0
-	for _, vec := range []*prometheus.GaugeVec{mProxyHosts, mProxyRoutes, mProxyCerts} {
+	for _, vec := range []prometheus.Collector{mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors} {
 		ch := make(chan prometheus.Metric)
 		go func() {
 			vec.Collect(ch)
