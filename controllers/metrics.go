@@ -96,6 +96,10 @@ var (
 		Name: "synapse_operator_proxy_certs",
 		Help: "TLS Secrets currently projected into a proxy's certificates Secret.",
 	}, []string{"namespace", "name"})
+	mProxyRenderErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "synapse_operator_proxy_render_errors_total",
+		Help: "Renders of a proxy's routes and certificates that failed.",
+	}, []string{"namespace", "name"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
 		Help: "Referenced TLS Secrets that were missing or not usable.",
@@ -107,7 +111,7 @@ func init() {
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
-		mProxyHosts, mProxyRoutes, mProxyCerts,
+		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,
 	)

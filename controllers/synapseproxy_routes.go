@@ -92,8 +92,16 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
 	}
-	_, _, _, err = render.render(ctx)
-	return ctrl.Result{}, err
+	if _, _, _, err = render.render(ctx); err != nil {
+		// It is retried, but until it succeeds the proxy serves the routes
+		// and certificates of the last render that did, and says nothing.
+		mProxyRenderErrors.WithLabelValues(proxy.Namespace, proxy.Name).Inc()
+		if r.Recorder != nil {
+			r.Recorder.Eventf(&proxy, corev1.EventTypeWarning, "RoutesNotRendered", "%v", err)
+		}
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 // boundIngressClasses returns the names of the IngressClasses that hand
@@ -149,6 +157,7 @@ func forgetProxyGauges(namespace, name string) {
 	mProxyHosts.DeleteLabelValues(namespace, name)
 	mProxyRoutes.DeleteLabelValues(namespace, name)
 	mProxyCerts.DeleteLabelValues(namespace, name)
+	mProxyRenderErrors.DeleteLabelValues(namespace, name)
 }
 
 // SetupWithManager registers the controller. A render is a function of
