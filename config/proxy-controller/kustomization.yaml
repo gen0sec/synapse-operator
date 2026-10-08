@@ -1,0 +1,13 @@
+# What running SynapseProxy resources takes on top of the operator in ../:
+# the CRD, and the role its two controllers need.
+#
+#   kubectl apply -k config
+#   kubectl apply -k config/proxy-controller
+#
+# and --proxy-controller in the operator's arguments.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../crd
+  - rbac.yaml

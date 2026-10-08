@@ -42,7 +42,7 @@ func proxyCertsName(proxy *synapsev1alpha1.SynapseProxy) types.NamespacedName {
 //
 // The rendering itself is IngressReconciler's, run once per proxy.
 //
-// What it needs to be allowed is in config/rbac-proxy-controller.yaml; see
+// What it needs to be allowed is in config/proxy-controller/rbac.yaml; see
 // SynapseProxyReconciler.
 type SynapseRouteReconciler struct {
 	client.Client

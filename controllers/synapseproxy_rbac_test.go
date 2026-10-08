@@ -42,7 +42,7 @@ import (
 // nothing, and read everything it lets them read; with any one of its writes
 // taken away, they must be refused something.
 const (
-	proxyRoleManifest    = "../config/rbac-proxy-controller.yaml"
+	proxyRoleManifest    = "../config/proxy-controller/rbac.yaml"
 	operatorRoleManifest = "../config/rbac.yaml"
 )
 
@@ -335,15 +335,9 @@ func runProxyControllers(t *testing.T, cfg *rest.Config, namespace ...string) (s
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes := &SynapseRouteReconciler{
-		Client: mgr.GetClient(), ClusterDomain: "cluster.local",
-		Recorder: mgr.GetEventRecorderFor("synapse-proxy-routes"),
-	}
-	if err := routes.SetupWithManager(mgr); err != nil {
-		t.Fatal(err)
-	}
-	proxies := &SynapseProxyReconciler{Client: mgr.GetClient(), Recorder: mgr.GetEventRecorderFor("synapse-proxy")}
-	if err := proxies.SetupWithManager(mgr); err != nil {
+	// As the operator registers them, so that the role is tested against
+	// what the operator runs.
+	if err := SetupProxyControllers(mgr, "cluster.local"); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

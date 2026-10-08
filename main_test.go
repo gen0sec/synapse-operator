@@ -296,3 +296,28 @@ func TestParseKeySet(t *testing.T) {
 
 	assert.Nil(t, parseKeySet(""))
 }
+
+func TestProxyControllerConflict(t *testing.T) {
+	tests := []struct {
+		name                                     string
+		proxyController, ingressMode, configSync bool
+		want                                     string
+	}{
+		{name: "alone", proxyController: true},
+		{name: "off, with ingress mode", ingressMode: true},
+		{name: "off, with config-sync", configSync: true},
+		{name: "with ingress mode", proxyController: true, ingressMode: true, want: "--ingress-mode"},
+		{name: "with config-sync", proxyController: true, configSync: true, want: "--config-sync"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := proxyControllerConflict(tt.proxyController, tt.ingressMode, tt.configSync)
+			if tt.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, "--proxy-controller")
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}

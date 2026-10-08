@@ -43,7 +43,7 @@ manifests:
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 
 # `git status`, not `git diff`: a generated file nobody committed is stale too.
-GENERATED = config/crd ':(glob)api/**/zz_generated.*.go'
+GENERATED = config/crd/bases ':(glob)api/**/zz_generated.*.go'
 
 verify-generated: generate manifests
 	@if [ -n "$$(git status --porcelain -- $(GENERATED))" ]; then \

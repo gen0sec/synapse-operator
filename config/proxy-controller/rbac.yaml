@@ -1,6 +1,6 @@
-# What the operator needs, on top of config/rbac.yaml, to run SynapseProxy
-# resources. It is a role of its own so that an operator that does not run
-# them is not handed it.
+# What the operator needs, on top of ../rbac.yaml, to run SynapseProxy
+# resources (--proxy-controller). It is a role of its own so that an operator
+# that does not run them is not handed it.
 #
 # Two grants are wide because RBAC cannot narrow them:
 #   - Secrets, in every namespace: read, because a proxy's certificates come

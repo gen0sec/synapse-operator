@@ -28,6 +28,7 @@ A Go [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)
 - **TLS projection** — projects referenced Ingress/Gateway TLS Secrets into Synapse's certificates directory, operator-owned and hot-reloaded
 - **Status & HA** — optionally publishes load-balancer addresses on matched Ingresses and gates shared status writes behind a Lease when running more than one proxy replica
 - **Helm-native** — keys off `app.kubernetes.io/name=synapse`, so it plugs straight into Synapse Helm releases
+- **SynapseProxy** (`--proxy-controller`, alpha) — runs a Synapse proxy from one typed resource: its configuration, Deployment, Service, routes and certificates. See [SynapseProxy](#synapseproxy)
 
 > **Go 1.26+** · any conformant **Kubernetes** cluster · Gateway API CRDs required only for `--gateway-api`
 
@@ -133,6 +134,76 @@ Regex paths are **anchored at the start** (`^`) since they match from the beginn
 
 ---
 
+## SynapseProxy
+
+> **Alpha** (`synapse.gen0sec.com/v1alpha1`): the API can still change. Off unless the operator runs with `--proxy-controller`.
+
+A `SynapseProxy` is a Synapse proxy described by one resource. The operator renders its configuration, creates its Deployment, Service and ServiceAccount, and renders the routes and TLS certificates of the Ingresses that belong to it. Nobody edits a ConfigMap.
+
+```yaml
+apiVersion: synapse.gen0sec.com/v1alpha1
+kind: SynapseProxy
+metadata:
+  name: edge
+  namespace: edge
+spec:
+  image: ghcr.io/gen0sec/synapse:<version>   # 0.8.5 or newer
+  replicas: 2
+  service:
+    type: LoadBalancer
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+    - name: https
+      port: 443
+      protocol: TLS
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: edge
+spec:
+  controller: gen0sec.com/synapse
+  parameters:            # which proxy serves this class
+    apiGroup: synapse.gen0sec.com
+    kind: SynapseProxy
+    scope: Namespace
+    namespace: edge
+    name: edge
+```
+
+An Ingress with `ingressClassName: edge`, in any namespace, is then served by that proxy, with the certificates its `tls` section names.
+
+```console
+$ kubectl get synapseproxies -n edge
+NAME   READY   REASON    DESIRED   AVAILABLE   ADDRESS        AGE
+edge   True    Applied   2         2           203.0.113.10   2m
+```
+
+`READY` is true when the pods run the spec as it is written. When they do not, `REASON` and the resource's conditions say why: a configuration that cannot be rendered, a rollout in progress, an object of the same name in the way.
+
+### Install
+
+```bash
+kubectl apply -k config                    # the operator
+kubectl apply -k config/proxy-controller   # the CRD, and the role the controllers need
+```
+
+then add `--proxy-controller` to the operator's arguments in `config/manager.yaml`. The operator checks for the CRD and the role when it starts, and exits saying which is missing.
+
+### What to know
+
+- **The pod is privileged and runs as root,** as the Helm chart's does, with packet capture, the firewall and the IDS on. Whoever may create a `SynapseProxy` in a namespace gets such a pod there, running the image they name.
+- **A class is one trust domain.** The class decides which proxy gets an Ingress, and a class is cluster-scoped on purpose: a proxy receives the TLS private keys of every Ingress of its classes, from every namespace, and anyone who can create an Ingress of the class can claim a host on it.
+- **Routes and certificates take about a minute to reach running pods.** They are delivered through mounted volumes, which the kubelet refreshes on its own schedule.
+- **`spec.config` takes the Synapse settings that have no field.** A key the operator owns, such as `mode` or the listeners, is refused there and reported in the `ConfigValid` condition; it is never silently overridden. An invalid configuration changes nothing that is running.
+- **Certificates come from the Ingresses' TLS Secrets,** for example from cert-manager. Synapse's built-in ACME client is not used.
+- **Ingress only.** Gateway API routes are not rendered for a `SynapseProxy` yet.
+- **Not together with `--ingress-mode` or `--config-sync`** in one operator process.
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -181,6 +252,13 @@ flowchart TD
 | `--config-hash-annotation` | `synapse.gen0sec.com/config-hash` | Annotation key for the hash |
 | `--ignore-configmap-keys` | `upstreams.yaml` | Comma-separated ConfigMap keys excluded from the hash |
 | `--ignore-secret-keys` | _(none)_ | Comma-separated Secret keys excluded from the hash |
+
+**SynapseProxy**
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--proxy-controller` | `false` | Run [`SynapseProxy`](#synapseproxy) resources. Needs the CRD and the role in [`config/proxy-controller`](config/proxy-controller/). Composable with the default config-sync controller and the resolvers; refused with `--ingress-mode` and `--config-sync` |
+| `--cluster-domain` | `cluster.local` | Cluster DNS domain, for a backend that has no cluster IP |
 
 **Ingress / Gateway API mode** (`--ingress-mode`)
 
@@ -356,6 +434,7 @@ Details that matter:
 | [Gen0Sec Docs](https://docs.gen0sec.com/) | Product documentation and guides |
 | [Synapse](https://github.com/gen0sec/synapse) | The NDR/proxy this operator manages |
 | [`config/`](config/) | Kustomize deployment: namespace, ServiceAccount, RBAC, manager |
+| [`config/proxy-controller/`](config/proxy-controller/) | What `--proxy-controller` needs on top: the `SynapseProxy` CRD and its role |
 | [`SECURITY.md`](SECURITY.md) | Security policy and disclosure |
 
 ---
