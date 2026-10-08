@@ -239,7 +239,9 @@ type SynapseProxyStatus struct {
 	ConfigHash string `json:"configHash,omitempty"`
 
 	// Replicas is the number of proxy pods.
-	Replicas int32 `json:"replicas"`
+	//
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
 
 	// ReadyReplicas is the number of proxy pods that are ready.
 	//

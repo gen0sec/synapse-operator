@@ -1361,8 +1361,6 @@ spec:
                   configuration and image.
                 format: int32
                 type: integer
-            required:
-            - replicas
             type: object
         type: object
         x-kubernetes-validations:

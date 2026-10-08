@@ -313,6 +313,29 @@ func TestSynapseProxy_StatusIsASubresource(t *testing.T) {
 	}
 }
 
+// A controller reports what it knows when it knows it. No status field may be
+// required, or the first write that leaves one out is refused: a proxy with
+// no pods yet has nothing to say about replicas.
+func TestSynapseProxy_StatusFieldsAreOptional(t *testing.T) {
+	ctx := context.Background()
+	p := validProxy()
+	mustCreate(t, p)
+
+	patch := client.MergeFrom(p.DeepCopy())
+	p.Status.ConfigHash = "abc123"
+	if err := k8s.Status().Patch(ctx, p, patch); err != nil {
+		t.Fatalf("a status patch that sets one field: %v", err)
+	}
+
+	scale := &autoscalingv1.Scale{}
+	if err := k8s.SubResource("scale").Get(ctx, p, scale); err != nil {
+		t.Fatalf("get scale: %v", err)
+	}
+	if scale.Status.Replicas != 0 {
+		t.Errorf("scale reports %d replicas for a proxy that has reported none", scale.Status.Replicas)
+	}
+}
+
 // `kubectl scale` and the HorizontalPodAutoscaler go through this subresource.
 func TestSynapseProxy_ScaleSubresource(t *testing.T) {
 	ctx := context.Background()
