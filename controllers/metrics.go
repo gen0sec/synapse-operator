@@ -82,6 +82,20 @@ var (
 		Name: "synapse_operator_certs",
 		Help: "TLS Secrets currently projected into the certificates dir.",
 	})
+	// The three below are the per-owner counterparts of mHosts, mRoutes and
+	// mCerts, for renders that have an owner (IngressReconciler.OwnerRef).
+	mProxyHosts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_hosts",
+		Help: "Distinct hosts in the upstreams.yaml most recently rendered for a proxy.",
+	}, []string{"namespace", "name"})
+	mProxyRoutes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_routes",
+		Help: "Distinct host+path routes in the upstreams.yaml most recently rendered for a proxy.",
+	}, []string{"namespace", "name"})
+	mProxyCerts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_certs",
+		Help: "TLS Secrets currently projected into a proxy's certificates Secret.",
+	}, []string{"namespace", "name"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
 		Help: "Referenced TLS Secrets that were missing or not usable.",
@@ -93,6 +107,7 @@ func init() {
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
+		mProxyHosts, mProxyRoutes, mProxyCerts,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,
 	)

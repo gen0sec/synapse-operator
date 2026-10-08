@@ -133,6 +133,17 @@ type IngressReconciler struct {
 	// than waiting out synapse's DNS cache TTL. Falls back to ClusterIP/FQDN
 	// whenever the endpoint set is missing or empty.
 	ResolveBackendEndpoints bool
+	// IngressClassMatch, when set, decides which class names are served, in
+	// place of the comparison with IngressClassName. It is a function and
+	// not a list so that "serves no class" is a matcher returning false,
+	// never an empty value that falls back to IngressClassName.
+	IngressClassMatch func(className string) bool
+	// OwnerRef, when set, is made the controller of the upstreams ConfigMap
+	// and the certs Secret, so both are removed with their owner. An object
+	// that already exists under either name without that controller is left
+	// alone and the render fails, and the render reports on per-owner gauges
+	// rather than the process-wide ones.
+	OwnerRef *metav1.OwnerReference
 
 	ready      atomic.Bool
 	reloadOnce sync.Once
@@ -417,9 +428,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		}
 	}
 
-	mHosts.Set(float64(hosts))
-	mRoutes.Set(float64(routes))
-	mLastRenderTS.SetToCurrentTime()
+	if r.OwnerRef != nil {
+		mProxyHosts.WithLabelValues(r.UpstreamsOutConfigMap.Namespace, r.OwnerRef.Name).Set(float64(hosts))
+		mProxyRoutes.WithLabelValues(r.UpstreamsOutConfigMap.Namespace, r.OwnerRef.Name).Set(float64(routes))
+	} else {
+		mHosts.Set(float64(hosts))
+		mRoutes.Set(float64(routes))
+		mLastRenderTS.SetToCurrentTime()
+	}
 	if changed {
 		mRenderChangedTotal.Inc()
 		// SignalReload only makes sense in sidecar mode — central mode
@@ -435,7 +451,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	}
 	r.publishStatus(ctx, matchedIngs)
 
-	if r.ready.CompareAndSwap(false, true) {
+	if r.ready.CompareAndSwap(false, true) && r.OwnerRef == nil {
 		mReady.Set(1)
 	}
 	return changed, matched, hosts, nil
@@ -448,18 +464,27 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 // IngressClass (defaultOurs, resolved once per render).
 func (r *IngressReconciler) isOurs(ing *networkingv1.Ingress, defaultOurs bool) bool {
 	if ing.Spec.IngressClassName != nil {
-		return *ing.Spec.IngressClassName == r.IngressClassName
+		return r.servesClass(*ing.Spec.IngressClassName)
 	}
 	if v := strings.TrimSpace(ing.Annotations["kubernetes.io/ingress.class"]); v != "" {
-		return v == r.IngressClassName
+		return r.servesClass(v)
 	}
 	return defaultOurs
+}
+
+// servesClass reports whether Ingresses of the named class are ours.
+func (r *IngressReconciler) servesClass(name string) bool {
+	if r.IngressClassMatch != nil {
+		return r.IngressClassMatch(name)
+	}
+	return name == r.IngressClassName
 }
 
 // defaultClassIsOurs is true when an IngressClass annotated
 // ingressclass.kubernetes.io/is-default-class=true is controlled by
 // us (spec.controller == ControllerName) — so Ingresses with neither
-// spec.ingressClassName nor the legacy annotation are ours.
+// spec.ingressClassName nor the legacy annotation are ours. With
+// IngressClassMatch set, that default class must also be one it serves.
 func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 	var icl networkingv1.IngressClassList
 	if err := r.List(ctx, &icl); err != nil {
@@ -470,7 +495,10 @@ func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 		if ic.Spec.Controller != ControllerName {
 			continue
 		}
-		if ic.Annotations["ingressclass.kubernetes.io/is-default-class"] == "true" {
+		if ic.Annotations["ingressclass.kubernetes.io/is-default-class"] != "true" {
+			continue
+		}
+		if r.IngressClassMatch == nil || r.IngressClassMatch(ic.Name) {
 			return true
 		}
 	}
@@ -627,6 +655,9 @@ func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content
 	}
 	var changed bool
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if err := r.claimOutput(cm); err != nil {
+			return err
+		}
 		if cm.Labels == nil {
 			cm.Labels = map[string]string{}
 		}
@@ -653,6 +684,25 @@ func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content
 		// changed was already set inside the mutate fn
 	}
 	return changed, nil
+}
+
+// claimOutput makes OwnerRef the controller of an output object that is about
+// to be created, and refuses one that already exists under another controller
+// or none: it is somebody else's, and the routes and private keys do not
+// belong in it. A no-op without OwnerRef.
+func (r *IngressReconciler) claimOutput(obj client.Object) error {
+	if r.OwnerRef == nil {
+		return nil
+	}
+	if obj.GetResourceVersion() == "" {
+		obj.SetOwnerReferences([]metav1.OwnerReference{*r.OwnerRef})
+		return nil
+	}
+	if ref := metav1.GetControllerOf(obj); ref == nil || ref.UID != r.OwnerRef.UID {
+		return fmt.Errorf("%s/%s already exists and is not controlled by %s %s",
+			obj.GetNamespace(), obj.GetName(), r.OwnerRef.Kind, r.OwnerRef.Name)
+	}
+	return nil
 }
 
 // ingressUpstreamsManagedLabel marks a ConfigMap as written by the

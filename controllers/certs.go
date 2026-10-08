@@ -175,6 +175,9 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 	}}
 	var changed bool
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, out, func() error {
+		if err := r.claimOutput(out); err != nil {
+			return err
+		}
 		if out.Labels == nil {
 			out.Labels = map[string]string{}
 		}
@@ -197,7 +200,11 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 		logger.Info("projected TLS certs to secret",
 			"secret", r.CertsOutSecret.Namespace+"/"+r.CertsOutSecret.Name, "certs", n)
 	}
-	mCerts.Set(float64(n))
+	if r.OwnerRef != nil {
+		mProxyCerts.WithLabelValues(r.CertsOutSecret.Namespace, r.OwnerRef.Name).Set(float64(n))
+	} else {
+		mCerts.Set(float64(n))
+	}
 	return changed, n, nil
 }
 
