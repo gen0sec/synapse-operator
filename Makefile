@@ -25,6 +25,10 @@ release:
 		echo "Error: VERSION is required. Usage: make release VERSION=x.y.z [MESSAGE=\"...\"]"; \
 		exit 1; \
 	fi
+	@if [ "$$(git branch --show-current)" != "main" ]; then \
+		echo "Error: release from main. This target pushes main and the tag; from another branch the tag would point at a commit no branch has."; \
+		exit 1; \
+	fi
 	@echo "Releasing operator version $(VERSION)..."
 	@git commit --allow-empty -m "chore: release operator $(VERSION)"
 	@git tag -m "$(TAG_MSG)" v$(VERSION)

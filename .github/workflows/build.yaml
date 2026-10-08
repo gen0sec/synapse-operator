@@ -6,12 +6,13 @@ on:
         # A large change is collected on a release branch before it reaches
         # main; pull requests into one get the same checks.
         - 'release/**'
-  # The branches themselves, after each merge: two pull requests can each be
-  # green and still break once both are in.
+  # The branch itself, after each merge: two pull requests can each be green
+  # and still break once both are in. A release branch gets the same from the
+  # release workflow, which runs these jobs before it publishes anything.
   push:
       branches:
         - main
-        - 'release/**'
+  workflow_call:
 
 env:
   GO_VERSION: '1.26'
