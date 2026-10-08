@@ -6,6 +6,12 @@ on:
         # A large change is collected on a release branch before it reaches
         # main; pull requests into one get the same checks.
         - 'release/**'
+  # The branches themselves, after each merge: two pull requests can each be
+  # green and still break once both are in.
+  push:
+      branches:
+        - main
+        - 'release/**'
 
 jobs:
   build-amd64:
