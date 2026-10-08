@@ -177,7 +177,7 @@ flowchart TD
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--label-selector` | `app.kubernetes.io/name=synapse` | Selects config sources and workloads |
+| `--label-selector` | `app.kubernetes.io/name=synapse` | Selects config sources and workloads. Objects controlled by one of the operator's own resources (`synapse.gen0sec.com`) are left alone even when they match: the controller for that resource rolls them |
 | `--config-hash-annotation` | `synapse.gen0sec.com/config-hash` | Annotation key for the hash |
 | `--ignore-configmap-keys` | `upstreams.yaml` | Comma-separated ConfigMap keys excluded from the hash |
 | `--ignore-secret-keys` | _(none)_ | Comma-separated Secret keys excluded from the hash |

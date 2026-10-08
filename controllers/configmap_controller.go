@@ -19,10 +19,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/yaml"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
 
 // ConfigMapReconciler watches Synapse config ConfigMaps/Secrets and forces a rollout on the workload when the config changes.
@@ -93,7 +96,7 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 // SetupWithManager configures the controller to watch ConfigMaps/Secrets that match the selector.
 func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	matchesSelector := predicate.NewPredicateFuncs(r.isConfigSource)
+	matchesSelector := r.sourcePredicate()
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(
@@ -118,6 +121,22 @@ func (r *ConfigMapReconciler) selector() labels.Selector {
 	return r.LabelSelector
 }
 
+// sourcePredicate lets through the events of config sources. An update counts
+// when the object is a source before it or after it: one that stops being a
+// source, by losing the label or gaining an owner, changes the hash as much
+// as one whose content changed, and has to be reconciled then rather than at
+// the next unrelated event.
+func (r *ConfigMapReconciler) sourcePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return r.isConfigSource(e.Object) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return r.isConfigSource(e.Object) },
+		GenericFunc: func(e event.GenericEvent) bool { return r.isConfigSource(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return r.isConfigSource(e.ObjectOld) || r.isConfigSource(e.ObjectNew)
+		},
+	}
+}
+
 // isConfigSource reports whether a ConfigMap/Secret feeds the config hash.
 func (r *ConfigMapReconciler) isConfigSource(obj client.Object) bool {
 	if obj == nil {
@@ -126,21 +145,22 @@ func (r *ConfigMapReconciler) isConfigSource(obj client.Object) bool {
 	return r.selector().Matches(labels.Set(obj.GetLabels())) && !ownedByManagedResource(obj)
 }
 
-// managedAPIGroup is the API group of the operator's own resources.
-const managedAPIGroup = "synapse.gen0sec.com"
-
 // ownedByManagedResource reports whether obj is controlled by one of the
 // operator's own resources. Such an object already has one writer, the
 // controller for that resource, so this controller neither reads it as config
 // nor stamps it: two writers on one pod template would undo each other, and
 // config that belongs to one workload must not roll the rest of the namespace.
+//
+// That makes the owning controller responsible for rolling its workload, also
+// when config the workload reads from elsewhere changes. And owned config is
+// not a source for anybody: a workload that mounts some is not rolled for it.
 func ownedByManagedResource(obj metav1.Object) bool {
-	ref := metav1.GetControllerOf(obj)
+	ref := metav1.GetControllerOfNoCopy(obj)
 	if ref == nil {
 		return false
 	}
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
-	return err == nil && gv.Group == managedAPIGroup
+	return err == nil && gv.Group == synapsev1alpha1.GroupVersion.Group
 }
 
 // listConfigSources returns all labelled ConfigMaps + Secrets in the namespace,
@@ -166,8 +186,10 @@ func (r *ConfigMapReconciler) listConfigSources(ctx context.Context, namespace s
 		return nil, nil, err
 	}
 
-	cms := slices.DeleteFunc(configMaps.Items, func(cm corev1.ConfigMap) bool { return ownedByManagedResource(&cm) })
-	secs := slices.DeleteFunc(secrets.Items, func(s corev1.Secret) bool { return ownedByManagedResource(&s) })
+	// The same test the watch applies, so an object cannot trigger a
+	// reconcile without being hashed, or be hashed without triggering one.
+	cms := slices.DeleteFunc(configMaps.Items, func(cm corev1.ConfigMap) bool { return !r.isConfigSource(&cm) })
+	secs := slices.DeleteFunc(secrets.Items, func(s corev1.Secret) bool { return !r.isConfigSource(&s) })
 	return cms, secs, nil
 }
 
