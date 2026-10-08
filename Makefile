@@ -1,4 +1,4 @@
-.PHONY: release help generate manifests verify-generated vet test
+.PHONY: release help generate manifests verify-generated vet test e2e
 
 # Matches the k8s.io libraries in go.mod.
 CONTROLLER_TOOLS_VERSION ?= v0.22.0
@@ -18,6 +18,7 @@ help:
 	@echo "  verify-generated                        - Fail if generated files are out of date"
 	@echo "  vet                                     - Run go vet"
 	@echo "  test                                    - Run all tests"
+	@echo "  e2e E2E_SYNAPSE_IMAGE=<image>           - Run a SynapseProxy end to end on a k3s cluster in a container"
 	@echo "  help                                    - Show this help message"
 
 release:
@@ -52,8 +53,13 @@ verify-generated: generate manifests
 		exit 1; \
 	fi
 
+# With the e2e tag as well, so that the end-to-end test is at least compiled.
 vet:
-	go vet ./...
+	go vet -tags e2e ./...
 
 test:
 	go test ./...
+
+# Needs docker, kubectl and a Synapse image the local Docker has or can pull.
+e2e:
+	test/e2e/run.sh

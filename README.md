@@ -53,6 +53,12 @@ The API tests run against a local Kubernetes API server. Its binaries are downlo
 
 After changing a type under `api/`, run `make generate manifests` and commit the result.
 
+```bash
+make e2e E2E_SYNAPSE_IMAGE=ghcr.io/gen0sec/synapse:<version>
+```
+
+runs a `SynapseProxy` end to end: it starts a k3s cluster in a container, installs the operator built from the working tree, and sends requests through the cluster's load balancer to the Synapse pods the operator creates. It needs Docker, `kubectl`, and a Synapse image, 0.8.5 or newer, that the local Docker has or can pull. The cluster gets a kubeconfig of its own; the one `kubectl` uses by default is not touched. See [`test/e2e`](test/e2e/).
+
 ### Container
 
 ```bash
@@ -190,7 +196,7 @@ kubectl apply -k config                    # the operator
 kubectl apply -k config/proxy-controller   # the CRD, and the role the controllers need
 ```
 
-then add `--proxy-controller` to the operator's arguments in `config/manager.yaml`. The operator checks for the CRD and the role when it starts, and exits saying which is missing.
+then add `--proxy-controller` to the operator's arguments in `config/manager.yaml`. [`test/e2e/operator`](test/e2e/operator/) is a kustomization that does all three. The operator checks for the CRD and the role when it starts, and exits saying which is missing.
 
 ### What to know
 
@@ -435,6 +441,7 @@ Details that matter:
 | [Synapse](https://github.com/gen0sec/synapse) | The NDR/proxy this operator manages |
 | [`config/`](config/) | Kustomize deployment: namespace, ServiceAccount, RBAC, manager |
 | [`config/proxy-controller/`](config/proxy-controller/) | What `--proxy-controller` needs on top: the `SynapseProxy` CRD and its role |
+| [`test/e2e/`](test/e2e/) | End-to-end test of a `SynapseProxy` on k3s |
 | [`SECURITY.md`](SECURITY.md) | Security policy and disclosure |
 
 ---
