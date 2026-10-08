@@ -37,9 +37,20 @@ jobs:
           git diff --exit-code -- go.mod go.sum
       - name: Vet
         run: go vet ./...
+      - name: Check generated files are up to date
+        run: make verify-generated
+      - name: Cache the test API server binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: envtest-amd64-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
       - name: Run tests
         # Every package: a bare `go test` only covers the root one.
         run: go test -v ./...
+      - name: Run the API tests on the oldest supported Kubernetes
+        run: go test -count=1 ./api/...
+        env:
+          ENVTEST_K8S_VERSION: "1.30.3"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build image
@@ -79,6 +90,13 @@ jobs:
           git diff --exit-code -- go.mod go.sum
       - name: Vet
         run: go vet ./...
+      - name: Check generated files are up to date
+        run: make verify-generated
+      - name: Cache the test API server binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: envtest-arm64-${{ hashFiles('internal/testenv/testenv.go', '.github/workflows/build.yaml') }}
       - name: Run tests
         # Every package: a bare `go test` only covers the root one.
         run: go test -v ./...
