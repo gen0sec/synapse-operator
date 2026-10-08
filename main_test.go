@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -10,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/yaml"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 
@@ -320,4 +322,26 @@ func TestProxyControllerConflict(t *testing.T) {
 			assert.Contains(t, got, tt.want)
 		})
 	}
+}
+
+// config/crd/kustomization.yaml is written by hand, and what it lists is
+// generated. A kind added under api/ gets its CRD written to bases/ without
+// anything else noticing, and would then be missing from every install that
+// goes through the kustomization.
+func TestCRDKustomizationListsEveryCRD(t *testing.T) {
+	raw, err := os.ReadFile("config/crd/kustomization.yaml")
+	require.NoError(t, err)
+	var kustomization struct {
+		Resources []string `json:"resources"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &kustomization))
+
+	generated, err := filepath.Glob("config/crd/bases/*.yaml")
+	require.NoError(t, err)
+	require.NotEmpty(t, generated)
+	want := make([]string, 0, len(generated))
+	for _, file := range generated {
+		want = append(want, "bases/"+filepath.Base(file))
+	}
+	assert.ElementsMatch(t, want, kustomization.Resources)
 }

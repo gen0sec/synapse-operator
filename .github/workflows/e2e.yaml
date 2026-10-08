@@ -35,7 +35,9 @@ jobs:
       vars.E2E_SYNAPSE_IMAGE != '' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 30
+    # Longer than the test gives itself (test/e2e/run.sh), so that a run that
+    # hangs is ended by the test, with its state printed, and not by this.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
