@@ -100,6 +100,10 @@ var (
 		Name: "synapse_operator_proxy_render_errors_total",
 		Help: "Renders of a proxy's routes and certificates that failed.",
 	}, []string{"namespace", "name"})
+	mProxyReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_ready",
+		Help: "1 when a SynapseProxy's Ready condition is true, else 0.",
+	}, []string{"namespace", "name"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
 		Help: "Referenced TLS Secrets that were missing or not usable.",
@@ -111,7 +115,7 @@ func init() {
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
-		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors,
+		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,
 	)
