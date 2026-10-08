@@ -73,7 +73,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: SynapseProxySpec is the desired state of a SynapseProxy.
+            description: Spec is the desired state of the proxy.
             properties:
               affinity:
                 description: Affinity is the scheduling affinity of the proxy pods.
@@ -1362,6 +1362,8 @@ spec:
                 format: int32
                 type: integer
             type: object
+        required:
+        - spec
         type: object
         x-kubernetes-validations:
         - message: metadata.name must be at most 48 characters

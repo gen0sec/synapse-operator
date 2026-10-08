@@ -30,7 +30,8 @@ type SynapseProxy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   SynapseProxySpec   `json:"spec,omitempty"`
+	// Spec is the desired state of the proxy.
+	Spec   SynapseProxySpec   `json:"spec"`
 	Status SynapseProxyStatus `json:"status,omitempty"`
 }
 
