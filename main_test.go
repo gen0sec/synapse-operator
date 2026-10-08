@@ -11,6 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +36,11 @@ func TestSchemeInitialization(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Deployment", gvk.Kind)
 	assert.Equal(t, "apps/v1", gvk.GroupVersion().String())
+
+	gvk, err = apiutil.GVKForObject(&synapsev1alpha1.SynapseProxy{}, scheme)
+	require.NoError(t, err)
+	assert.Equal(t, "SynapseProxy", gvk.Kind)
+	assert.Equal(t, "synapse.gen0sec.com/v1alpha1", gvk.GroupVersion().String())
 }
 
 func TestSchemeKnownTypes(t *testing.T) {
