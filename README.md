@@ -29,7 +29,7 @@ A Go [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)
 - **Status & HA** — optionally publishes load-balancer addresses on matched Ingresses and gates shared status writes behind a Lease when running more than one proxy replica
 - **Helm-native** — keys off `app.kubernetes.io/name=synapse`, so it plugs straight into Synapse Helm releases
 
-> **Go 1.24+** · any conformant **Kubernetes** cluster · Gateway API CRDs required only for `--gateway-api`
+> **Go 1.26+** · any conformant **Kubernetes** cluster · Gateway API CRDs required only for `--gateway-api`
 
 ---
 
@@ -40,6 +40,17 @@ A Go [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)
 ```bash
 GOOS=linux GOARCH=amd64 go build -o bin/synapse-operator
 ```
+
+### Test
+
+```bash
+make test               # every package
+make verify-generated   # fails if the CRDs or deepcopy code are stale
+```
+
+The API tests run against a local Kubernetes API server. Its binaries are downloaded on first use; set `KUBEBUILDER_ASSETS` to use ones already on disk.
+
+After changing a type under `api/`, run `make generate manifests` and commit the result.
 
 ### Container
 
