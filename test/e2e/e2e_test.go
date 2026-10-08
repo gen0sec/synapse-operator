@@ -1,0 +1,744 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
+)
+
+const (
+	operatorNamespace = "synapse-os"
+	// The proxy and what it serves are in different namespaces, as they
+	// usually are: routes and certificates have to cross.
+	proxyNamespace = "e2e-edge"
+	appsNamespace  = "e2e-apps"
+	className      = "e2e-edge"
+
+	shopHost  = "shop.e2e.test"
+	apiHost   = "api.e2e.test"
+	otherHost = "other.e2e.test"
+
+	// How long a change is given to show. A proxy's routes and certificates
+	// reach its pods through mounted volumes, which the kubelet refreshes
+	// about once a minute; more often while a pod is new, which is why these
+	// steps can be over in a second.
+	soon       = 2 * time.Minute
+	afterASync = 5 * time.Minute
+)
+
+var proxyKey = types.NamespacedName{Namespace: proxyNamespace, Name: "edge"}
+
+// cluster is the cluster under test and the two addresses its load balancer
+// is reached at from here.
+type cluster struct {
+	t   *testing.T
+	ctx context.Context
+	k8s client.Client
+
+	httpAddr, httpsAddr        string
+	synapseImage, backendImage string
+}
+
+func env(t *testing.T, name string) string {
+	t.Helper()
+	v := os.Getenv(name)
+	if v == "" {
+		t.Fatalf("%s is not set; test/e2e/run.sh sets up a cluster and everything this test needs", name)
+	}
+	return v
+}
+
+func newCluster(t *testing.T) *cluster {
+	t.Helper()
+	// From the named file only: never whatever cluster kubectl points at.
+	cfg, err := clientcmd.BuildConfigFromFlags("", env(t, "E2E_KUBECONFIG"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, synapsev1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	k8s, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &cluster{
+		t: t, ctx: context.Background(), k8s: k8s,
+		httpAddr: env(t, "E2E_HTTP_ADDR"), httpsAddr: env(t, "E2E_HTTPS_ADDR"),
+		synapseImage: env(t, "E2E_SYNAPSE_IMAGE"), backendImage: env(t, "E2E_BACKEND_IMAGE"),
+	}
+}
+
+// eventually polls check until it returns "" or the time is up, and fails
+// the test with the last reason it gave. It returns how long it took.
+func (c *cluster) eventually(t *testing.T, within time.Duration, what string, check func() string) time.Duration {
+	t.Helper()
+	start := time.Now()
+	deadline := start.Add(within)
+	for {
+		reason := check()
+		if reason == "" {
+			return time.Since(start).Round(time.Second)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: after %s, %s", what, within, reason)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (c *cluster) create(t *testing.T, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		if err := c.k8s.Create(c.ctx, obj); err != nil {
+			t.Fatalf("create %T %s: %v", obj, obj.GetName(), err)
+		}
+	}
+}
+
+// clear removes what an earlier run on the same cluster left.
+func (c *cluster) clear(t *testing.T) {
+	t.Helper()
+	leftovers := []client.Object{
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: proxyNamespace}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: appsNamespace}},
+		&networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: className}},
+	}
+	for _, obj := range leftovers {
+		if err := c.k8s.Delete(c.ctx, obj); client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+	}
+	c.eventually(t, soon, "what an earlier run left is removed", func() string {
+		for _, obj := range leftovers {
+			if err := c.k8s.Get(c.ctx, client.ObjectKeyFromObject(obj), obj); !apierrors.IsNotFound(err) {
+				return fmt.Sprintf("%T %s is still there (%v)", obj, obj.GetName(), err)
+			}
+		}
+		return ""
+	})
+}
+
+// backend is a Deployment of the test's HTTP server and the Service in front
+// of it. Every response names the backend it came from.
+func (c *cluster) backend(name string) []client.Object {
+	labels := map[string]string{"app": name}
+	return []client.Object{
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: name},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: labels},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name:            "backend",
+						Image:           c.backendImage,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Env:             []corev1.EnvVar{{Name: "NAME", Value: name}},
+						Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
+						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt32(8080)},
+						}},
+					}}},
+				},
+			},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: name},
+			Spec: corev1.ServiceSpec{
+				Selector: labels,
+				Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt32(8080)}},
+			},
+		},
+	}
+}
+
+// ingress routes host to the backend of the given name, for the given class.
+func ingress(name, class, host, backend string) *networkingv1.Ingress {
+	prefix := networkingv1.PathTypePrefix
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: name},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: &class,
+			Rules: []networkingv1.IngressRule{{
+				Host: host,
+				IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: []networkingv1.HTTPIngressPath{{
+						Path: "/", PathType: &prefix,
+						Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
+							Name: backend, Port: networkingv1.ServiceBackendPort{Number: 80},
+						}},
+					}},
+				}},
+			}},
+		},
+	}
+}
+
+// certificate makes a self-signed certificate for host. It returns the PEM
+// pair a TLS Secret holds and the certificate as a server presents it.
+func certificate(t *testing.T, host string) (certPEM, keyPEM, der []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err = x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), der
+}
+
+// answer is what came back for one request.
+type answer struct {
+	status  int
+	backend string
+	// served is the certificate the server presented, over TLS.
+	served []byte
+}
+
+// get sends one request for host through the load balancer, on a connection
+// of its own.
+func (c *cluster) get(scheme, host string) (answer, error) {
+	addr := c.httpAddr
+	if scheme == "https" {
+		addr = c.httpsAddr
+	}
+	requests := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, addr)
+			},
+			// Not verified here: the test compares the certificate itself.
+			TLSClientConfig: &tls.Config{ServerName: host, InsecureSkipVerify: true},
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := requests.Get(scheme + "://" + host + "/")
+	if err != nil {
+		return answer{}, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	a := answer{status: resp.StatusCode, backend: resp.Header.Get("X-Backend")}
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		a.served = resp.TLS.PeerCertificates[0].Raw
+	}
+	return a, nil
+}
+
+// routed reports "" when a request for host reaches backend.
+func (c *cluster) routed(scheme, host, backend string) string {
+	a, err := c.get(scheme, host)
+	switch {
+	case err != nil:
+		return err.Error()
+	case a.status != http.StatusOK || a.backend != backend:
+		return fmt.Sprintf("%s://%s answered %d from backend %q, want 200 from %q", scheme, host, a.status, a.backend, backend)
+	}
+	return ""
+}
+
+func (c *cluster) proxy(t *testing.T) *synapsev1alpha1.SynapseProxy {
+	t.Helper()
+	var p synapsev1alpha1.SynapseProxy
+	if err := c.k8s.Get(c.ctx, proxyKey, &p); err != nil {
+		t.Fatal(err)
+	}
+	return &p
+}
+
+// edit changes the proxy's spec, as a user would.
+func (c *cluster) edit(t *testing.T, change func(*synapsev1alpha1.SynapseProxySpec)) {
+	t.Helper()
+	p := c.proxy(t)
+	change(&p.Spec)
+	if err := c.k8s.Update(c.ctx, p); err != nil {
+		t.Fatalf("update the proxy: %v", err)
+	}
+}
+
+// ready reports "" when the proxy says its spec, as it is now, is what runs.
+func (c *cluster) ready() string {
+	var p synapsev1alpha1.SynapseProxy
+	if err := c.k8s.Get(c.ctx, proxyKey, &p); err != nil {
+		return err.Error()
+	}
+	cond := meta.FindStatusCondition(p.Status.Conditions, "Ready")
+	switch {
+	case cond == nil:
+		return "the proxy has no Ready condition"
+	case cond.ObservedGeneration != p.Generation:
+		return "the proxy's status is of an earlier spec"
+	case cond.Status != metav1.ConditionTrue:
+		return fmt.Sprintf("the proxy is not ready: %s: %s", cond.Reason, cond.Message)
+	}
+	return ""
+}
+
+func (c *cluster) deployment(t *testing.T) *appsv1.Deployment {
+	t.Helper()
+	var d appsv1.Deployment
+	if err := c.k8s.Get(c.ctx, proxyKey, &d); err != nil {
+		t.Fatal(err)
+	}
+	return &d
+}
+
+// configSecret is the Secret the Deployment's pods get their config from.
+func configSecret(d *appsv1.Deployment) string {
+	for _, v := range d.Spec.Template.Spec.Volumes {
+		if v.Name == "config" && v.Secret != nil {
+			return v.Secret.SecretName
+		}
+	}
+	return ""
+}
+
+// pods returns the UIDs of the proxy's pods that are not on their way out.
+func (c *cluster) pods(t *testing.T) []types.UID {
+	t.Helper()
+	var list corev1.PodList
+	err := c.k8s.List(c.ctx, &list, client.InNamespace(proxyNamespace), client.MatchingLabels{"synapse.gen0sec.com/proxy": proxyKey.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uids []types.UID
+	for _, p := range list.Items {
+		if p.DeletionTimestamp.IsZero() {
+			uids = append(uids, p.UID)
+		}
+	}
+	slices.Sort(uids)
+	return uids
+}
+
+func (c *cluster) operatorAvailable() string {
+	var d appsv1.Deployment
+	if err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: operatorNamespace, Name: "synapse-operator"}, &d); err != nil {
+		return err.Error()
+	}
+	if d.Status.ObservedGeneration != d.Generation || d.Status.UpdatedReplicas < 1 || d.Status.AvailableReplicas != d.Status.Replicas {
+		return fmt.Sprintf("the operator's Deployment is at %+v", d.Status)
+	}
+	return ""
+}
+
+// One proxy, from before it exists until after it is gone. The steps build on
+// each other, so the first that fails ends the test.
+func TestSynapseProxy(t *testing.T) {
+	c := newCluster(t)
+	step := func(name string, run func(t *testing.T)) {
+		t.Helper()
+		if !t.Run(name, run) {
+			t.FailNow()
+		}
+	}
+
+	step("the operator is running", func(t *testing.T) {
+		c.eventually(t, soon, "the operator is available", c.operatorAvailable)
+		c.clear(t)
+	})
+
+	step("a proxy serves an Ingress that was there before it", func(t *testing.T) {
+		c.create(t,
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: proxyNamespace}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: appsNamespace}},
+		)
+		c.create(t, c.backend("shop")...)
+		c.create(t, c.backend("api")...)
+
+		// The class hands its Ingresses to a proxy that does not exist yet.
+		group, scope, ns := synapsev1alpha1.GroupVersion.Group, networkingv1.IngressClassParametersReferenceScopeNamespace, proxyNamespace
+		c.create(t,
+			&networkingv1.IngressClass{
+				ObjectMeta: metav1.ObjectMeta{Name: className},
+				Spec: networkingv1.IngressClassSpec{
+					Controller: "gen0sec.com/synapse",
+					Parameters: &networkingv1.IngressClassParametersReference{
+						APIGroup: &group, Kind: "SynapseProxy", Name: proxyKey.Name, Scope: &scope, Namespace: &ns,
+					},
+				},
+			},
+			ingress("shop", className, shopHost, "shop"),
+		)
+
+		c.create(t, &synapsev1alpha1.SynapseProxy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: proxyKey.Namespace, Name: proxyKey.Name},
+			Spec: synapsev1alpha1.SynapseProxySpec{
+				Image:   c.synapseImage,
+				Service: &synapsev1alpha1.ProxyServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+				Listeners: []synapsev1alpha1.Listener{
+					{Name: "http", Port: 80, Protocol: "HTTP"},
+					{Name: "https", Port: 443, Protocol: "TLS"},
+				},
+			},
+		})
+		c.eventually(t, soon, "the proxy becomes ready", c.ready)
+
+		p := c.proxy(t)
+		if p.Status.ReadyReplicas != 1 || p.Status.ConfigHash == "" || len(p.Status.Addresses) == 0 {
+			t.Errorf("a ready proxy reports %d ready replicas, configuration %q, addresses %v",
+				p.Status.ReadyReplicas, p.Status.ConfigHash, p.Status.Addresses)
+		}
+		c.eventually(t, soon, "the Ingress is served", func() string { return c.routed("http", shopHost, "shop") })
+	})
+
+	step("a host nobody routes is not served", func(t *testing.T) {
+		a, err := c.get("http", "nobody.e2e.test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.status != http.StatusNotFound || a.backend != "" {
+			t.Errorf("answered %d from backend %q, want 404 from none", a.status, a.backend)
+		}
+	})
+
+	step("the Ingress is told where the proxy is", func(t *testing.T) {
+		c.eventually(t, soon, "the proxy's address is on the Ingress", func() string {
+			var svc corev1.Service
+			if err := c.k8s.Get(c.ctx, proxyKey, &svc); err != nil {
+				return err.Error()
+			}
+			var ing networkingv1.Ingress
+			if err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: appsNamespace, Name: "shop"}, &ing); err != nil {
+				return err.Error()
+			}
+			var want, got []string
+			for _, in := range svc.Status.LoadBalancer.Ingress {
+				want = append(want, in.IP+in.Hostname)
+			}
+			for _, in := range ing.Status.LoadBalancer.Ingress {
+				got = append(got, in.IP+in.Hostname)
+			}
+			if len(want) == 0 || !slices.Equal(got, want) {
+				return fmt.Sprintf("the Service is at %v and the Ingress says %v", want, got)
+			}
+			return ""
+		})
+	})
+
+	certPEM, keyPEM, first := certificate(t, apiHost)
+	apiTLS := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "api-tls"},
+		Type:       corev1.SecretTypeTLS,
+		Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
+	}
+
+	step("an Ingress added later is served, with its certificate, and one of another class is not", func(t *testing.T) {
+		c.create(t, ingress("other", "someone-elses", otherHost, "shop"))
+		api := ingress("api", className, apiHost, "api")
+		api.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{apiHost}, SecretName: apiTLS.Name}}
+		c.create(t, apiTLS, api)
+
+		took := c.eventually(t, afterASync, "the new Ingress is served over TLS", func() string {
+			if reason := c.routed("https", apiHost, "api"); reason != "" {
+				return reason
+			}
+			if a, _ := c.get("https", apiHost); !bytes.Equal(a.served, first) {
+				return "the certificate served is not the one in the Ingress's Secret"
+			}
+			return ""
+		})
+		t.Logf("served %s after it was created", took)
+
+		// Rendered after the other class's Ingress was created, so its
+		// absence is not a matter of time.
+		var routes corev1.ConfigMap
+		if err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: proxyNamespace, Name: "edge-upstreams"}, &routes); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(routes.Data["upstreams.yaml"], otherHost) {
+			t.Errorf("the proxy's routes include an Ingress of another class:\n%s", routes.Data["upstreams.yaml"])
+		}
+		if a, err := c.get("http", otherHost); err != nil || a.status != http.StatusNotFound {
+			t.Errorf("a host of another class answered %d (%v), want 404", a.status, err)
+		}
+		if reason := c.routed("http", shopHost, "shop"); reason != "" {
+			t.Errorf("the first Ingress is no longer served: %s", reason)
+		}
+	})
+
+	step("a renewed certificate is served", func(t *testing.T) {
+		certPEM, keyPEM, renewed := certificate(t, apiHost)
+		if err := c.k8s.Get(c.ctx, client.ObjectKeyFromObject(apiTLS), apiTLS); err != nil {
+			t.Fatal(err)
+		}
+		apiTLS.Data = map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM}
+		if err := c.k8s.Update(c.ctx, apiTLS); err != nil {
+			t.Fatal(err)
+		}
+		took := c.eventually(t, afterASync, "the renewed certificate is served", func() string {
+			a, err := c.get("https", apiHost)
+			switch {
+			case err != nil:
+				return err.Error()
+			case bytes.Equal(a.served, first):
+				return "the old certificate is still served"
+			case !bytes.Equal(a.served, renewed):
+				return "a certificate is served that is neither the old nor the renewed one"
+			case a.status != http.StatusOK || a.backend != "api":
+				return fmt.Sprintf("answered %d from backend %q", a.status, a.backend)
+			}
+			return ""
+		})
+		t.Logf("served %s after it was renewed", took)
+	})
+
+	step("a configuration change replaces the pods without a failed request", func(t *testing.T) {
+		before := c.deployment(t)
+		oldConfig, oldPods := configSecret(before), c.pods(t)
+
+		// Requests through the load balancer, each on a new connection, from
+		// a few clients at once, for as long as the rollout takes. A pod that
+		// stops while it is still being sent connections fails one of them.
+		var mu sync.Mutex
+		var sent int
+		var failed []string
+		stop := make(chan struct{})
+		var clients sync.WaitGroup
+		for range 4 {
+			clients.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					reason := c.routed("http", shopHost, "shop")
+					mu.Lock()
+					sent++
+					if reason != "" {
+						failed = append(failed, time.Now().Format("15:04:05.000 ")+reason)
+					}
+					mu.Unlock()
+					time.Sleep(10 * time.Millisecond)
+				}
+			})
+		}
+
+		// Every field that ends up in Synapse's configuration, and a
+		// setting passed through as it is: Synapse has to start with what
+		// the operator renders from them.
+		c.edit(t, func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"}
+			s.TLS = &synapsev1alpha1.TLSSpec{Grade: "high"}
+			s.TrustedProxies = []string{"10.0.0.0/8", "fd00::/8"}
+			s.Config = &runtime.RawExtension{Raw: []byte(`{"proxy":{"h2c":false}}`)}
+		})
+		c.eventually(t, afterASync, "the pods are replaced and the old configuration removed", func() string {
+			if reason := c.ready(); reason != "" {
+				return reason
+			}
+			now := configSecret(c.deployment(t))
+			if now == oldConfig {
+				return "the pods still mount " + now
+			}
+			for _, uid := range c.pods(t) {
+				if slices.Contains(oldPods, uid) {
+					return "a pod with the old configuration is still running"
+				}
+			}
+			err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: proxyNamespace, Name: oldConfig}, &corev1.Secret{})
+			if !apierrors.IsNotFound(err) {
+				return fmt.Sprintf("the old configuration %s is still there (%v)", oldConfig, err)
+			}
+			return ""
+		})
+		close(stop)
+		clients.Wait()
+
+		t.Logf("%d requests during the rollout", sent)
+		if sent < 100 {
+			t.Errorf("only %d requests were sent during the rollout; that shows nothing", sent)
+		}
+		if len(failed) > 0 {
+			t.Errorf("%d of %d requests failed during the rollout:\n  %s", len(failed), sent, strings.Join(failed, "\n  "))
+		}
+	})
+
+	step("a configuration that cannot be rendered is reported, and changes nothing that runs", func(t *testing.T) {
+		before := c.deployment(t)
+		pods := c.pods(t)
+
+		// mode is the operator's to set.
+		valid := c.proxy(t).Spec.Config
+		c.edit(t, func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.Config = &runtime.RawExtension{Raw: []byte(`{"mode":"agent"}`)}
+		})
+		c.eventually(t, soon, "the proxy reports the configuration", func() string {
+			p := c.proxy(t)
+			rendered := meta.FindStatusCondition(p.Status.Conditions, "ConfigValid")
+			ready := meta.FindStatusCondition(p.Status.Conditions, "Ready")
+			switch {
+			case rendered == nil || ready == nil || rendered.ObservedGeneration != p.Generation:
+				return "the proxy's status is of an earlier spec"
+			case rendered.Status != metav1.ConditionFalse || rendered.Reason != "InvalidConfig" || !strings.Contains(rendered.Message, "mode"):
+				return fmt.Sprintf("ConfigValid is %s/%s: %s", rendered.Status, rendered.Reason, rendered.Message)
+			case ready.Status != metav1.ConditionFalse || ready.Reason != "ConfigInvalid":
+				return fmt.Sprintf("Ready is %s/%s: %s", ready.Status, ready.Reason, ready.Message)
+			}
+			return ""
+		})
+		if after := c.deployment(t); after.Generation != before.Generation {
+			t.Errorf("the Deployment was changed: generation %d, was %d", after.Generation, before.Generation)
+		}
+		if now := c.pods(t); !slices.Equal(now, pods) {
+			t.Errorf("the pods were replaced: %v, were %v", now, pods)
+		}
+		if reason := c.routed("http", shopHost, "shop"); reason != "" {
+			t.Errorf("the proxy stopped serving: %s", reason)
+		}
+
+		c.edit(t, func(s *synapsev1alpha1.SynapseProxySpec) { s.Config = valid })
+		c.eventually(t, soon, "the proxy is ready again once the configuration is put right", c.ready)
+		if after := c.deployment(t); after.Generation != before.Generation {
+			t.Errorf("putting the configuration right changed the Deployment: generation %d, was %d", after.Generation, before.Generation)
+		}
+	})
+
+	step("the operator is replaced without disturbing the proxy, and carries on", func(t *testing.T) {
+		pods := c.pods(t)
+
+		var operators corev1.PodList
+		if err := c.k8s.List(c.ctx, &operators, client.InNamespace(operatorNamespace)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range operators.Items {
+			if err := c.k8s.Delete(c.ctx, &operators.Items[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.eventually(t, soon, "a new operator pod is available", func() string {
+			var now corev1.PodList
+			if err := c.k8s.List(c.ctx, &now, client.InNamespace(operatorNamespace)); err != nil {
+				return err.Error()
+			}
+			for _, p := range now.Items {
+				for _, old := range operators.Items {
+					if p.UID == old.UID {
+						return "the old operator pod is still there"
+					}
+				}
+			}
+			return c.operatorAvailable()
+		})
+
+		// Through the scale subresource, as `kubectl scale` and an
+		// autoscaler do. That it is acted on shows the new operator works.
+		p := c.proxy(t)
+		scale := &autoscalingv1.Scale{}
+		if err := c.k8s.SubResource("scale").Get(c.ctx, p, scale); err != nil {
+			t.Fatal(err)
+		}
+		scale.Spec.Replicas = 2
+		if err := c.k8s.SubResource("scale").Update(c.ctx, p, client.WithSubResourceBody(scale)); err != nil {
+			t.Fatal(err)
+		}
+		c.eventually(t, afterASync, "the proxy runs two pods", func() string {
+			if reason := c.ready(); reason != "" {
+				return reason
+			}
+			if p := c.proxy(t); p.Status.ReadyReplicas != 2 {
+				return fmt.Sprintf("%d pods are ready", p.Status.ReadyReplicas)
+			}
+			return ""
+		})
+		now := c.pods(t)
+		for _, uid := range pods {
+			if !slices.Contains(now, uid) {
+				t.Errorf("a pod that was running before the operator was replaced is gone: %v, were %v", now, pods)
+			}
+		}
+		if reason := c.routed("http", shopHost, "shop"); reason != "" {
+			t.Errorf("the proxy stopped serving: %s", reason)
+		}
+	})
+
+	step("deleting the proxy removes everything made for it", func(t *testing.T) {
+		if err := c.k8s.Delete(c.ctx, c.proxy(t)); err != nil {
+			t.Fatal(err)
+		}
+		c.eventually(t, afterASync, "nothing of the proxy is left", func() string {
+			owned := client.MatchingLabels{"synapse.gen0sec.com/proxy": proxyKey.Name}
+			for _, list := range []client.ObjectList{
+				&appsv1.DeploymentList{}, &appsv1.ReplicaSetList{}, &corev1.PodList{},
+				&corev1.ServiceList{}, &corev1.ServiceAccountList{}, &corev1.SecretList{}, &corev1.ConfigMapList{},
+			} {
+				if err := c.k8s.List(c.ctx, list, client.InNamespace(proxyNamespace), owned); err != nil {
+					return err.Error()
+				}
+				if n := meta.LenList(list); n > 0 {
+					return fmt.Sprintf("%d of %T are left", n, list)
+				}
+			}
+			// The routes and the certificates carry no label of the proxy's.
+			for name, obj := range map[string]client.Object{"edge-upstreams": &corev1.ConfigMap{}, "edge-certs": &corev1.Secret{}} {
+				err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: proxyNamespace, Name: name}, obj)
+				if !apierrors.IsNotFound(err) {
+					return fmt.Sprintf("%T %s is left (%v)", obj, name, err)
+				}
+			}
+			return ""
+		})
+	})
+}
