@@ -1,0 +1,50 @@
+# Synapse settings the operator applies to a SynapseProxy unless spec.config
+# says otherwise. Keys the operator owns outright are not here: see
+# ownedConfigKeys in proxyconfig.go.
+#
+# Only settings that differ from Synapse's built-in defaults are listed.
+# Packet capture and the kernel firewall are on by default in Synapse itself.
+#
+# The `platform` and `logging` sections must always be rendered. When either
+# is missing altogether, Synapse does not apply its per-key defaults to it:
+# telemetry, the threat feed and GeoIP all come up disabled.
+
+daemon:
+  # Synapse keeps its cached copy of the platform configuration here. Its own
+  # default is "/"; the pod mounts a volume at this path instead.
+  working_directory: /var/lib/synapse
+
+ids:
+  enabled: true
+  # Ban the source of a matched drop rule.
+  enforce_block: true
+  # A rule path is what starts the engine, even when it matches no file. The
+  # rules managed on the platform load next to whatever is found here.
+  rule_paths:
+    - /etc/synapse/rules/*.rules
+
+logging:
+  # Log to stdout, where `kubectl logs` reads.
+  file_logging_enabled: false
+
+platform:
+  # Both feeds are enabled by default in Synapse, but download nothing until
+  # they are told where from and where to.
+  threat:
+    url: https://download.gen0sec.com/v1
+    path: /var/lib/synapse
+  geoip:
+    country:
+      url: https://github.com/gen0sec/geoip-databases/raw/download/ipinfo_lite.mmdb
+      path: /var/lib/synapse/ipinfo_lite.mmdb
+
+proxy:
+  # The certificate served when no other matches the requested name.
+  default_certificate: default
+  # HTTP/2 without TLS on the HTTP listeners.
+  h2c: true
+  captcha:
+    # Seconds. Synapse's own default for both is 0 once a `proxy` section
+    # exists, which makes every challenge expire at once.
+    token_ttl: 7200
+    cache_ttl: 300
