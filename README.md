@@ -179,7 +179,7 @@ spec:
     name: edge
 ```
 
-An Ingress with `ingressClassName: edge`, in any namespace, is then served by that proxy, with the certificates its `tls` section names.
+An Ingress with `ingressClassName: edge` is then served by that proxy, with the certificates its `tls` section names. It can be in any namespace the operator watches.
 
 ```console
 $ kubectl get synapseproxies -n edge
@@ -196,7 +196,7 @@ kubectl apply -k config                    # the operator
 kubectl apply -k config/proxy-controller   # the CRD, and the role the controllers need
 ```
 
-then add `--proxy-controller` to the operator's arguments in `config/manager.yaml`. [`test/e2e/operator`](test/e2e/operator/) is a kustomization that does all three. The operator checks for the CRD and the role when it starts, and exits saying which is missing.
+then add `--proxy-controller` to the operator's arguments in `config/manager.yaml`. [`test/e2e/operator`](test/e2e/operator/) is a kustomization that does all three. When it starts, the operator checks that it can read `SynapseProxy` resources, and exits if it cannot, saying whether the CRD is missing or the role is. A role that is bound but incomplete gets past that: the controller that is refused something stops the operator a couple of minutes later, naming the kind it could not read.
 
 ### What to know
 
@@ -207,6 +207,7 @@ then add `--proxy-controller` to the operator's arguments in `config/manager.yam
 - **Certificates come from the Ingresses' TLS Secrets,** for example from cert-manager. Synapse's built-in ACME client is not used.
 - **Ingress only.** Gateway API routes are not rendered for a `SynapseProxy` yet.
 - **Not together with `--ingress-mode` or `--config-sync`** in one operator process.
+- **With `--namespace`, only that namespace is seen.** A proxy elsewhere is not run, and an Ingress elsewhere is not served, whatever its class; nothing reports either.
 
 ---
 

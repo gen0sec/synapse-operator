@@ -7,7 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -68,11 +69,18 @@ func TestCheckProxyAccess(t *testing.T) {
 	})
 
 	t.Run("the CRD is not installed", func(t *testing.T) {
-		missing := &meta.NoKindMatchError{
-			GroupKind:        schema.GroupKind{Group: synapsev1alpha1.GroupVersion.Group, Kind: "SynapseProxy"},
-			SearchedVersions: []string{synapsev1alpha1.GroupVersion.Version},
+		// The test API server has the CRD. So the kind is given, in this
+		// client's eyes only, a group the server has never heard of: what it
+		// gets back is what a client gets from a cluster without the CRD.
+		absent := schema.GroupVersion{Group: "absent." + synapsev1alpha1.GroupVersion.Group, Version: "v1alpha1"}
+		scheme := runtime.NewScheme()
+		scheme.AddKnownTypes(absent, &synapsev1alpha1.SynapseProxy{}, &synapsev1alpha1.SynapseProxyList{})
+		metav1.AddToGroupVersion(scheme, absent)
+		nowhere, err := client.New(apiServer(t), client.Options{Scheme: scheme})
+		if err != nil {
+			t.Fatal(err)
 		}
-		err := CheckProxyAccess(ctx, failingReader(t, missing), "")
+		err = CheckProxyAccess(ctx, nowhere, "")
 		if err == nil {
 			t.Fatal("no error without the CRD")
 		}
