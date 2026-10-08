@@ -45,7 +45,9 @@ type SynapseProxyList struct {
 
 // SynapseProxySpec is the desired state of a SynapseProxy.
 type SynapseProxySpec struct {
-	// Image is the Synapse container image, tag or digest included.
+	// Image is the Synapse container image, tag or digest included. It has
+	// to be Synapse 0.8.5 or newer: older releases do not read the listeners
+	// this resource renders, and would start without binding any.
 	//
 	// +kubebuilder:validation:MinLength=1
 	Image string `json:"image"`

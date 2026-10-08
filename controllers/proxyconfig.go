@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/yaml"
@@ -33,6 +36,20 @@ const defaultInternalServicesPort = 9180
 //
 //go:embed proxyconfig_defaults.yaml
 var proxyConfigDefaults []byte
+
+// proxyConfigDefaultsJSON is the same document, converted once. A defaults
+// file that does not parse stops the operator when it starts, not at the
+// first reconcile.
+var proxyConfigDefaultsJSON = func() []byte {
+	out, err := yaml.YAMLToJSON(proxyConfigDefaults)
+	if err != nil {
+		panic(fmt.Sprintf("proxyconfig_defaults.yaml: %v", err))
+	}
+	if _, err := decodeConfigObject(out); err != nil {
+		panic(fmt.Sprintf("proxyconfig_defaults.yaml: %v", err))
+	}
+	return out
+}()
 
 // ProxyConfigInput is everything a SynapseProxy's config.yaml is rendered
 // from.
@@ -82,6 +99,9 @@ var ownedConfigKeys = []ownedConfigKey{
 	// operator's own `proxy` and `platform` they would be a duplicate key.
 	{"pingora", "use the key proxy"},
 	{"arxignis", "use the key platform"},
+	// The older place for the IDS settings. Synapse ignores it whenever the
+	// top-level `ids` section is there, and here it always is.
+	{"firewall.ids", "use the top-level key ids"},
 }
 
 // RenderProxyConfig renders the config.yaml of a SynapseProxy.
@@ -108,17 +128,45 @@ func RenderProxyConfig(in ProxyConfigInput) (ProxyConfigOutput, field.ErrorList)
 		}
 	}
 
-	cfg, err := decodeConfigObject(mustYAMLToJSON(proxyConfigDefaults))
-	if err != nil {
-		panic(fmt.Sprintf("proxyconfig_defaults.yaml: %v", err))
+	apiKey := ""
+	if spec.Platform != nil && spec.Platform.APIKeySecretRef != nil {
+		// A Secret made from a file ends in a newline, which is not part of
+		// the key. Anything else that is not plain text cannot be one.
+		apiKey = strings.TrimSpace(in.APIKey)
+		ref := specPath.Child("platform", "apiKeySecretRef")
+		switch {
+		case apiKey == "":
+			errs = append(errs, field.Invalid(ref, "", "the referenced Secret key is empty"))
+		case !isPlainToken(apiKey):
+			// The value is not repeated: it is, or was meant to be, a secret.
+			errs = append(errs, field.Invalid(ref, "<redacted>", "the referenced Secret key holds whitespace or control characters, which an API key cannot"))
+		}
 	}
-	mergeConfig(cfg, raw)
 
-	internalPort := internalServicesPort(cfg)
+	cfg, err := decodeConfigObject(proxyConfigDefaultsJSON)
+	if err != nil {
+		return ProxyConfigOutput{}, field.ErrorList{field.InternalError(specPath, err)}
+	}
+	errs = append(errs, mergeConfig(cfg, raw, specPath.Child("config"))...)
+
+	internalPort, portErr := internalServicesPort(cfg, specPath.Child("config"))
+	if portErr != nil {
+		errs = append(errs, portErr)
+	}
+	// The API server enforces the listener rules through the CRD. These two
+	// are repeated because a CRD older than the operator would not, and
+	// either mistake starts a proxy that listens on nothing.
+	if len(spec.Listeners) == 0 {
+		errs = append(errs, field.Required(specPath.Child("listeners"), "a proxy needs at least one listener"))
+	}
 	listeners := make([]any, 0, len(spec.Listeners))
 	for i, l := range spec.Listeners {
-		if int64(l.Port) == internalPort {
-			errs = append(errs, field.Invalid(specPath.Child("listeners").Index(i).Child("port"), l.Port,
+		at := specPath.Child("listeners").Index(i)
+		if l.Protocol != "HTTP" && l.Protocol != "TLS" {
+			errs = append(errs, field.NotSupported(at.Child("protocol"), l.Protocol, []string{"HTTP", "TLS"}))
+		}
+		if portErr == nil && int64(l.Port) == internalPort {
+			errs = append(errs, field.Invalid(at.Child("port"), l.Port,
 				"is the port of Synapse's internal services (proxy.internal_services.port)"))
 		}
 		listeners = append(listeners, map[string]any{
@@ -128,6 +176,14 @@ func RenderProxyConfig(in ProxyConfigInput) (ProxyConfigOutput, field.ErrorList)
 		})
 	}
 	if len(errs) > 0 {
+		// A stable order: the errors are written to the resource's status,
+		// which must not change from one render of the same spec to the next.
+		sort.SliceStable(errs, func(i, j int) bool {
+			if errs[i].Field != errs[j].Field {
+				return errs[i].Field < errs[j].Field
+			}
+			return errs[i].Detail < errs[j].Detail
+		})
 		return ProxyConfigOutput{}, errs
 	}
 
@@ -146,8 +202,8 @@ func RenderProxyConfig(in ProxyConfigInput) (ProxyConfigOutput, field.ErrorList)
 	if spec.Logging != nil && spec.Logging.Level != "" {
 		setConfig(cfg, "logging.level", spec.Logging.Level)
 	}
-	if spec.Platform != nil && spec.Platform.APIKeySecretRef != nil {
-		setConfig(cfg, "platform.api_key", in.APIKey)
+	if apiKey != "" {
+		setConfig(cfg, "platform.api_key", apiKey)
 	}
 
 	body, err := yaml.Marshal(cfg)
@@ -185,14 +241,6 @@ func decodeConfigObject(data []byte) (map[string]any, error) {
 	return obj, nil
 }
 
-func mustYAMLToJSON(doc []byte) []byte {
-	out, err := yaml.YAMLToJSON(doc)
-	if err != nil {
-		panic(err)
-	}
-	return out
-}
-
 // checkOwnedConfigKeys reports every owned key raw sets, and every place raw
 // puts something other than an object where an owned key has to live.
 func checkOwnedConfigKeys(raw map[string]any, base *field.Path) field.ErrorList {
@@ -228,13 +276,29 @@ func checkOwnedConfigKeys(raw map[string]any, base *field.Path) field.ErrorList 
 	return errs
 }
 
-// mergeConfig overlays src on dst. Objects merge key by key; anything else
-// replaces. A null removes the key: Synapse has no use for a null, and for
-// most keys it is a type error that stops the proxy from starting.
-func mergeConfig(dst, src map[string]any) {
+// mergeConfig overlays src, which is spec.config, on dst. Objects merge key
+// by key and anything else replaces, as in a JSON merge patch, with two
+// refusals.
+//
+// A null removes the key: Synapse has no use for a null, and for most keys it
+// is a type error that stops the proxy from starting. But a null on an object
+// of defaults would remove every default under it, and that is what a section
+// whose keys are all commented out looks like, so it is refused instead.
+func mergeConfig(dst, src map[string]any, at *field.Path) field.ErrorList {
+	var errs field.ErrorList
 	for key, value := range src {
+		here := at.Child(key)
+		if !isConfigText(key) {
+			errs = append(errs, field.Invalid(at, "<key>", "a key holds control characters"))
+			continue
+		}
 		switch v := value.(type) {
 		case nil:
+			if _, isObject := dst[key].(map[string]any); isObject {
+				errs = append(errs, field.Invalid(here, "null",
+					"would remove every default under this key; delete the key, or set the values to change"))
+				continue
+			}
 			delete(dst, key)
 		case map[string]any:
 			into, isObject := dst[key].(map[string]any)
@@ -242,11 +306,60 @@ func mergeConfig(dst, src map[string]any) {
 				into = map[string]any{}
 				dst[key] = into
 			}
-			mergeConfig(into, v)
+			errs = append(errs, mergeConfig(into, v, here)...)
 		default:
-			dst[key] = value
+			clean, valueErrs := cleanConfigValue(value, here)
+			errs = append(errs, valueErrs...)
+			dst[key] = clean
 		}
 	}
+	return errs
+}
+
+// cleanConfigValue checks a value that is copied as it is: a scalar or a
+// list. Text must be something YAML can carry. A null inside a list is
+// refused, since an element cannot be "removed"; inside an object in a list
+// it is dropped like any other.
+func cleanConfigValue(value any, at *field.Path) (any, field.ErrorList) {
+	switch v := value.(type) {
+	case string:
+		if !isConfigText(v) {
+			return v, field.ErrorList{field.Invalid(at, "<text>", "holds control characters")}
+		}
+	case []any:
+		var errs field.ErrorList
+		out := make([]any, 0, len(v))
+		for i, element := range v {
+			if element == nil {
+				errs = append(errs, field.Invalid(at.Index(i), "null", "a list cannot hold a null"))
+				continue
+			}
+			clean, elementErrs := cleanConfigValue(element, at.Index(i))
+			errs = append(errs, elementErrs...)
+			out = append(out, clean)
+		}
+		return out, errs
+	case map[string]any:
+		out := map[string]any{}
+		return out, mergeConfig(out, v, at)
+	}
+	return value, nil
+}
+
+// isConfigText reports whether s is text YAML can carry: no control
+// characters but tab and the line breaks.
+func isConfigText(s string) bool {
+	return !strings.ContainsFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r'
+	})
+}
+
+// isPlainToken reports whether s could be an API key: text with no
+// whitespace or control characters in it.
+func isPlainToken(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	})
 }
 
 // setConfig sets a dotted key, creating the objects on the way. The owned-key
@@ -264,23 +377,30 @@ func setConfig(cfg map[string]any, path string, value any) {
 	cfg[parts[len(parts)-1]] = value
 }
 
-// internalServicesPort is the port the merged config gives the internal
-// services, or Synapse's default.
-func internalServicesPort(cfg map[string]any) int64 {
+// internalServicesPort is the port the merged config gives Synapse's internal
+// services, or Synapse's default. A value that is there but is not a port is
+// an error: read loosely it would pass for the default, and the listeners
+// would be checked against the wrong port.
+func internalServicesPort(cfg map[string]any, config *field.Path) (int64, *field.Error) {
 	proxy, _ := cfg["proxy"].(map[string]any)
 	services, _ := proxy["internal_services"].(map[string]any)
-	if n, isNumber := services["port"].(json.Number); isNumber {
-		if port, err := strconv.ParseInt(n.String(), 10, 64); err == nil {
-			return port
+	value, set := services["port"]
+	if !set {
+		return defaultInternalServicesPort, nil
+	}
+	if n, isNumber := value.(json.Number); isNumber {
+		if port, err := strconv.ParseInt(n.String(), 10, 64); err == nil && port >= 1 && port <= 65535 {
+			return port, nil
 		}
 	}
-	return defaultInternalServicesPort
+	return 0, field.Invalid(config.Child("proxy", "internal_services", "port"), fmt.Sprint(value), "must be a port number, 1 to 65535")
 }
 
 func isAddressOrPrefix(s string) bool {
 	if _, err := netip.ParsePrefix(s); err == nil {
 		return true
 	}
-	_, err := netip.ParseAddr(s)
-	return err == nil
+	// Synapse does not parse an address with a zone, such as fe80::1%eth0.
+	addr, err := netip.ParseAddr(s)
+	return err == nil && addr.Zone() == ""
 }
