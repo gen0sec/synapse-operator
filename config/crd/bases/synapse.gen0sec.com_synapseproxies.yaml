@@ -995,7 +995,10 @@ spec:
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               image:
-                description: Image is the Synapse container image, tag or digest included.
+                description: |-
+                  Image is the Synapse container image, tag or digest included. It has
+                  to be Synapse 0.8.5 or newer: older releases do not read the listeners
+                  this resource renders, and would start without binding any.
                 minLength: 1
                 type: string
               imagePullSecrets:

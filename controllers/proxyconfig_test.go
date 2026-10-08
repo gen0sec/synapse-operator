@@ -344,6 +344,7 @@ func TestRenderProxyConfig_RefusesKeysItOwns(t *testing.T) {
 		"proxy.certificates":              `"/certs"`,
 		"proxy.upstream.conf":             `"/x/upstreams.yaml"`,
 		"proxy.acme":                      `{"enabled": true}`,
+		"firewall.ids":                    `{"enforce_block": false}`,
 		"proxy.internal_services.enabled": `false`,
 		"proxy.tls_grade":                 `"unsafe"`,
 		"proxy.trusted_proxies":           `["0.0.0.0/0"]`,
@@ -451,15 +452,16 @@ func TestRenderProxyConfig_TrustedProxies(t *testing.T) {
 	// typo into a proxy that silently trusts nobody.
 	t.Run("anything else is refused", func(t *testing.T) {
 		_, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
-			s.TrustedProxies = []string{"10.0.0.0/8", "10.0.0.0/33", "lb.example.test", "10.0.0.0/8 "}
+			// The last is a real address, with a zone Synapse cannot parse.
+			s.TrustedProxies = []string{"10.0.0.0/8", "10.0.0.0/33", "lb.example.test", "10.0.0.0/8 ", "fe80::1%eth0"}
 		})})
-		for _, path := range []string{"spec.trustedProxies[1]", "spec.trustedProxies[2]", "spec.trustedProxies[3]"} {
+		for _, path := range []string{"spec.trustedProxies[1]", "spec.trustedProxies[2]", "spec.trustedProxies[3]", "spec.trustedProxies[4]"} {
 			if !errorAt(errs, field.ErrorTypeInvalid, path) {
 				t.Errorf("no Invalid error at %s; got %v", path, errs)
 			}
 		}
-		if len(errs) != 3 {
-			t.Errorf("%d errors, want 3: %v", len(errs), errs)
+		if len(errs) != 4 {
+			t.Errorf("%d errors, want 4: %v", len(errs), errs)
 		}
 	})
 }
@@ -544,5 +546,173 @@ func TestRenderProxyConfig_HashTracksTheRenderedConfigOnly(t *testing.T) {
 	other.Name, other.Namespace = "other", "elsewhere"
 	if got := renderOK(t, ProxyConfigInput{APIKey: "k-1", Proxy: other}).Hash; got != base {
 		t.Error("the hash depends on the object's name")
+	}
+}
+
+// A null removes one default. On a whole section it would remove every
+// default under it, and that is how a section whose keys are all commented
+// out reads: `platform:` with nothing beneath it. Synapse would then come up
+// with telemetry, the threat feed and GeoIP off, or with the IDS off, and
+// nothing would say so.
+func TestRenderProxyConfig_RefusesANullOnASectionOfDefaults(t *testing.T) {
+	for _, doc := range []string{
+		`{"platform": null}`, `{"logging": null}`, `{"ids": null}`, `{"proxy": null}`, `{"daemon": null}`,
+		`{"platform": {"threat": null}}`, `{"proxy": {"captcha": null}}`,
+	} {
+		t.Run(doc, func(t *testing.T) {
+			out, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(rawConfig(doc))})
+			if len(errs) != 1 || errs[0].Type != field.ErrorTypeInvalid || !strings.HasPrefix(errs[0].Field, "spec.config.") {
+				t.Errorf("got %v, want one Invalid error under spec.config", errs)
+			}
+			if len(out.YAML) != 0 {
+				t.Error("a config was rendered despite the error")
+			}
+		})
+	}
+
+	// Controls: a null still removes a single default, and is harmless on a
+	// section the operator has no defaults in.
+	tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"proxy": {"h2c": null}, "telemetry": null}`))})
+	wantAbsent(t, tree, "proxy.h2c")
+	wantAbsent(t, tree, "telemetry")
+	wantAt(t, tree, "proxy.default_certificate", "default")
+}
+
+func TestRenderProxyConfig_NullsInsideLists(t *testing.T) {
+	// A list element cannot be "removed"; a null there is a mistake.
+	_, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"ids": {"rule_paths": ["/a", null]}}`))})
+	if !errorAt(errs, field.ErrorTypeInvalid, "spec.config.ids.rule_paths[1]") || len(errs) != 1 {
+		t.Errorf("got %v, want one Invalid error at the null element", errs)
+	}
+
+	// Inside an object that is itself in a list, a null is dropped like any
+	// other: it never reaches Synapse.
+	tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"x": [{"a": null, "b": 1, "c": [{"d": null, "e": true}]}]}`))})
+	x, _ := at(tree, "x")
+	got, _ := yaml.Marshal(x)
+	if want := "- b: 1\n  c:\n  - e: true\n"; string(got) != want {
+		t.Errorf("x renders as\n%swant\n%s", got, want)
+	}
+}
+
+// YAML cannot carry these, and nothing in a Synapse config has a use for them.
+func TestRenderProxyConfig_RefusesControlCharacters(t *testing.T) {
+	cases := map[string]string{
+		`{"telemetry": {"resource": {"attributes": {"a": "x\u007fy"}}}}`: "spec.config.telemetry.resource.attributes.a",
+		`{"telemetry": {"otlp": {"endpoint": "http://c\u0085"}}}`:        "spec.config.telemetry.otlp.endpoint",
+		`{"ids": {"rule_paths": ["/a", "/b\u0001"]}}`:                    "spec.config.ids.rule_paths[1]",
+		`{"x": [{"a": "y\u007f"}]}`:                                      "spec.config.x[0].a",
+	}
+	for doc, path := range cases {
+		t.Run(path, func(t *testing.T) {
+			out, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(rawConfig(doc))})
+			if !errorAt(errs, field.ErrorTypeInvalid, path) || len(errs) != 1 {
+				t.Errorf("got %v, want one Invalid error at %s", errs, path)
+			}
+			if len(out.YAML) != 0 {
+				t.Error("a config was rendered despite the error")
+			}
+		})
+	}
+
+	// A key is text too.
+	if _, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"telemetry": {"a\u007fb": 1}}`))}); !errorAt(errs, field.ErrorTypeInvalid, "spec.config.telemetry") || len(errs) != 1 {
+		t.Errorf("a key with a control character: got %v", errs)
+	}
+
+	// Tabs and line breaks are ordinary text.
+	renderOK(t, ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"telemetry": {"resource": {"attributes": {"a": "one\ttwo\nthree"}}}}`))})
+}
+
+func TestRenderProxyConfig_APIKeyValue(t *testing.T) {
+	withKey := func(s *synapsev1alpha1.SynapseProxySpec) {
+		s.Platform = &synapsev1alpha1.PlatformSpec{
+			APIKeySecretRef: &synapsev1alpha1.SecretKeyReference{Name: "creds", Key: "API_KEY"},
+		}
+	}
+
+	// A Secret made from a file or with `echo` ends in a newline. Synapse
+	// would send it along, and every call to the platform would fail quietly.
+	t.Run("surrounding whitespace is not part of the key", func(t *testing.T) {
+		plain := renderOK(t, ProxyConfigInput{APIKey: "k-123", Proxy: proxyForConfig(withKey)})
+		for _, padded := range []string{"k-123\n", "k-123\r\n", "  k-123\t\n"} {
+			in := ProxyConfigInput{APIKey: padded, Proxy: proxyForConfig(withKey)}
+			wantAt(t, renderedTree(t, in), "platform.api_key", "k-123")
+			if got := renderOK(t, in).Hash; got != plain.Hash {
+				t.Errorf("key %q changes the hash; the same key would roll the pods", padded)
+			}
+		}
+	})
+
+	t.Run("what cannot be a key is refused", func(t *testing.T) {
+		for name, key := range map[string]string{
+			"empty": "", "only whitespace": " \n", "a space inside": "k 123", "a line break inside": "k-1\nk-2",
+			"a control character": "k-1\x7f23", "bytes that are not text": "k-\xff\xfe",
+		} {
+			out, errs := RenderProxyConfig(ProxyConfigInput{APIKey: key, Proxy: proxyForConfig(withKey)})
+			if !errorAt(errs, field.ErrorTypeInvalid, "spec.platform.apiKeySecretRef") || len(errs) != 1 {
+				t.Errorf("%s: got %v, want one Invalid error at spec.platform.apiKeySecretRef", name, errs)
+			}
+			if len(out.YAML) != 0 {
+				t.Errorf("%s: a config was rendered despite the error", name)
+			}
+			// The message must not repeat what was in the Secret.
+			if len(errs) > 0 && strings.TrimSpace(key) != "" && strings.Contains(errs.ToAggregate().Error(), strings.TrimSpace(key)) {
+				t.Errorf("%s: the error quotes the key: %v", name, errs)
+			}
+		}
+	})
+}
+
+// Read permissively, a port that is not a plain number would be taken for
+// Synapse's default, and the check against the listeners would be made
+// against the wrong port.
+func TestRenderProxyConfig_InternalServicesPortMustBeAPort(t *testing.T) {
+	for _, port := range []string{`9999.0`, `1e4`, `"9999"`, `0`, `-1`, `65536`, `true`, `[9999]`} {
+		t.Run(port, func(t *testing.T) {
+			doc := `{"proxy": {"internal_services": {"port": ` + port + `}}}`
+			out, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(rawConfig(doc))})
+			if !errorAt(errs, field.ErrorTypeInvalid, "spec.config.proxy.internal_services.port") || len(errs) != 1 {
+				t.Errorf("got %v, want one Invalid error at the port", errs)
+			}
+			if len(out.YAML) != 0 {
+				t.Error("a config was rendered despite the error")
+			}
+		})
+	}
+}
+
+// The API server enforces both through the CRD. A CRD older than the
+// operator would not, and either mistake starts a proxy that listens on
+// nothing without saying so.
+func TestRenderProxyConfig_Listeners(t *testing.T) {
+	_, errs := RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) { s.Listeners = nil })})
+	if !errorAt(errs, field.ErrorTypeRequired, "spec.listeners") {
+		t.Errorf("no listeners: got %v", errs)
+	}
+
+	_, errs = RenderProxyConfig(ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) { s.Listeners[0].Protocol = "UDP" })})
+	if !errorAt(errs, field.ErrorTypeNotSupported, "spec.listeners[0].protocol") {
+		t.Errorf("unknown protocol: got %v", errs)
+	}
+}
+
+// The errors end up in the resource's status. If their order moved from one
+// render to the next, so would the status, for as long as the spec is wrong.
+func TestRenderProxyConfig_ErrorsComeInAStableOrder(t *testing.T) {
+	in := ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{
+		"platform": null, "logging": null, "ids": null, "daemon": null, "mode": "agent",
+		"a": ["x\u007f"], "b": ["y\u007f"], "c": [null], "d": [null]
+	}`), func(s *synapsev1alpha1.SynapseProxySpec) { s.TrustedProxies = []string{"nope", "neither"} })}
+
+	_, first := RenderProxyConfig(in)
+	if len(first) < 10 {
+		t.Fatalf("%d errors, want the whole set: %v", len(first), first)
+	}
+	for range 30 {
+		_, again := RenderProxyConfig(in)
+		if again.ToAggregate().Error() != first.ToAggregate().Error() {
+			t.Fatalf("the same spec reported its errors in a different order:\n%v\nvs\n%v", first, again)
+		}
 	}
 }
