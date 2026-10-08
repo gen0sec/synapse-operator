@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -249,6 +250,25 @@ func TestSynapseProxy_Rejects(t *testing.T) {
 	}
 }
 
+// Every rule above is a rule about the spec. An object with no spec at all
+// would slip past all of them, and the typed client cannot show it: it always
+// writes one.
+func TestSynapseProxy_RejectsAnObjectWithoutASpec(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": v1alpha1.GroupVersion.String(),
+		"kind":       "SynapseProxy",
+		"metadata":   map[string]any{"name": validProxy().Name, "namespace": "default"},
+	}}
+	err := k8s.Create(context.Background(), obj)
+	if err == nil {
+		_ = k8s.Delete(context.Background(), obj)
+		t.Fatal("accepted, want it rejected")
+	}
+	if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "spec") {
+		t.Errorf("got %v, want an Invalid error naming spec", err)
+	}
+}
+
 // The free-form config carries keys the typed spec does not model, so the API
 // server must store it untouched rather than prune what it has no schema for.
 func TestSynapseProxy_ConfigKeepsUnknownKeys(t *testing.T) {
@@ -374,7 +394,9 @@ func TestSynapseProxy_ScaleSubresource(t *testing.T) {
 func TestSynapseProxy_PrinterColumns(t *testing.T) {
 	ctx := context.Background()
 	p := validProxy()
-	p.Namespace = "printer-columns"
+	// A namespace of its own, so the table has exactly one row; named after
+	// the proxy, so the test can run more than once against one API server.
+	p.Namespace = "columns-" + p.Name
 	if err := k8s.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: p.Namespace}}); err != nil {
 		t.Fatal(err)
 	}
