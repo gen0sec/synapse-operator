@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -31,6 +32,9 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	}
 	if err := gwv1.AddToScheme(s); err != nil {
 		t.Fatalf("gwv1: %v", err)
+	}
+	if err := gwv1beta1.AddToScheme(s); err != nil {
+		t.Fatalf("gwv1beta1: %v", err)
 	}
 	return s
 }

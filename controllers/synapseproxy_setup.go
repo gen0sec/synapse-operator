@@ -23,6 +23,14 @@ func SetupProxyControllers(mgr ctrl.Manager, clusterDomain string) error {
 		Client:        mgr.GetClient(),
 		ClusterDomain: clusterDomain,
 		Recorder:      mgr.GetEventRecorderFor("synapse-proxy-routes"),
+		// Looked at once, here. CRDs installed later are found when the
+		// operator next starts.
+		GatewayAPI: GatewayAPIServed(mgr.GetRESTMapper()),
+	}
+	if routes.GatewayAPI {
+		mgr.GetLogger().Info("Gateway API is installed: Gateways of a class that names a SynapseProxy are served")
+	} else {
+		mgr.GetLogger().Info("Gateway API is not installed: only Ingresses are served; restart the operator once its CRDs are there")
 	}
 	if err := routes.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("route controller: %w", err)
