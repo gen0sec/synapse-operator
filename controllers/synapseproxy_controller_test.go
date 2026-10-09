@@ -77,13 +77,7 @@ func (e *proxyEnv) proxy(mutate ...func(*synapsev1alpha1.SynapseProxySpec)) *syn
 // edit changes the proxy's spec the way a user would.
 func (e *proxyEnv) edit(p *synapsev1alpha1.SynapseProxy, mutate func(*synapsev1alpha1.SynapseProxySpec)) {
 	e.t.Helper()
-	if err := e.k8s.Get(e.ctx, client.ObjectKeyFromObject(p), p); err != nil {
-		e.t.Fatal(err)
-	}
-	mutate(&p.Spec)
-	if err := e.k8s.Update(e.ctx, p); err != nil {
-		e.t.Fatalf("update the proxy: %v", err)
-	}
+	change(e.t, e.k8s, p, func() { mutate(&p.Spec) })
 }
 
 func (e *proxyEnv) renderRoutes(p *synapsev1alpha1.SynapseProxy) {

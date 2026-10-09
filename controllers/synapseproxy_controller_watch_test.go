@@ -173,10 +173,9 @@ func TestProxy_FollowsItsInputs(t *testing.T) {
 
 	// The Deployment's progress reaches the proxy's status.
 	d := e.deployment()
-	d.Status = appsv1.DeploymentStatus{ObservedGeneration: d.Generation, Replicas: 3, UpdatedReplicas: 3, ReadyReplicas: 3, AvailableReplicas: 3}
-	if err := e.k8s.Status().Update(ctx, d); err != nil {
-		t.Fatal(err)
-	}
+	changeStatus(t, e.k8s, d, func() {
+		d.Status = appsv1.DeploymentStatus{ObservedGeneration: d.Generation, Replicas: 3, UpdatedReplicas: 3, ReadyReplicas: 3, AvailableReplicas: 3}
+	})
 	condition("a finished rollout makes the proxy ready", ConditionReady, ReasonApplied)
 }
 
