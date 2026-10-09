@@ -1048,12 +1048,9 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) emitted {
 		}
 		if !slices.ContainsFunc(ms, func(mt gwMatch) bool { return !mt.plain() }) {
 			for _, mt := range ms {
-				// Its own headers, even when it has none: without a list
-				// of its own a path takes the nearest one above it, and
-				// one with request headers only has them sent back in
-				// its responses.
+				// Its headers are its own: a route of a v2 file has the
+				// ones it lists, each way, and no other route's.
 				if m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.reqHeaders, mt.respHeaders) {
-					m.hosts[host][plainPathKey(mt.value)].ownHeaders = true
 					out.served[mt.route]++
 				}
 			}

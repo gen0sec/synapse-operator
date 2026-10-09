@@ -128,7 +128,7 @@ func TestRoutes_UnboundProxyGetsEmptyOutputs(t *testing.T) {
 	)
 	mustReconcileRoutes(t, r, edge)
 
-	if got, floor := upstreamsOf(t, r, edge), renderUpstreams(newRenderModel()); got != floor {
+	if got, floor := upstreamsOf(t, r, edge), proxyFloor(); got != floor {
 		t.Errorf("upstreams =\n%s\nwant the empty document\n%s", got, floor)
 	}
 	if sec := certsOf(t, r, edge); len(sec.Data) != 0 {
@@ -215,8 +215,58 @@ func TestRoutes_ProjectsCertificatesAcrossNamespaces(t *testing.T) {
 	if string(sec.Data["shop.example.com.crt"]) != "CRT" || string(sec.Data["shop.example.com.key"]) != "KEY" {
 		t.Errorf("certificate not projected; keys %v", keysOf(sec.Data))
 	}
-	if !strings.Contains(upstreamsOf(t, r, edge), `certificate: "shop.example.com"`) {
+	if got := parseV2(t, upstreamsOf(t, r, edge)).Hosts["shop.example.com"].TLS.Terminate; got == nil || got.Cert != "shop.example.com" {
 		t.Errorf("host not bound to its certificate:\n%s", upstreamsOf(t, r, edge))
+	}
+}
+
+// proxyFloor is the routes file of a proxy that has nothing to route.
+func proxyFloor() string {
+	m := newRenderModel()
+	m.sameAsV1 = true
+	return renderUpstreamsV2(m)
+}
+
+// A proxy's routes are written in Synapse's v2 schema, whatever is in them,
+// and say what the v1 file they used to be written in said: see
+// renderUpstreamsV2.
+func TestRoutes_AreAV2File(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	plain := routedIngress("plain", ptr("public"), "plain.example.com")
+	versioned := routedIngress("versioned", ptr("public"), "api.example.com")
+	versioned.Annotations = map[string]string{"synapse.gen0sec.com/use-regex": "true"}
+	versioned.Spec.Rules[0].HTTP.Paths[0].Path = "/v[0-9]+/items"
+	versioned.Spec.Rules[0].HTTP.Paths[0].PathType = ptr(networkingv1.PathTypeImplementationSpecific)
+
+	r := newRouteReconciler(t, edge, classFor("public", edge), plain, versioned)
+	mustReconcileRoutes(t, r, edge)
+	rendered := upstreamsOf(t, r, edge)
+	doc := parseV2(t, rendered)
+
+	// A host with no certificate, which a v2 file has to say.
+	host, ok := doc.Hosts["plain.example.com"]
+	if !ok || host.TLS.Terminate == nil || host.TLS.Terminate.Cert != "" {
+		t.Fatalf("plain.example.com is %+v in\n%s", host, rendered)
+	}
+	route, ok := host.Paths["/"]
+	if !ok || route.Upstream != "app.default.svc.cluster.local:80" {
+		t.Errorf("its route is %+v", route)
+	}
+	if route.SSLEnabled == nil || *route.SSLEnabled {
+		t.Errorf("how its backend is reached is not said: %+v", route.SSLEnabled)
+	}
+	if got := doc.Timeouts.Read; got == nil || *got != v1ReadTimeoutSeconds {
+		t.Errorf("the file's read timeout is %v", got)
+	}
+	// A route chosen by an expression, which a v1 file was needed for.
+	var expressions int
+	for _, route := range doc.Hosts["api.example.com"].Paths {
+		if route.MatchExpr != "" {
+			expressions++
+		}
+	}
+	if expressions != 1 {
+		t.Errorf("api.example.com has %d routes chosen by an expression, want 1:\n%s", expressions, rendered)
 	}
 }
 

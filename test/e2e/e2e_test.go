@@ -519,6 +519,31 @@ func TestSynapseProxy(t *testing.T) {
 		}
 		served := eventually(t, afterASync, "the Ingress is served", func() string { return c.routed("http", shopHost, "shop") })
 		t.Logf("ready after %s, served %s after that", ready, served)
+
+		// What it routes by is a file in Synapse's v2 schema, which says
+		// what the v1 file it used to be said: the host has no certificate
+		// and is served, and the backend is not sent the client's
+		// fingerprints, which a v2 file has sent on unless it says no.
+		var routes corev1.ConfigMap
+		if err := c.k8s.Get(c.ctx, types.NamespacedName{Namespace: proxyNamespace, Name: routesConfigMap}, &routes); err != nil {
+			t.Fatal(err)
+		}
+		if file := routes.Data[routesKey]; !strings.Contains(file, "\nversion: 2\n") {
+			t.Errorf("the proxy's routes are not a v2 file:\n%s", file)
+		}
+		a, err := c.get("http", shopHost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := a.header.Get("X-Seen-Headers")
+		if !strings.Contains(seen, "host") && !strings.Contains(seen, "accept") && !strings.Contains(seen, "user-agent") {
+			t.Errorf("the backend names no request header it was sent: %q", seen)
+		}
+		for _, name := range strings.Split(seen, ",") {
+			if strings.Contains(name, "ja4") || strings.Contains(name, "g0s") {
+				t.Errorf("the backend was sent the client's fingerprint in %q; all it was sent: %s", name, seen)
+			}
+		}
 	})
 
 	step("a host nobody routes is not served", func(t *testing.T) {

@@ -57,7 +57,7 @@ After changing a type under `api/`, run `make generate manifests` and commit the
 make e2e E2E_SYNAPSE_IMAGE=ghcr.io/gen0sec/synapse:<version>
 ```
 
-runs a `SynapseProxy` end to end: it starts a k3s cluster in a container, installs the operator built from the working tree, and sends requests through the cluster's load balancer to the Synapse pods the operator creates. It needs Docker, `kubectl`, and a Synapse image, 0.8.5 or newer, that the local Docker has or can pull. The cluster gets a kubeconfig of its own; the one `kubectl` uses by default is not touched. See [`test/e2e`](test/e2e/).
+runs a `SynapseProxy` end to end: it starts a k3s cluster in a container, installs the operator built from the working tree, and sends requests through the cluster's load balancer to the Synapse pods the operator creates. It needs Docker, `kubectl`, and a Synapse image, newer than 0.8.7, that the local Docker has or can pull. The cluster gets a kubeconfig of its own; the one `kubectl` uses by default is not touched. See [`test/e2e`](test/e2e/).
 
 ### Container
 
@@ -153,7 +153,7 @@ metadata:
   name: edge
   namespace: edge
 spec:
-  image: ghcr.io/gen0sec/synapse:<version>   # 0.8.5 or newer
+  image: ghcr.io/gen0sec/synapse:<version>   # newer than 0.8.7
   replicas: 2
   service:
     type: LoadBalancer
@@ -203,6 +203,8 @@ then add `--proxy-controller` to the operator's arguments in `config/manager.yam
 - **The pod is privileged and runs as root,** as the Helm chart's does, with packet capture, the firewall and the IDS on. Whoever may create a `SynapseProxy` in a namespace gets such a pod there, running the image they name.
 - **A class is one trust domain.** The class decides which proxy gets an Ingress, and a class is cluster-scoped on purpose: a proxy receives the TLS private keys of every Ingress of its classes, from every namespace, and anyone who can create an Ingress of the class can claim a host on it.
 - **Routes and certificates take about a minute to reach running pods.** They are delivered through mounted volumes, which the kubelet refreshes on its own schedule.
+- **It takes a Synapse newer than 0.8.7.** A proxy's routes are written in Synapse's v2 upstreams schema, whatever is in them. Up to 0.8.7, Synapse refuses such a file when a host has no certificate or a route is chosen by a regular expression, and then serves none of its routes.
+- **An annotation does what it does in `--ingress-mode`, with one exception.** The v2 file says what the v1 file of that mode leaves unsaid: plain HTTP to a backend unless `backend-protocol` asks for TLS, a probe unless `healthcheck` is `false`, 120 seconds for a backend to send, and nothing about the client in the request to it. The exception is `request-headers` and `response-headers`: they are for the routes of the Ingress that carries them. In `--ingress-mode` a path of another Ingress that lies below such a route, and sets no headers of its own, takes that route's as well.
 - **`spec.config` takes the Synapse settings that have no field.** A key the operator owns, such as `mode` or the listeners, is refused there and reported in the `ConfigValid` condition; it is never silently overridden. An invalid configuration changes nothing that is running.
 - **Certificates come from the Ingresses' TLS Secrets,** for example from cert-manager. Synapse's built-in ACME client is not used.
 - **Ingresses and, where its CRDs are installed, the Gateway API.** See [below](#gateway-api-for-a-synapseproxy) for what of it is served.
