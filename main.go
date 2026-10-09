@@ -413,7 +413,7 @@ func main() {
 	}
 
 	if proxyController {
-		if err = controllers.SetupProxyControllers(mgr, clusterDomain); err != nil {
+		if err = controllers.SetupProxyControllers(context.Background(), mgr, clusterDomain, watchedNamespace); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SynapseProxy")
 			os.Exit(1)
 		}

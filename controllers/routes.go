@@ -2,10 +2,13 @@ package controllers
 
 import (
 	"fmt"
+	"regexp/syntax"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Annotation support for synapse upstream settings.
@@ -84,6 +87,9 @@ type routeCfg struct {
 	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// ownHeaders says the route's headers are these and no others, also
+	// when there are none. See writeHeaderLists.
+	ownHeaders bool
 	// redirect, when set, makes this route a 3xx short-circuit. Status is
 	// 301 (permanent) or 302 (temporal) by default; *-code annotations
 	// override. Mutually exclusive with rewriting/forwarding at the proxy:
@@ -205,11 +211,7 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 	// like ".../index.html" (the truncation yields "/docs/x/swagger", which
 	// != the slashed key). Storing the de-slashed key lets the route cover its
 	// whole subtree. Regex routes (addRegexRoute) keep their literal form.
-	if path != "/" {
-		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
-			path = trimmed
-		}
-	}
+	path = plainPathKey(path)
 	if _, claimed := m.passthroughHosts[host]; claimed {
 		return false
 	}
@@ -261,7 +263,140 @@ func pathRegexExpr(regex string) string {
 	if !strings.HasPrefix(regex, "^") {
 		regex = "^" + regex
 	}
-	return fmt.Sprintf("http.request.path matches %q", regex)
+	return "http.request.path matches " + wfRegex(regex)
+}
+
+// wfString writes s as a string literal of Synapse's expression language.
+// The language has three escapes, `\"`, `\\` and `\xHH`, and refuses any
+// other, so a general-purpose quoting function writes strings it cannot
+// read.
+func wfString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20 || c > 0x7e:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// wfRegex writes a regular expression as a regex literal of that language,
+// which is not a string literal: a backslash and the character after it go
+// to the regex engine as they are. Doubled, as quoting a string would, `\.`
+// becomes a backslash and any character.
+//
+// The one thing to take care of is the quote, which ends the literal. `\"`
+// is a quote outside a character class only, so it is written `\x22`, which
+// the engine reads as a quote everywhere.
+func wfRegex(re string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(re); i++ {
+		switch {
+		case re[i] == '"':
+			b.WriteString(`\x22`)
+		case re[i] == '\\' && i+1 < len(re) && re[i+1] == '"':
+			b.WriteString(`\x22`)
+			i++
+		case re[i] == '\\' && i+1 < len(re):
+			b.WriteByte(re[i])
+			b.WriteByte(re[i+1])
+			i++
+		default:
+			b.WriteByte(re[i])
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// maxRegexLen bounds a regular expression as it is written out. A class is
+// written as the ranges it stands for, and one like `\pL` is tens of
+// kilobytes of them.
+const maxRegexLen = 1024
+
+// canonicalRegex returns re as Go's own parser writes it back, or why it
+// cannot be used.
+//
+// Synapse's regex engine is not Go's, and the two do not read every
+// expression alike: braces that are no repetition are literal here and an
+// error there, `\Q...\E` exists only here, `\<` is a character here and a
+// word boundary there. An expression Synapse refuses costs its route, and
+// with it every route that was written to exclude it. Written back from the
+// parse tree it is in the small common core of the two: classes as explicit
+// ranges, literals escaped, groups and flags spelled out.
+func canonicalRegex(re string) (string, error) {
+	parsed, err := syntax.Parse(re, syntax.Perl)
+	if err != nil {
+		return "", err
+	}
+	out := parsed.String()
+	if len(out) > maxRegexLen {
+		return "", fmt.Errorf("it is %d bytes with its classes written out, and the limit is %d", len(out), maxRegexLen)
+	}
+	if err := asciiRegex(parsed, out); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// asciiRegex says what in a regular expression Synapse's engine does not
+// take, or would take to mean something else: it is run without Unicode.
+// written is the expression as parsed.String() gives it.
+//
+//   - A class with a character outside ASCII in it is an error there.
+//   - A letter outside ASCII has no other case there.
+//   - A character written by its number is one byte there, and above 0x7f
+//     not the character it is here.
+//
+// A character outside ASCII that is simply to be matched is fine: it is the
+// same bytes on both sides.
+func asciiRegex(parsed *syntax.Regexp, written string) error {
+	var folded func(re *syntax.Regexp) bool
+	folded = func(re *syntax.Regexp) bool {
+		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 &&
+			slices.ContainsFunc(re.Rune, func(r rune) bool { return r > unicode.MaxASCII }) {
+			return true
+		}
+		return slices.ContainsFunc(re.Sub, folded)
+	}
+	if folded(parsed) {
+		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	}
+	inClass := false
+	for i := 0; i < len(written); {
+		r, size := utf8.DecodeRuneInString(written[i:])
+		switch {
+		case r == '\\' && strings.HasPrefix(written[i:], `\x`):
+			// `\x{10ffff}`, or two digits without the braces.
+			digits := written[min(i+2, len(written)):min(i+4, len(written))]
+			size = 4
+			if end := strings.IndexByte(written[i:], '}'); strings.HasPrefix(digits, "{") && end > 0 {
+				digits, size = written[i+3:i+end], end+1
+			}
+			if n, err := strconv.ParseUint(digits, 16, 32); err != nil || n > unicode.MaxASCII {
+				return fmt.Errorf("a character outside ASCII cannot be written by its number")
+			}
+		case r == '\\':
+			size++ // and whatever it escapes
+		case r == '[' && !inClass:
+			inClass = true
+		case r == ']':
+			inClass = false
+		case r > unicode.MaxASCII && inClass:
+			return fmt.Errorf("a character class cannot hold a character outside ASCII")
+		}
+		i += size
+	}
+	return nil
 }
 
 // addRegexRoute records a regex path route: it is matched by `match_expr`
@@ -634,21 +769,48 @@ func renderUpstreams(m *renderModel) string {
 				fmt.Fprintf(&b, "        redirect:\n          status: %d\n          location: %q\n",
 					*rc.redirectStatus, rc.redirectLocation)
 			}
-			writeHeaderList(&b, "request_headers", rc.reqHeaders)
-			writeHeaderList(&b, "response_headers", rc.respHeaders)
+			writeHeaderLists(&b, rc)
 		}
 	}
 	return b.String()
 }
 
-func writeHeaderList(b *strings.Builder, key string, hs []string) {
-	if len(hs) == 0 {
-		return
+// writeHeaderLists writes a v1 route's two header lists.
+//
+// A route with request headers also says what its response headers are,
+// none included. Synapse reads one that has request headers and not a word
+// on response headers as the older single list, and sends the same headers
+// back to the client: a credential set for the backend would go out in
+// every response.
+//
+// A route that is to have headers of its own (ownHeaders) has both lists
+// written, empty ones too. A route without a list takes the one of the
+// nearest path above it.
+func writeHeaderLists(b *strings.Builder, rc *routeCfg) {
+	write := func(key string, hs []string, always bool) {
+		switch {
+		case len(hs) > 0:
+			fmt.Fprintf(b, "        %s:\n", key)
+			for _, h := range hs {
+				fmt.Fprintf(b, "          - %q\n", h)
+			}
+		case always:
+			fmt.Fprintf(b, "        %s: []\n", key)
+		}
 	}
-	fmt.Fprintf(b, "        %s:\n", key)
-	for _, h := range hs {
-		fmt.Fprintf(b, "          - %q\n", h)
+	write("request_headers", rc.reqHeaders, rc.ownHeaders)
+	write("response_headers", rc.respHeaders, rc.ownHeaders || len(rc.reqHeaders) > 0)
+}
+
+// plainPathKey is the key a plain path is stored under: without a trailing
+// slash, except the root. See addRoute.
+func plainPathKey(path string) string {
+	if path != "/" {
+		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
+			return trimmed
+		}
 	}
+	return path
 }
 
 // renderUpstreamsV2 emits the v2 synapse upstreams schema. Used when

@@ -283,6 +283,8 @@ func certificate(t *testing.T, host string) (certPEM, keyPEM, der []byte) {
 type answer struct {
 	status  int
 	backend string
+	// header holds the response's headers.
+	header http.Header
 	// served is the certificate the server presented, over TLS.
 	served []byte
 }
@@ -321,7 +323,7 @@ func (c *cluster) request(method, scheme, host, path string) (answer, error) {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	a := answer{status: resp.StatusCode, backend: resp.Header.Get("X-Backend")}
+	a := answer{status: resp.StatusCode, backend: resp.Header.Get("X-Backend"), header: resp.Header}
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		a.served = resp.TLS.PeerCertificates[0].Raw
 	}
@@ -662,6 +664,49 @@ func TestSynapseProxy(t *testing.T) {
 					{Matches: match(gwv1.PathMatchExact, "/exact", ""), BackendRefs: to("api")},
 					{Matches: match(gwv1.PathMatchPathPrefix, "/api", "POST"), BackendRefs: to("api")},
 					{Matches: match(gwv1.PathMatchRegularExpression, "/v[0-9]+/items$", ""), BackendRefs: to("api")},
+					// What means something to a regular expression: a dot
+					// in a prefix, a class written with a backslash, and
+					// an alternative, which an anchor in front does not hold.
+					{Matches: match(gwv1.PathMatchPathPrefix, "/api/v1.0", ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchRegularExpression, `/n\d+/things`, ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchRegularExpression, "/foo|/bar", ""), BackendRefs: to("api")},
+					// A rule the proxy cannot carry out. Its requests are
+					// not the first rule's to serve.
+					{Matches: match(gwv1.PathMatchPathPrefix, "/held", ""), BackendRefs: to("api"),
+						Filters: []gwv1.HTTPRouteFilter{{Type: gwv1.HTTPRouteFilterURLRewrite, URLRewrite: &gwv1.HTTPURLRewriteFilter{
+							Path: &gwv1.HTTPPathModifier{Type: gwv1.PrefixMatchHTTPPathModifier, ReplacePrefixMatch: ptrTo("/")},
+						}}}},
+				},
+			},
+		}
+		// Headers, on a host of its own that has nothing but path prefixes.
+		setRequest := gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: &gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "X-From-Gateway", Value: "yes"}}}}
+		setResponse := gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
+			ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "X-Resp", Value: "1"}}}}
+		headers := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-headers"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"headers." + host},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop"), Filters: []gwv1.HTTPRouteFilter{setRequest}},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/bare", ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/resp", ""), BackendRefs: to("api"), Filters: []gwv1.HTTPRouteFilter{setResponse}},
+				},
+			},
+		}
+		// Every name under a wildcard, where Synapse 0.8.7 tries plain
+		// paths and nothing else.
+		wildcard := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-wildcard"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"*.wild." + host},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop")},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/api", ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchExact, "/only", ""), BackendRefs: to("api")},
 				},
 			},
 		}
@@ -690,7 +735,7 @@ func TestSynapseProxy(t *testing.T) {
 				Type:       corev1.SecretTypeTLS,
 				Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
 			},
-			gw, route, unsupported,
+			gw, route, unsupported, headers, wildcard,
 		)
 
 		accepted := func(rt *gwv1.HTTPRoute) (*metav1.Condition, string) {
@@ -718,6 +763,22 @@ func TestSynapseProxy(t *testing.T) {
 			case cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "UnsupportedValue":
 				return fmt.Sprintf("the route that matches on a header is %+v, want False/UnsupportedValue", cond)
 			}
+			// What is left out of a route that is served is said too.
+			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", wildcard: "wildcard host", headers: ""} {
+				switch cond, reason := accepted(rt); {
+				case reason != "":
+					return reason
+				case cond == nil || cond.Status != metav1.ConditionTrue:
+					return fmt.Sprintf("route %s is %+v", rt.Name, cond)
+				}
+				partly := meta.FindStatusCondition(rt.Status.Parents[0].Conditions, "PartiallyInvalid")
+				switch {
+				case part == "" && partly != nil:
+					return fmt.Sprintf("route %s can be served whole, yet: %s", rt.Name, partly.Message)
+				case part != "" && (partly == nil || !strings.Contains(partly.Message, part)):
+					return fmt.Sprintf("route %s does not say what of it is left out: %+v", rt.Name, partly)
+				}
+			}
 			switch {
 			case !meta.IsStatusConditionTrue(gw.Status.Conditions, "Programmed"):
 				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
@@ -727,7 +788,7 @@ func TestSynapseProxy(t *testing.T) {
 			// that cannot be programmed too: attaching is about who may,
 			// not about what the route then asks for. Only the first is
 			// for the host the other listener serves.
-			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 2 || gw.Status.Listeners[1].AttachedRoutes != 1:
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 4 || gw.Status.Listeners[1].AttachedRoutes != 1:
 				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
 			}
 			return ""
@@ -746,6 +807,12 @@ func TestSynapseProxy(t *testing.T) {
 			{"POST", "/apiary", "shop"},
 			{"GET", "/v2/items", "api"},
 			{"GET", "/v2/items/9", "shop"},
+			{"GET", "/api/v1.0/users", "api"},
+			{"GET", "/api/v1X0/users", "shop"},
+			{"GET", "/n7/things", "api"},
+			{"GET", "/nx/things", "shop"},
+			{"GET", "/bar", "api"},
+			{"GET", "/x/bar", "shop"},
 		}
 		took := eventually(t, afterASync, "requests reach the backend the route says", func() string {
 			for _, r := range requests {
@@ -772,6 +839,63 @@ func TestSynapseProxy(t *testing.T) {
 		if a, err := c.request("GET", "http", "canary."+gatewayHost, "/canary"); err != nil || a.status != http.StatusNotFound {
 			t.Errorf("a route that could not be programmed answers %d (%v), want 404", a.status, err)
 		}
+		// Under the first rule's prefix, and not the first rule's.
+		for _, path := range []string{"/held", "/held/x"} {
+			if a, err := c.request("GET", "http", gatewayHost, path); err != nil || a.status != http.StatusNotFound {
+				t.Errorf("GET %s, of a rule that cannot be carried out, answers %d from %q (%v), want 404", path, a.status, a.backend, err)
+			}
+		}
+
+		// Headers are set by Synapse, by rules of its own about which
+		// route's it takes for a request.
+		type headerCase struct {
+			path, backend string
+			// seen is what the backend was sent in X-From-Gateway, and
+			// resp what the client got in X-Resp.
+			seen, resp string
+		}
+		eventually(t, afterASync, "each rule's headers are set, on its requests and on no others", func() string {
+			for _, hc := range []headerCase{
+				{"/", "shop", "yes", ""},
+				{"/deep/down", "shop", "yes", ""},
+				// Not the ones of the rule above it.
+				{"/bare/x", "api", "", ""},
+				{"/resp", "api", "", "1"},
+			} {
+				a, err := c.request("GET", "http", "headers."+gatewayHost, hc.path)
+				switch {
+				case err != nil:
+					return err.Error()
+				case a.status != http.StatusOK || a.backend != hc.backend:
+					return fmt.Sprintf("%s answered %d from %q, want 200 from %q", hc.path, a.status, a.backend, hc.backend)
+				case a.header.Get("X-Seen-From-Gateway") != hc.seen:
+					return fmt.Sprintf("%s: the backend was sent X-From-Gateway %q, want %q", hc.path, a.header.Get("X-Seen-From-Gateway"), hc.seen)
+				case a.header.Get("X-Resp") != hc.resp:
+					return fmt.Sprintf("%s: the client got X-Resp %q, want %q", hc.path, a.header.Get("X-Resp"), hc.resp)
+				// What is set for the backend is not sent back.
+				case a.header.Get("X-From-Gateway") != "":
+					return fmt.Sprintf("%s: the client got the request header back: X-From-Gateway %q", hc.path, a.header.Get("X-From-Gateway"))
+				}
+			}
+			return ""
+		})
+
+		eventually(t, afterASync, "a wildcard host serves its path prefixes", func() string {
+			// The exact path is left out, and its requests are the
+			// first rule's as if it were not there.
+			for path, backend := range map[string]string{"/": "shop", "/api/x": "api", "/only": "shop"} {
+				for _, name := range []string{"a.wild." + gatewayHost, "deep.er.wild." + gatewayHost} {
+					a, err := c.request("GET", "http", name, path)
+					switch {
+					case err != nil:
+						return err.Error()
+					case a.status != http.StatusOK || a.backend != backend:
+						return fmt.Sprintf("%s%s answered %d from %q, want 200 from %q", name, path, a.status, a.backend, backend)
+					}
+				}
+			}
+			return ""
+		})
 	})
 
 	step("a configuration change replaces the pods without a failed request", func(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	"sigs.k8s.io/yaml"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -251,6 +252,91 @@ func cmpOr(a, b string) string {
 	return b
 }
 
+// wfStringValue reads a string literal the way Synapse's expression language
+// does: `\"`, `\\`, `\xHH` and three octal digits are its escapes, and
+// anything else after a backslash is an error, for which Synapse drops the
+// route.
+func wfStringValue(t *testing.T, lit string) string {
+	t.Helper()
+	if len(lit) < 2 || lit[0] != '"' || lit[len(lit)-1] != '"' {
+		t.Fatalf("not a string literal: %s", lit)
+	}
+	body := lit[1 : len(lit)-1]
+	var out []byte
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if c == '"' {
+			t.Fatalf("a quote that is not escaped ends the literal early: %s", lit)
+		}
+		if c != '\\' {
+			out = append(out, c)
+			continue
+		}
+		if i++; i >= len(body) {
+			t.Fatalf("a backslash ends the literal: %s", lit)
+		}
+		switch e := body[i]; {
+		case e == '"' || e == '\\':
+			out = append(out, e)
+		case e == 'x' && i+2 < len(body):
+			b, err := strconv.ParseUint(body[i+1:i+3], 16, 8)
+			if err != nil {
+				t.Fatalf("bad \\x escape in %s: %v", lit, err)
+			}
+			out = append(out, byte(b))
+			i += 2
+		case e >= '0' && e <= '7' && i+2 < len(body):
+			b, err := strconv.ParseUint(body[i:i+3], 8, 8)
+			if err != nil {
+				t.Fatalf("bad octal escape in %s: %v", lit, err)
+			}
+			out = append(out, byte(b))
+			i += 2
+		default:
+			t.Fatalf("Synapse refuses the escape \\%c in %s", e, lit)
+		}
+	}
+	return string(out)
+}
+
+// wfRegexValue reads a regex literal the way Synapse's expression language
+// does, which is not the way it reads a string: a backslash and what
+// follows it go to the regex engine as written. The one exception is `\"`
+// outside a character class, which is a quote. What a class is, it tells by
+// counting brackets and nothing else.
+func wfRegexValue(t *testing.T, lit string) string {
+	t.Helper()
+	if len(lit) < 2 || lit[0] != '"' || lit[len(lit)-1] != '"' {
+		t.Fatalf("not a regex literal: %s", lit)
+	}
+	body := lit[1 : len(lit)-1]
+	var out []byte
+	inClass := false
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c == '\\':
+			if i++; i >= len(body) {
+				t.Fatalf("a backslash ends the literal: %s", lit)
+			}
+			if inClass || body[i] != '"' {
+				out = append(out, '\\')
+			}
+			out = append(out, body[i])
+		case c == '"' && !inClass:
+			t.Fatalf("a quote that is not escaped ends the literal early: %s", lit)
+		case c == '[' && !inClass:
+			inClass = true
+			out = append(out, c)
+		case c == ']' && inClass:
+			inClass = false
+			out = append(out, c)
+		default:
+			out = append(out, c)
+		}
+	}
+	return string(out)
+}
+
 // evalRouteExpr evaluates the subset of Synapse's route expressions the
 // operator writes: `eq` and `matches` on the path and the method, `and`,
 // `or`, `not` and parentheses.
@@ -288,16 +374,12 @@ func evalRouteExpr(t *testing.T, expr, method, path string) bool {
 			if tok == "http.request.method" {
 				field = method
 			}
-			op := next()
-			lit, err := strconv.Unquote(next())
-			if err != nil {
-				t.Fatalf("bad string in %s: %v", expr, err)
-			}
+			op, lit := next(), next()
 			switch op {
 			case "eq":
-				return field == lit
+				return field == wfStringValue(t, lit)
 			case "matches":
-				return regexp.MustCompile(lit).MatchString(field)
+				return regexp.MustCompile(wfRegexValue(t, lit)).MatchString(field)
 			}
 			t.Fatalf("unknown operator %q in %s", op, expr)
 		default:
@@ -639,7 +721,10 @@ func TestGateway_Backends(t *testing.T) {
 			r := to("nope")
 			r.BackendRefs = append(r.BackendRefs, backendRef("", "app"))
 			return r
-		}, "10.0.0.1:80", "BackendNotFound"},
+			// Not the one that does exist with all of it: the API has the
+			// other's share answered with an error, and nobody asked this
+			// backend to take twice its load.
+		}, "", "BackendNotFound"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := newGwWorld()
@@ -818,6 +903,143 @@ func TestGateway_WhichRuleARequestMatches(t *testing.T) {
 
 // Between two routes that match equally well, the older one has the request;
 // and a match written twice is one route, not two that both claim it.
+func TestRouteExprLiterals(t *testing.T) {
+	// A string, whatever is in it, is read back as it was.
+	for _, s := range []string{"/plain", `/a"b`, `/a\b`, "/caf\u00e9", "/tab\there", "/nl\n", "/\x00\xff", `/x\"`} {
+		if got := wfStringValue(t, wfString(s)); got != s {
+			t.Errorf("string %q is read back as %q, written %s", s, got, wfString(s))
+		}
+	}
+	// A regular expression reaches the engine as it was written. Doubling
+	// its backslashes, as quoting a string does, makes `\.` a backslash
+	// and any character.
+	for _, re := range []string{`^/api/v1\.0/`, `/v\d+/items`, `/a"b`, `/["\-\]ab]`, `/a\"b`, `/[^/]+$`, "/caf\u00e9"} {
+		got := wfRegexValue(t, wfRegex(re))
+		// `\"` and `"` are the same thing to the engine.
+		want := strings.ReplaceAll(strings.ReplaceAll(re, `\"`, `\x22`), `"`, `\x22`)
+		if got != want {
+			t.Errorf("regex %s reaches the engine as %s, written %s", re, got, wfRegex(re))
+		}
+	}
+	if got, want := wfRegex(`^/api/v1\.0/`), `"^/api/v1\.0/"`; got != want {
+		t.Errorf("wfRegex = %s, want %s", got, want)
+	}
+}
+
+func TestGateway_PathsThatMeanSomethingToARegex(t *testing.T) {
+	w := newGwWorld()
+	for _, svc := range []string{"root", "exact", "v1", "wellknown", "items", "foobar", "braces", "ends"} {
+		w.service("apps", svc, "")
+	}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+	w.in.routes = append(w.in.routes, httpRoute("shop", []string{"shop.example.com"},
+		to("root", pathMatch(gwv1.PathMatchPathPrefix, "/")),
+		to("exact", pathMatch(gwv1.PathMatchExact, "/exact")),
+		to("v1", pathMatch(gwv1.PathMatchPathPrefix, "/api/v1.0")),
+		to("wellknown", pathMatch(gwv1.PathMatchPathPrefix, "/.well-known/acme+x")),
+		to("items", pathMatch(gwv1.PathMatchRegularExpression, `/v\d+/items`)),
+		to("foobar", pathMatch(gwv1.PathMatchRegularExpression, `/foo|/bar`)),
+		to("braces", pathMatch(gwv1.PathMatchRegularExpression, `/users/{id}`)),
+		to("ends", pathMatch(gwv1.PathMatchRegularExpression, `/alpha|beta`)),
+	))
+	m, st := w.translate()
+	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
+	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
+		t.Fatalf("all of it can be served, yet: %s", c.Message)
+	}
+	for _, c := range []struct{ path, want string }{
+		{"/api/v1.0", "v1"},
+		{"/api/v1.0/users", "v1"},
+		// The dot is a dot, not any character.
+		{"/api/v1X0/users", "root"},
+		{"/.well-known/acme+x/token", "wellknown"},
+		{"/.well-known/acmeeex/token", "root"},
+		{"/v12/items", "items"},
+		{"/vx/items", "root"},
+		// An alternative is anchored like the rest: `^/foo|/bar` would
+		// take every path with /bar somewhere in it.
+		{"/foo", "foobar"},
+		{"/bar/x", "foobar"},
+		{"/api/v1.0/bar", "v1"},
+		{"/x/bar", "root"},
+		// Also when the alternatives have nothing in common to be
+		// written in front of them.
+		{"/alpha/1", "ends"},
+		{"/x/beta", "root"},
+		// Braces that are no repetition are braces. Synapse's regex
+		// engine refuses them written bare, and a route it refuses takes
+		// with it every route written to exclude it.
+		{"/users/{id}", "braces"},
+		{"/users/7", "root"},
+	} {
+		if got := server(t, m, "shop.example.com", "GET", c.path); !strings.HasPrefix(got, c.want+".") {
+			t.Errorf("GET %s goes to %q, want %s", c.path, got, c.want)
+		}
+	}
+	for label, rc := range m.hosts["shop.example.com"] {
+		if strings.Contains(rc.matchExpr, "{id}") && !strings.Contains(rc.matchExpr, `\{id\}`) {
+			t.Errorf("%s: braces are written bare: %s", label, rc.matchExpr)
+		}
+	}
+}
+
+// Synapse's regex engine is run without Unicode. A class that holds a
+// character outside ASCII is an error to it, and a letter outside ASCII is
+// not matched in its other case.
+func TestCanonicalRegex(t *testing.T) {
+	for re, want := range map[string]string{
+		`/v\d+/items`:  `/v[0-9]+/items`,
+		`/users/{id}`:  `/users/\{id\}`,
+		`/foo|/bar`:    `/(?:foo|bar)`,
+		`\Q/a.b\E/c`:   `/a\.b/c`,
+		`/\<x\>`:       `/<x>`,
+		`/[^a-c]z`:     `/[^a-c]z`,
+		`/caf\x{e9}/x`: `/café/x`,
+		`(?i)/Case`:    `(?i:/CASE)`,
+		// A class of one is that character, and matched as its bytes.
+		`/[é]x`:    `/éx`,
+		`/a\x{7f}`: `/a\x7f`,
+	} {
+		if got, err := canonicalRegex(re); err != nil || got != want {
+			t.Errorf("canonicalRegex(%s) = %s, %v; want %s", re, got, err, want)
+		}
+	}
+	for _, re := range []string{
+		`/a(`, `/p\p{Greek}q`, `/[éa]x`, `/[^é]x`, `/[a-é]`, `/\pL+`, `(?i)/café`, `/x\x{80}y`, `/x\x{2028}y`, `/[\x{80}-\x{90}]`,
+		"/" + strings.Repeat("[a-c][d-f]", 200),
+	} {
+		if got, err := canonicalRegex(re); err == nil {
+			t.Errorf("canonicalRegex(%.40s) = %.60s, want it refused", re, got)
+		}
+	}
+}
+
+func TestGateway_ARegularExpressionTooLargeIsRefused(t *testing.T) {
+	// A class is written out as the ranges it stands for, and \pL is tens of
+	// kilobytes of them, in every route that has to exclude this one.
+	w := newGwWorld()
+	w.service("apps", "root", "")
+	w.service("apps", "letters", "")
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+	w.in.routes = append(w.in.routes, httpRoute("shop", []string{"shop.example.com"},
+		to("root", pathMatch(gwv1.PathMatchPathPrefix, "/")),
+		to("letters", pathMatch(gwv1.PathMatchRegularExpression, `/\pL+`)),
+	))
+	m, st := w.translate()
+	c := routeCondition(t, st, "shop", "PartiallyInvalid")
+	if c == nil || !strings.Contains(c.Message, "regular expression") {
+		t.Fatalf("PartiallyInvalid = %+v, want it to name the regular expression", c)
+	}
+	if got := server(t, m, "shop.example.com", "GET", "/abc"); !strings.HasPrefix(got, "root.") {
+		t.Errorf("GET /abc goes to %q, want root", got)
+	}
+	for label, rc := range m.hosts["shop.example.com"] {
+		if len(rc.matchExpr) > 4096 {
+			t.Errorf("%s: an expression of %d bytes", label, len(rc.matchExpr))
+		}
+	}
+}
+
 func TestGateway_TheOlderRouteWins(t *testing.T) {
 	for _, exactPath := range []bool{false, true} {
 		w := newGwWorld()
@@ -902,35 +1124,475 @@ func TestGateway_WhatCannotBeHonouredIsNotProgrammed(t *testing.T) {
 	}
 }
 
-func TestGateway_HeadersSetAndAdded(t *testing.T) {
+// synapseHeaders returns the headers Synapse gives a request for path on
+// host, or its response, out of a rendered v1 file. By Synapse's rules, not
+// by what was meant: a route's headers are found by the request's path among
+// the path keys, walking up to the nearest one that has a list; a route with
+// request headers and no word on response headers has them sent back too.
+func synapseHeaders(t *testing.T, rendered, host, path string, response bool) []string {
+	t.Helper()
+	var doc struct {
+		Upstreams map[string]struct {
+			Paths map[string]map[string]any `json:"paths"`
+		} `json:"upstreams"`
+	}
+	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered file does not parse: %v\n%s", err, rendered)
+	}
+	paths := doc.Upstreams[host].Paths
+	list := func(v any) (out []string, given bool) {
+		items, given := v.([]any)
+		for _, item := range items {
+			out = append(out, fmt.Sprint(item))
+		}
+		return out, given
+	}
+	entry := func(p string) ([]string, bool) {
+		cfg, ok := paths[p]
+		if !ok {
+			return nil, false
+		}
+		req, hasReq := list(cfg["request_headers"])
+		resp, hasResp := list(cfg["response_headers"])
+		switch {
+		case !response:
+			return req, hasReq
+		case !hasResp && len(req) > 0:
+			return req, true // the older single list: both ways
+		}
+		return resp, hasResp
+	}
+	for p := path; ; {
+		if hs, ok := entry(p); ok {
+			return hs
+		}
+		i := strings.LastIndex(p, "/")
+		if i <= 0 {
+			break
+		}
+		p = p[:i]
+	}
+	hs, _ := entry("/")
+	return hs
+}
+
+func setHeaders(rule gwv1.HTTPRouteRule, req, resp []gwv1.HTTPHeader) gwv1.HTTPRouteRule {
+	if req != nil {
+		rule.Filters = append(rule.Filters, gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: &gwv1.HTTPHeaderFilter{Set: req}})
+	}
+	if resp != nil {
+		rule.Filters = append(rule.Filters, gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
+			ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{Set: resp}})
+	}
+	return rule
+}
+
+func TestGateway_HeadersARuleSets(t *testing.T) {
 	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
-	rule := to("app")
-	rule.Filters = []gwv1.HTTPRouteFilter{
-		{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &gwv1.HTTPHeaderFilter{
-			Set: []gwv1.HTTPHeader{{Name: "X-Set", Value: "1"}}, Add: []gwv1.HTTPHeader{{Name: "X-Add", Value: "2"}},
-		}},
-		{Type: gwv1.HTTPRouteFilterResponseHeaderModifier, ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{
-			Set: []gwv1.HTTPHeader{{Name: "X-Resp", Value: "3"}},
-		}},
-	}
-	// On a host of plain paths and on one of expressions alike.
-	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", []string{"shop.example.com"}, rule)}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil,
+		// A credential for the backend, and nothing for the response.
+		setHeaders(to("app", prefix("/")), []gwv1.HTTPHeader{{Name: "Authorization", Value: "Bearer backend"}}, nil),
+		to("app2", prefix("/api")),
+		setHeaders(to("app3", prefix("/both")), []gwv1.HTTPHeader{{Name: "X-Req", Value: "1"}}, []gwv1.HTTPHeader{{Name: "X-Resp", Value: "2"}}),
+		setHeaders(to("app4", prefix("/resp")), nil, []gwv1.HTTPHeader{{Name: "X-Resp", Value: "3"}}),
+	)}
 	m, st := w.translate()
 	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
-	rc := m.hosts["shop.example.com"]["/"]
-	if !reflect.DeepEqual(rc.reqHeaders, []string{"X-Set: 1", "X-Add: 2"}) || !reflect.DeepEqual(rc.respHeaders, []string{"X-Resp: 3"}) {
-		t.Errorf("headers are %v and %v", rc.reqHeaders, rc.respHeaders)
+	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
+		t.Fatalf("all of it can be served, yet: %s", c.Message)
+	}
+	rendered := renderUpstreams(m)
+	for _, c := range []struct {
+		path     string
+		response bool
+		want     []string
+	}{
+		{"/", false, []string{"Authorization: Bearer backend"}},
+		{"/x/y", false, []string{"Authorization: Bearer backend"}},
+		// Not sent back to the client.
+		{"/", true, nil},
+		{"/x/y", true, nil},
+		// A rule without headers has none: not the ones of the rule above it.
+		{"/api", false, nil},
+		{"/api/users", false, nil},
+		{"/api/users", true, nil},
+		{"/both/x", false, []string{"X-Req: 1"}},
+		{"/both/x", true, []string{"X-Resp: 2"}},
+		{"/resp", false, nil},
+		{"/resp", true, []string{"X-Resp: 3"}},
+	} {
+		if got := synapseHeaders(t, rendered, "shop.example.com", c.path, c.response); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s, response %v: Synapse sets %q, want %q", c.path, c.response, got, c.want)
+		}
+	}
+}
+
+// The same file is written for Ingresses, whose headers come from two
+// annotations. Synapse reads a route with request headers and no word on
+// response headers as its older single list, and sends them back to the
+// client.
+func TestRenderUpstreams_RequestHeadersAreNotSentBack(t *testing.T) {
+	m := newRenderModel()
+	servers := []backend{{addr: "x:1"}}
+	m.addRoute("h", "/", servers, annSettings{reqHeaders: []string{"Authorization: Bearer backend"}}, nil, nil)
+	m.addRoute("h", "/framed", servers, annSettings{respHeaders: []string{"X-Frame-Options: DENY"}}, nil, nil)
+	m.addRoute("h", "/bare", servers, annSettings{}, nil, nil)
+	rendered := renderUpstreams(m)
+	for _, c := range []struct {
+		path     string
+		response bool
+		want     []string
+	}{
+		{"/x", false, []string{"Authorization: Bearer backend"}},
+		{"/x", true, nil},
+		{"/framed", true, []string{"X-Frame-Options: DENY"}},
+		// An Ingress route without a list still takes the one of the
+		// path above it, as it did.
+		{"/framed", false, []string{"Authorization: Bearer backend"}},
+		{"/bare", false, []string{"Authorization: Bearer backend"}},
+		{"/bare", true, nil},
+	} {
+		if got := synapseHeaders(t, rendered, "h", c.path, c.response); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s, response %v: Synapse sets %q, want %q", c.path, c.response, got, c.want)
+		}
+	}
+	if strings.Contains(rendered, "request_headers: []") {
+		t.Errorf("an Ingress route says it has no request headers, which ends what it took from the path above:\n%s", rendered)
+	}
+}
+
+// Synapse replaces a header's value. `add` asks for one more beside those a
+// header has: of Set-Cookie it would drop the backend's own.
+func TestGateway_AddingToAHeaderIsRefused(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	rule := to("app2", prefix("/cookie"))
+	rule.Filters = []gwv1.HTTPRouteFilter{{Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
+		ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{Add: []gwv1.HTTPHeader{{Name: "Set-Cookie", Value: "flag=1"}}}}}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app", prefix("/")), rule)}
+	m, st := w.translate()
+	c := routeCondition(t, st, "shop", "PartiallyInvalid")
+	if c == nil || !strings.Contains(c.Message, "adding to a header") {
+		t.Fatalf("PartiallyInvalid = %+v, want it to say that adding is not supported", c)
+	}
+	if got := server(t, m, "shop.example.com", "GET", "/cookie/x"); got != "" {
+		t.Errorf("/cookie/x is served by %s, without the header that was asked for", got)
+	}
+	if got := server(t, m, "shop.example.com", "GET", "/other"); got != "10.0.0.1:80" {
+		t.Errorf("/other goes to %q", got)
+	}
+}
+
+// Synapse finds a route's headers by the request's path, among the plain
+// paths. Those of a route matched by an expression are never found, so on a
+// host that needs expressions a rule that sets headers cannot be carried
+// out. It is not served without them.
+func TestGateway_HeadersOnAHostOfExpressions(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil,
+		to("app", prefix("/")),
+		to("app2", exact("/exact")),
+		setHeaders(to("app3", prefix("/secure")), nil, []gwv1.HTTPHeader{{Name: "Strict-Transport-Security", Value: "max-age=1"}}),
+	)}
+	m, st := w.translate()
+	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
+	c := routeCondition(t, st, "shop", "PartiallyInvalid")
+	if c == nil || !strings.Contains(c.Message, "rule 2, match 0 on shop.example.com: headers cannot be set") {
+		t.Fatalf("PartiallyInvalid = %+v, want it to name the rule and the host", c)
+	}
+	for path, want := range map[string]string{"/": "10.0.0.1:80", "/exact": "10.0.0.2:80", "/secure": "", "/secure/x": "", "/securely": "10.0.0.1:80"} {
+		if got := server(t, m, "shop.example.com", "GET", path); got != want {
+			t.Errorf("GET %s goes to %q, want %q", path, got, want)
+		}
+	}
+	for label, rc := range m.hosts["shop.example.com"] {
+		if len(rc.reqHeaders)+len(rc.respHeaders) > 0 {
+			t.Errorf("%s carries headers Synapse will never apply", label)
+		}
+	}
+}
+
+// A rule the proxy cannot carry out keeps its requests: they are answered
+// with an error, and are not served by whichever other rule matches them
+// too. A match the proxy cannot evaluate is left out, and its requests are
+// served as if it were not there.
+func TestGateway_ARuleThatCannotBeCarriedOutKeepsItsRequests(t *testing.T) {
+	rewrite := to("app2", prefix("/admin"))
+	rewrite.Filters = []gwv1.HTTPRouteFilter{{Type: gwv1.HTTPRouteFilterURLRewrite, URLRewrite: &gwv1.HTTPURLRewriteFilter{}}}
+	timeout := to("app2", prefix("/admin"))
+	timeout.Timeouts = &gwv1.HTTPRouteTimeouts{}
+	split := to("nope", prefix("/admin"))
+	split.BackendRefs[0].Weight = ptr(int32(90))
+	split.BackendRefs = append(split.BackendRefs, backendRef("", "app2"))
+	split.BackendRefs[1].Weight = ptr(int32(10))
+	noTraffic := to("app2", prefix("/admin"))
+	noTraffic.BackendRefs[0].Weight = ptr(int32(0))
+
+	for name, rule := range map[string]gwv1.HTTPRouteRule{
+		"a filter the proxy does not have":   rewrite,
+		"a timeout":                          timeout,
+		"a backend that does not exist":      to("nope", prefix("/admin")),
+		"one of two backends does not exist": split,
+		"backends that are to get nothing":   noTraffic,
+		"no backend":                         {Matches: []gwv1.HTTPRouteMatch{prefix("/admin")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newGwWorld()
+			w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+			// In another route, as another team's would be.
+			w.in.routes = []gwv1.HTTPRoute{httpRoute("web", nil, to("app", prefix("/"))), httpRoute("admin", nil, rule)}
+			m, st := w.translate()
+			wantRoute(t, st, "web", "Accepted", metav1.ConditionTrue, "Accepted")
+			for path, want := range map[string]string{"/": "10.0.0.1:80", "/shop": "10.0.0.1:80", "/administrator": "10.0.0.1:80", "/admin": "", "/admin/users": ""} {
+				if got := server(t, m, "shop.example.com", "GET", path); got != want {
+					t.Errorf("GET %s goes to %q, want %q", path, got, want)
+				}
+			}
+		})
 	}
 
-	rule.Matches = []gwv1.HTTPRouteMatch{exact("/x")}
-	w = newGwWorld()
+	// What cannot be evaluated has no place to keep.
+	header := prefix("/admin")
+	header.Headers = []gwv1.HTTPHeaderMatch{{Name: "X-Env", Value: "canary"}}
+	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
-	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, rule)}
-	m, _ = w.translate()
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("web", nil, to("app", prefix("/"))), httpRoute("canary", nil, to("app2", header))}
+	m, st := w.translate()
+	wantRoute(t, st, "canary", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+	if got := server(t, m, "shop.example.com", "GET", "/admin/x"); got != "10.0.0.1:80" {
+		t.Errorf("GET /admin/x goes to %q: a match on a header is left out, and the rest serves", got)
+	}
+}
+
+// Each expression names the ones ranked above it that a request could match
+// as well, and no others: every one it names is evaluated for every request,
+// and written once more into the file.
+func TestGateway_AnExpressionExcludesOnlyWhatOverlapsIt(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	rules := []gwv1.HTTPRouteRule{to("app", prefix("/")), to("app2", prefix("/x")), to("app3", prefix("/x/deep")), to("app4", onMethod("POST", prefix("/y")))}
+	for i := range 150 {
+		rules = append(rules, to("app2", exact(fmt.Sprintf("/item/%03d", i))))
+	}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, rules...)}
+	m, _ := w.translate()
+
+	total := 0
+	var root, x, deep string
 	for _, rc := range m.hosts["shop.example.com"] {
-		if !reflect.DeepEqual(rc.reqHeaders, []string{"X-Set: 1", "X-Add: 2"}) || !reflect.DeepEqual(rc.respHeaders, []string{"X-Resp: 3"}) {
-			t.Errorf("on an expression route the headers are %v and %v", rc.reqHeaders, rc.respHeaders)
+		total += len(rc.matchExpr)
+		switch own, _, _ := strings.Cut(rc.matchExpr, " and not "); own {
+		case `(http.request.path matches "^/")`:
+			root = rc.matchExpr
+		case `((http.request.path eq "/x" or http.request.path matches "^/x/"))`:
+			x = rc.matchExpr
+		case `((http.request.path eq "/x/deep" or http.request.path matches "^/x/deep/"))`:
+			deep = rc.matchExpr
+		}
+	}
+	if root == "" || x == "" || deep == "" {
+		t.Fatalf("expressions not found: root %q, /x %q, /x/deep %q", root, x, deep)
+	}
+	if strings.Contains(deep, "and not") {
+		t.Errorf("/x/deep has nothing above it that it meets, yet excludes: %s", deep)
+	}
+	if !strings.Contains(x, `"/x/deep"`) || strings.Contains(x, "/item/") || strings.Contains(x, `"/y"`) {
+		t.Errorf("/x excludes what is under it and nothing else: %s", x)
+	}
+	if !strings.Contains(root, `"/item/149"`) || !strings.Contains(root, `"/y"`) || !strings.Contains(root, `"/x"`) {
+		t.Errorf("/ is met by everything, and excludes it all: %.200s", root)
+	}
+	// 154 matches. Each naming all of those above it came to over a megabyte,
+	// which is more than a ConfigMap holds.
+	if total > 64<<10 {
+		t.Errorf("the host's expressions are %d bytes", total)
+	}
+	for path, want := range map[string]string{"/": "10.0.0.1:80", "/x": "10.0.0.2:80", "/x/deep/er": "10.0.0.3:80", "/item/007": "10.0.0.2:80", "/item/7": "10.0.0.1:80"} {
+		if got := server(t, m, "shop.example.com", "GET", path); got != want {
+			t.Errorf("GET %s goes to %q, want %q", path, got, want)
+		}
+	}
+	if got := server(t, m, "shop.example.com", "POST", "/y/z"); got != "10.0.0.4:80" {
+		t.Errorf("POST /y/z goes to %q", got)
+	}
+}
+
+func TestGatewayMatch_Overlaps(t *testing.T) {
+	post := func(m gwMatch) gwMatch { m.method = "POST"; return m }
+	get := func(m gwMatch) gwMatch { m.method = "GET"; return m }
+	e := func(v string) gwMatch { return gwMatch{kind: gwv1.PathMatchExact, value: v} }
+	p := func(v string) gwMatch { return gwMatch{kind: gwv1.PathMatchPathPrefix, value: v} }
+	re := gwMatch{kind: gwv1.PathMatchRegularExpression, value: "/r", regex: "/r"}
+	for _, c := range []struct {
+		a, b gwMatch
+		want bool
+	}{
+		{e("/a"), e("/a"), true},
+		{e("/a"), e("/b"), false},
+		{e("/a"), p("/a"), true},
+		{e("/a/"), p("/a"), true},
+		{e("/a/b"), p("/a"), true},
+		{e("/ab"), p("/a"), false},
+		{e("/"), p("/a"), false},
+		{e("/a"), p("/"), true},
+		{p("/a"), p("/a/b"), true},
+		{p("/a/"), p("/a"), true},
+		{p("/a"), p("/b"), false},
+		{p("/a"), p("/ab"), false},
+		{p("/"), p("/a"), true},
+		{re, e("/a"), true},
+		{re, p("/zzz"), true},
+		{post(e("/a")), get(e("/a")), false},
+		{post(p("/")), get(re), false},
+		{post(e("/a")), e("/a"), true},
+	} {
+		if got := c.a.overlaps(c.b); got != c.want {
+			t.Errorf("%+v overlaps %+v = %v, want %v", c.a, c.b, got, c.want)
+		}
+		if got := c.b.overlaps(c.a); got != c.want {
+			t.Errorf("%+v overlaps %+v = %v, want %v (the other way round)", c.b, c.a, got, c.want)
+		}
+	}
+}
+
+// Synapse up to 0.8.7 does not try the expressions of a wildcard host: a
+// request for a name under it finds the host's plain paths and nothing
+// else. Written as expressions, every route of the host would answer 404.
+func TestGateway_AWildcardHostIsPlainPaths(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "*.example.com"))}
+	refused := to("app4", prefix("/old"))
+	refused.Timeouts = &gwv1.HTTPRouteTimeouts{}
+	w.in.routes = []gwv1.HTTPRoute{
+		httpRoute("web", nil, to("app", prefix("/")), to("app2", prefix("/api"))),
+		httpRoute("extra", nil, to("app3", exact("/health")), to("app3", onMethod("POST", prefix("/upload"))), to("app3", regex("/v[0-9]+")), refused),
+	}
+	m, st := w.translate()
+	wantRoute(t, st, "web", "Accepted", metav1.ConditionTrue, "Accepted")
+	wantRoute(t, st, "extra", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+	c := routeCondition(t, st, "extra", "Accepted")
+	for _, part := range []string{"rule 0, match 0 on *.example.com: only a path prefix", "rule 1, match 0 on *.example.com", "rule 2, match 0 on *.example.com", "rule 3: timeouts"} {
+		if !strings.Contains(c.Message, part) {
+			t.Errorf("the message does not say %q: %s", part, c.Message)
+		}
+	}
+	for label, rc := range m.hosts["*.example.com"] {
+		if rc.matchExpr != "" {
+			t.Errorf("%s is an expression, which Synapse does not try on a wildcard host: %s", label, rc.matchExpr)
+		}
+	}
+	for path, want := range map[string]string{"/": "10.0.0.1:80", "/api/x": "10.0.0.2:80", "/health": "10.0.0.1:80", "/v2": "10.0.0.1:80"} {
+		if got := server(t, m, "*.example.com", "GET", path); got != want {
+			t.Errorf("GET %s goes to %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestGateway_WhatAGatewayAsksForAndIsNotDone(t *testing.T) {
+	whole := map[string]struct {
+		change func(*gwv1.Gateway)
+		reason string
+	}{
+		"an address": {func(gw *gwv1.Gateway) {
+			gw.Spec.Addresses = []gwv1.GatewaySpecAddress{{Value: "198.51.100.7"}}
+		}, "UnsupportedAddress"},
+		"parameters of its own": {func(gw *gwv1.Gateway) {
+			gw.Spec.Infrastructure = &gwv1.GatewayInfrastructure{ParametersRef: &gwv1.LocalParametersReference{Group: "example.com", Kind: "Config", Name: "x"}}
+		}, "InvalidParameters"},
+		"a certificate to show backends": {func(gw *gwv1.Gateway) {
+			gw.Spec.TLS = &gwv1.GatewayTLSConfig{Backend: &gwv1.GatewayBackendTLS{ClientCertificateRef: &gwv1.SecretObjectReference{Name: "client"}}}
+		}, "Invalid"},
+	}
+	for name, tc := range whole {
+		t.Run(name, func(t *testing.T) {
+			w := newGwWorld()
+			w.tlsSecret("edge", "cert")
+			gw := gateway("edge", "web", httpListener("http", 80, "shop.example.com"), httpsListener("https", "shop.example.com", secretRef("", "cert")))
+			tc.change(&gw)
+			w.in.gateways = []gwv1.Gateway{gw}
+			w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app"))}
+			m, st := w.translate()
+			status := st.gateways[types.NamespacedName{Namespace: "edge", Name: "web"}]
+			if c := meta.FindStatusCondition(status.Conditions, "Accepted"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != tc.reason {
+				t.Errorf("Accepted = %+v, want False/%s", c, tc.reason)
+			}
+			if c := meta.FindStatusCondition(status.Conditions, "Programmed"); c == nil || c.Status != metav1.ConditionFalse {
+				t.Errorf("Programmed = %+v, want False", c)
+			}
+			wantListener(t, st, "http", "Programmed", metav1.ConditionFalse, "Invalid")
+			wantListener(t, st, "https", "Programmed", metav1.ConditionFalse, "Invalid")
+			wantRoute(t, st, "shop", "Accepted", metav1.ConditionFalse, "NotAllowedByListeners")
+			if len(m.hosts) != 0 || len(m.certProjections) != 0 {
+				t.Errorf("hosts %v and %d certificates are rendered for a Gateway that is not accepted", sortedKeys(m.hosts), len(m.certProjections))
+			}
+		})
+	}
+
+	// Client certificates are a matter of the HTTPS listeners. Left out
+	// quietly, a listener that was to ask for one is open to everyone.
+	for name, frontend := range map[string]gwv1.FrontendTLSConfig{
+		"for every port": {Default: gwv1.TLSConfig{Validation: &gwv1.FrontendTLSValidation{}}},
+		"for one port":   {PerPort: []gwv1.TLSPortConfig{{Port: 443, TLS: gwv1.TLSConfig{Validation: &gwv1.FrontendTLSValidation{}}}}},
+	} {
+		t.Run("client certificates "+name, func(t *testing.T) {
+			w := newGwWorld()
+			w.tlsSecret("edge", "cert")
+			gw := gateway("edge", "web", httpListener("http", 80, "plain.example.com"), httpsListener("https", "shop.example.com", secretRef("", "cert")))
+			gw.Spec.TLS = &gwv1.GatewayTLSConfig{Frontend: &frontend}
+			w.in.gateways = []gwv1.Gateway{gw}
+			m, st := w.translate()
+			wantListener(t, st, "https", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+			wantListener(t, st, "http", "Accepted", metav1.ConditionTrue, "Accepted")
+			if len(m.certProjections) != 0 {
+				t.Errorf("%d certificates are rendered for a listener that is not served", len(m.certProjections))
+			}
+		})
+	}
+
+	// With nothing asked of it, the block changes nothing.
+	w := newGwWorld()
+	w.tlsSecret("edge", "cert")
+	gw := gateway("edge", "web", httpsListener("https", "shop.example.com", secretRef("", "cert")))
+	gw.Spec.TLS = &gwv1.GatewayTLSConfig{Frontend: &gwv1.FrontendTLSConfig{}, Backend: &gwv1.GatewayBackendTLS{}}
+	gw.Spec.Infrastructure = &gwv1.GatewayInfrastructure{Labels: map[gwv1.LabelKey]gwv1.LabelValue{"a": "b"}}
+	w.in.gateways = []gwv1.Gateway{gw}
+	_, st := w.translate()
+	wantListener(t, st, "https", "Programmed", metav1.ConditionTrue, "Programmed")
+
+	w = newGwWorld()
+	w.tlsSecret("edge", "cert")
+	options := httpsListener("https", "shop.example.com", secretRef("", "cert"))
+	options.TLS.Options = map[gwv1.AnnotationKey]gwv1.AnnotationValue{"example.com/min-version": "1.3"}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", options)}
+	_, st = w.translate()
+	wantListener(t, st, "https", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+}
+
+// A route that names no host is served on its listener's. On a listener
+// that names none either there is nothing to serve it on, and the route
+// says so also when another listener gave it a host.
+func TestGateway_ARouteWithoutAHostOnListenersWithAndWithout(t *testing.T) {
+	w := newGwWorld()
+	w.tlsSecret("edge", "cert")
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web",
+		httpListener("http", 80, ""), httpsListener("https", "shop.example.com", secretRef("", "cert")))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app"))}
+	m, st := w.translate()
+	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
+	c := routeCondition(t, st, "shop", "PartiallyInvalid")
+	if c == nil || !strings.Contains(c.Message, "a listener that names no host") {
+		t.Fatalf("PartiallyInvalid = %+v, want it to say the route is not served on the listener without a host", c)
+	}
+	if got := sortedKeys(m.hosts); !reflect.DeepEqual(got, []string{"shop.example.com"}) {
+		t.Errorf("hosts are %v", got)
+	}
+	status := st.gateways[types.NamespacedName{Namespace: "edge", Name: "web"}]
+	for _, l := range status.Listeners {
+		if want := map[gwv1.SectionName]int32{"http": 0, "https": 1}[l.Name]; l.AttachedRoutes != want {
+			t.Errorf("listener %s has %d routes attached, want %d", l.Name, l.AttachedRoutes, want)
 		}
 	}
 }

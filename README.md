@@ -252,7 +252,7 @@ spec:
           from: All
 ```
 
-An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule the operator follows: what is programmed is exactly what was asked for, and what cannot be is said in the object's status and not served. Nothing is routed more broadly than written.
+An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule the operator follows: what is programmed is exactly what was asked for, and what cannot be is said in the object's status. Nothing is routed more broadly than written.
 
 | | Served |
 |---|---|
@@ -262,23 +262,37 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
 | Matches | `PathPrefix`, `Exact` and `RegularExpression` paths, and `method`, in the precedence the API gives them |
 | Backends | Services, with weights; one in another namespace needs a `ReferenceGrant` |
 | Certificates | a listener's `certificateRefs`; one in another namespace needs a `ReferenceGrant` |
-| Filters | setting and adding request and response headers |
+| Filters | setting request and response headers |
 | Status | `Accepted`, `Programmed`, `ResolvedRefs` and `PartiallyInvalid`; attached routes per listener; the proxy's addresses |
 
-**Not served, and reported.** A rule or a match that asks for one of these is left out, with `PartiallyInvalid` on the route, or `Accepted: False` when nothing of it is left:
+**What cannot be done is one of two things, and they are not treated alike.**
 
-- a match on a header or on a query parameter: Synapse routes on host, path and method;
-- the redirect, URL-rewrite and mirror filters, removing a header, and filters on a backend;
-- timeouts, retries and session persistence;
-- a route where neither it nor its listener names a host: Synapse has no host that stands for all others;
-- TLS passthrough, and every kind of route but `HTTPRoute`.
+- **A rule the proxy cannot carry out keeps its requests.** They are answered `404`, and are not served by another rule that happens to match them too: a rule for `/admin` that cannot be served does not hand `/admin` to the rule for `/`. The route says `PartiallyInvalid`, or `Accepted: False` when nothing of it is served. This is a rule with:
+  - a redirect, URL-rewrite or mirror filter, a filter on a backend, or a header filter that removes a header or adds to one. Synapse replaces a header's value, which is what `set` asks for;
+  - timeouts, retries or session persistence;
+  - a backend that cannot be used: one that does not exist, is not a Service, or is in another namespace without a `ReferenceGrant`. One such backend among several is enough. Synapse cannot fail a share of the requests, and the other backends were not asked to take them. The route says which in `ResolvedRefs`.
+- **A match the proxy cannot evaluate is left out,** and what it would have matched is served as if the match were not there, by the route's other matches and by other routes. This is a match on a header or on a query parameter, and a regular expression that cannot be used.
 
-**Where it differs from the API:**
+**Limits that come from how Synapse routes:**
 
+- **Headers can be set on a host of path prefixes only.** A host where every match is a `PathPrefix` for any method is written as plain paths, and any other host as expressions. Synapse finds a route's headers by the request's path among the plain paths. On a host written as expressions a rule that sets headers cannot be carried out, and is not served without them.
+- **A wildcard host serves path prefixes only.** Synapse up to 0.8.7 does not evaluate expressions for a wildcard host. An exact path, a method or a regular expression on `*.example.com` is left out.
+- **Regular expressions are ASCII, and bounded.** Synapse's regex engine runs without Unicode: a character class may not hold a character outside ASCII, and a letter outside ASCII has no other case. An expression may be 1024 bytes with its classes written out as ranges. A `RegularExpression` match ranks between `Exact` and `PathPrefix`.
 - **A route belongs to a host, not to a listener.** One attached to a single listener of a Gateway is served on every listener of the proxy, the plain-HTTP ones included.
+- **A route that names no host needs a listener that names one.** Synapse has no host that stands for all others. On a listener without a hostname such a route is not served, and says so.
 - **A host an Ingress of the same proxy routes is taken.** An `HTTPRoute` for it is not accepted (`HostnameConflict`).
-- **A rule none of whose backends can be used is not served,** where the API asks for a 500.
-- **The CRDs are looked for when the operator starts.** Installed later, they are found after a restart.
+- **`/health` is Synapse's own.** It answers that path itself, on every host, and a backend's `/health` is not reached through the proxy.
+
+**A Gateway that asks for more than is done says so.**
+
+- With `spec.addresses`, `spec.infrastructure.parametersRef` or `spec.tls.backend` the Gateway is not accepted, and none of its listeners is served.
+- With client certificates (`spec.tls.frontend`) or with `tls.options` an HTTPS listener is not served. A listener that was to ask for a client certificate and does not would be open to everyone.
+- TLS passthrough, and every kind of route but `HTTPRoute`, are not served.
+- `BackendTLSPolicy`, `ListenerSet` and default Gateways (`useDefaultGateways`) are not implemented. Such objects get no status from this controller.
+
+**Statuses are taken back.** When a `GatewayClass` names a `SynapseProxy` that does not exist, the class says `InvalidParameters`, its Gateways go back to `Pending` without addresses, and routes lose their entries for those Gateways.
+
+**When the operator starts** it looks for the Gateway API's CRDs. Installed later, they are found after a restart. If they are there and the operator's role does not let it read them, it serves Ingresses only and logs what it is missing: the role is in `config/proxy-controller`.
 
 The Gateway API conformance suite has not been run against it.
 

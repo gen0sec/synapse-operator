@@ -70,7 +70,9 @@ func gatewayAPIServed(t *testing.T) bool {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gatewayAPIIs = GatewayAPIServed(mapper)
+		if gatewayAPIIs, err = GatewayAPIServed(mapper); err != nil {
+			t.Fatal(err)
+		}
 	})
 	return gatewayAPIIs
 }
@@ -239,6 +241,15 @@ func (a *asked) refusals() []string {
 	return slices.Clone(a.refused)
 }
 
+// forget drops the refusals recorded so far, and returns them.
+func (a *asked) forget() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	was := a.refused
+	a.refused = nil
+	return was
+}
+
 func (a *asked) didRead(g grant) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -361,8 +372,10 @@ func runProxyControllers(t *testing.T, cfg *rest.Config, namespace ...string) (s
 		HealthProbeBindAddress: "0",
 		Controller:             config.Controller{SkipNameValidation: ptr(true)},
 	}
+	limitedTo := ""
 	for _, ns := range namespace {
 		options.Cache.DefaultNamespaces = map[string]cache.Config{ns: {}}
+		limitedTo = ns
 	}
 	mgr, err := ctrl.NewManager(cfg, options)
 	if err != nil {
@@ -370,7 +383,7 @@ func runProxyControllers(t *testing.T, cfg *rest.Config, namespace ...string) (s
 	}
 	// As the operator registers them, so that the role is tested against
 	// what the operator runs.
-	if err := SetupProxyControllers(mgr, "cluster.local"); err != nil {
+	if err := SetupProxyControllers(context.Background(), mgr, "cluster.local", limitedTo); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -399,6 +412,9 @@ type proxyStory struct {
 	k8s      client.Client
 	ns       string
 	operator *asked
+	// noGateways leaves the Gateway API out of the story, also where the
+	// cluster has it.
+	noGateways bool
 }
 
 // wait polls until done returns "", and reports true; or until the operator
@@ -502,7 +518,7 @@ func (s *proxyStory) run() bool {
 
 	// And the same through the Gateway API, where the cluster has it: a
 	// class that names the proxy, a Gateway of it and a route.
-	gatewayAPI := gatewayAPIServed(s.t)
+	gatewayAPI := gatewayAPIServed(s.t) && !s.noGateways
 	var (
 		gwClassObj = gwClass(s.ns, s.ns, "edge")
 		gw         = gateway(s.ns, "web", httpListener("http", 80, "gw.example.com"))
@@ -721,6 +737,112 @@ func TestProxyRole_IsEnoughToRunAProxy(t *testing.T) {
 		if g.verb == readGrant && !operator.didRead(g) {
 			t.Errorf("the operator may %s and never did", g)
 		}
+	}
+}
+
+// An operator installed before it served Gateways holds a role that says
+// nothing of them, and many clusters come with the Gateway API's kinds. It
+// goes on serving its Ingresses, and says what it is missing. A controller
+// that may not read a kind it watches never starts, and stops the manager:
+// the new version would take the Ingresses down on the day it is rolled out.
+func TestProxyRole_WithoutTheGatewayGrantsIngressesAreServed(t *testing.T) {
+	if !gatewayAPIServed(t) {
+		t.Skip("the API server has no Gateway API")
+	}
+	ctx := context.Background()
+	role, binding := loadProxyRole(t)
+	admin := rbacAdmin(t)
+	as := func(cfg *rest.Config) client.Client {
+		c, err := client.New(cfg, client.Options{Scheme: proxyTestScheme(t)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	current, _ := operatorHolding(t, admin, role, binding)
+	if err := CheckGatewayAccess(ctx, as(current), ""); err != nil {
+		t.Fatalf("with the role as it is: %v", err)
+	}
+
+	// Every kind the route controller watches for Gateways is asked about:
+	// one it may not read is enough to stop it.
+	var older []grant
+	asked := 0
+	for i, g := range grantsOf(t, role) {
+		if !needsGatewayAPI(g) {
+			older = append(older, g)
+			continue
+		}
+		if g.verb != readGrant {
+			continue
+		}
+		asked++
+		name := fmt.Sprintf("proxy-role-%d", rbacTestRuns.Add(1))
+		without, _ := operatorHolding(t, admin, roleOf(name, slices.Delete(grantsOf(t, role), i, i+1)), bindingOf(name))
+		if err := CheckGatewayAccess(ctx, as(without), ""); !apierrors.IsForbidden(err) {
+			t.Errorf("not allowed to %s: %v, want to be refused", g, err)
+		}
+	}
+	if asked != 5 {
+		t.Errorf("%d kinds were asked about, want the five the route controller watches for Gateways", asked)
+	}
+
+	// An operator limited to a namespace may hold what is namespaced there
+	// and nowhere else. It is asked about that namespace.
+	var clusterWide, namespaced []grant
+	for _, g := range grantsOf(t, role) {
+		if needsGatewayAPI(g) && g.verb == readGrant && g.resource != "gatewayclasses" && g.resource != "namespaces" {
+			namespaced = append(namespaced, g)
+		} else {
+			clusterWide = append(clusterWide, g)
+		}
+	}
+	limited := fmt.Sprintf("proxy-role-%d", rbacTestRuns.Add(1))
+	inOne, _ := operatorHolding(t, admin, roleOf(limited, clusterWide), bindingOf(limited))
+	for _, obj := range []client.Object{
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: limited}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Namespace: limited, Name: limited}, Rules: roleOf(limited, namespaced).Rules},
+		&rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Namespace: limited, Name: limited},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: limited},
+			Subjects:   bindingOf(limited).Subjects,
+		},
+	} {
+		if err := admin.Create(ctx, obj); err != nil {
+			t.Fatalf("create %T: %v", obj, err)
+		}
+	}
+	if err := CheckGatewayAccess(ctx, as(inOne), limited); err != nil {
+		t.Errorf("limited to the namespace it may read: %v", err)
+	}
+	if err := CheckGatewayAccess(ctx, as(inOne), ""); !apierrors.IsForbidden(err) {
+		t.Errorf("on the whole cluster, with a role for one namespace: %v, want to be refused", err)
+	}
+	name := fmt.Sprintf("proxy-role-%d", rbacTestRuns.Add(1))
+	cfg, operator := operatorHolding(t, admin, roleOf(name, older), bindingOf(name))
+	if err := CheckGatewayAccess(ctx, as(cfg), ""); !apierrors.IsForbidden(err) {
+		t.Fatalf("with the role of before: %v, want to be refused", err)
+	}
+
+	story := newProxyStory(t, admin, operator)
+	story.noGateways = true
+	stop := runProxyControllers(t, cfg, story.ns)
+	// What it was refused while finding out is how it found out.
+	for _, refused := range operator.forget() {
+		if !strings.Contains(refused, gwv1.GroupName) && !strings.HasSuffix(refused, "/namespaces") {
+			t.Errorf("refused %s, which is not about the Gateway API", refused)
+		}
+	}
+	finished := story.run()
+	if err := stop(); err != nil {
+		t.Errorf("manager: %v", err)
+	}
+	if got := operator.refusals(); len(got) > 0 {
+		t.Errorf("serving Ingresses, the operator was refused:\n  %s", strings.Join(got, "\n  "))
+	}
+	if !finished {
+		t.Fatal("the story stopped early")
 	}
 }
 

@@ -73,6 +73,20 @@ func TestRegexRouteRender(t *testing.T) {
 	}
 }
 
+// A regex reaches Synapse as it was written. Quoted like a string, its
+// backslashes were doubled, and `\d` was a backslash and a d.
+func TestRegexRouteKeepsItsBackslashes(t *testing.T) {
+	m := newRenderModel()
+	m.addRegexRoute("h", `/api/v\d+/x\.json$`, []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+	var got string
+	for _, rc := range m.hosts["h"] {
+		got = rc.matchExpr
+	}
+	if want := `http.request.path matches "^/api/v\d+/x\.json$"`; got != want {
+		t.Fatalf("match_expr = %s\nwant         %s", got, want)
+	}
+}
+
 // A path regex stored without a leading `^` (k8s requires the Ingress path to
 // begin with `/`) is anchored at the start by the renderer.
 func TestRegexAnchoring(t *testing.T) {
