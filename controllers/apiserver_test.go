@@ -1,12 +1,15 @@
 package controllers
 
 import (
+	"context"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"synapse-operator/internal/testenv"
 )
@@ -54,5 +57,35 @@ func eventually(t *testing.T, what string, check func() string) {
 			t.Fatalf("%s: %s", what, reason)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// change reads obj, applies mutate to it and writes it back; changeStatus
+// does the same for its status. Both do it again when the object was written
+// in between. A controller that is running writes to the objects a test
+// edits, at moments of its own choosing: a read followed by an update loses
+// to it now and then.
+func change(t *testing.T, k8s client.Client, obj client.Object, mutate func()) {
+	t.Helper()
+	rewrite(t, k8s, obj, mutate, func(ctx context.Context) error { return k8s.Update(ctx, obj) })
+}
+
+func changeStatus(t *testing.T, k8s client.Client, obj client.Object, mutate func()) {
+	t.Helper()
+	rewrite(t, k8s, obj, mutate, func(ctx context.Context) error { return k8s.Status().Update(ctx, obj) })
+}
+
+func rewrite(t *testing.T, k8s client.Client, obj client.Object, mutate func(), write func(context.Context) error) {
+	t.Helper()
+	ctx := context.Background()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8s.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		mutate()
+		return write(ctx)
+	})
+	if err != nil {
+		t.Fatalf("update %T %s: %v", obj, obj.GetName(), err)
 	}
 }

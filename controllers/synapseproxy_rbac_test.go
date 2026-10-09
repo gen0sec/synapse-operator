@@ -415,7 +415,6 @@ func (s *proxyStory) events(kind, name, reason string) int32 {
 // as soon as the operator is refused anything.
 func (s *proxyStory) run() bool {
 	s.t.Helper()
-	key := client.ObjectKey{Namespace: s.ns, Name: "edge"}
 	get := func(name string, into client.Object) string {
 		if err := s.k8s.Get(s.ctx, client.ObjectKey{Namespace: s.ns, Name: name}, into); err != nil {
 			return err.Error()
@@ -467,9 +466,16 @@ func (s *proxyStory) run() bool {
 	s.create(ing)
 	s.create(edge)
 	// The API server is shared, and every later test that runs these
-	// controllers on the whole cluster would take this proxy on as well.
+	// controllers on the whole cluster would take this proxy on as well. Its
+	// two Services go too: nothing here collects what a deleted proxy owned,
+	// and the server has a few hundred addresses to give out, for every test
+	// and every repeat of one.
 	s.t.Cleanup(func() {
-		for _, obj := range []client.Object{edge, ing, class} {
+		services := []client.Object{
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "app"}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "edge"}},
+		}
+		for _, obj := range append([]client.Object{edge, ing, class}, services...) {
 			if err := s.k8s.Delete(s.ctx, obj); client.IgnoreNotFound(err) != nil {
 				s.t.Errorf("delete %T %s: %v", obj, obj.GetName(), err)
 			}
@@ -504,10 +510,9 @@ func (s *proxyStory) run() bool {
 	if reason := get("edge", &svc); reason != "" {
 		s.t.Fatal(reason)
 	}
-	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}
-	if err := s.k8s.Status().Update(s.ctx, &svc); err != nil {
-		s.t.Fatal(err)
-	}
+	changeStatus(s.t, s.k8s, &svc, func() {
+		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}
+	})
 	if !s.wait("the address is on the proxy and on its Ingress", func() string {
 		var p synapsev1alpha1.SynapseProxy
 		if reason := get("edge", &p); reason != "" {
@@ -529,13 +534,9 @@ func (s *proxyStory) run() bool {
 	}
 
 	// The user changes the spec: a new configuration, and the old one goes.
-	if err := s.k8s.Get(s.ctx, key, edge); err != nil {
-		s.t.Fatal(err)
-	}
-	edge.Spec.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"}
-	if err := s.k8s.Update(s.ctx, edge); err != nil {
-		s.t.Fatal(err)
-	}
+	change(s.t, s.k8s, edge, func() {
+		edge.Spec.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"}
+	})
 	if !s.wait("the pods get a new configuration and the old one is removed", func() string {
 		now, reason := configSecret()
 		switch {
@@ -555,13 +556,9 @@ func (s *proxyStory) run() bool {
 
 	// The Ingress changes without changing how many routes there are, so
 	// the event about it is the one already raised, once more.
-	if reason := get("shop", ing); reason != "" {
-		s.t.Fatal(reason)
-	}
-	ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port.Number = 8080
-	if err := s.k8s.Update(s.ctx, ing); err != nil {
-		s.t.Fatal(err)
-	}
+	change(s.t, s.k8s, ing, func() {
+		ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port.Number = 8080
+	})
 	if !s.wait("the changed Ingress is rendered, and reported once more", func() string {
 		var cm corev1.ConfigMap
 		if reason := get("edge-upstreams", &cm); reason != "" {
