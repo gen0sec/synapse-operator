@@ -117,6 +117,37 @@ rules:
       - ingresses/status
     verbs:
       - update
+  # The Gateway API, where it is installed: the Gateways of a class that
+  # names a proxy, the routes attached to them, and what lets them refer
+  # across namespaces. Each is told in its status what became of it.
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - gatewayclasses
+      - gateways
+      - httproutes
+      - referencegrants
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - gatewayclasses/status
+      - gateways/status
+      - httproutes/status
+    verbs:
+      - update
+  # A Gateway's listener may choose by label which namespaces attach routes.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - ""
     resources:

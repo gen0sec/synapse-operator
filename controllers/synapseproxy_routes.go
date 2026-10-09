@@ -15,6 +15,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -50,6 +52,9 @@ type SynapseRouteReconciler struct {
 	ClusterDomain string
 	// Recorder emits Events on the Ingresses. May be nil.
 	Recorder record.EventRecorder
+	// GatewayAPI says the cluster has the Gateway API kinds, so that the
+	// Gateways handed to a proxy are rendered too; see GatewayAPIServed.
+	GatewayAPI bool
 }
 
 func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -92,6 +97,22 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
 	}
+	var (
+		gatewayIn     gatewayInputs
+		gatewayStatus gatewayStatuses
+		lookups       = func() error { return nil }
+	)
+	if r.GatewayAPI {
+		if gatewayIn, lookups, err = r.gatewayInputs(ctx, &proxy); err != nil {
+			return ctrl.Result{}, err
+		}
+		render.RenderExtra = func(_ context.Context, m *renderModel) error {
+			gatewayStatus = translateGateways(gatewayIn, m)
+			// Rendered from a lookup that failed, the routes would lack a
+			// backend that is there: nothing is written, and it is retried.
+			return lookups()
+		}
+	}
 	if _, _, _, err = render.render(ctx); err != nil {
 		// It is retried, but until it succeeds the proxy serves the routes
 		// and certificates of the last render that did, and says nothing.
@@ -100,6 +121,13 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.Recorder.Eventf(&proxy, corev1.EventTypeWarning, "RoutesNotRendered", "%v", err)
 		}
 		return ctrl.Result{}, err
+	}
+	if r.GatewayAPI {
+		// After the routes are written: a status that says programmed is
+		// about what the proxy has been given.
+		if err := r.writeGatewayStatuses(ctx, gatewayIn, gatewayStatus); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return ctrl.Result{}, nil
 }
@@ -181,7 +209,7 @@ func (r *SynapseRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return ok && s.Type == corev1.SecretTypeTLS
 	})
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		// Named explicitly: the proxy's own controller is also `For` this kind.
 		Named("synapse-proxy-routes").
 		For(&synapsev1alpha1.SynapseProxy{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
@@ -193,6 +221,17 @@ func (r *SynapseRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Backend addresses, and the address of the proxy's own Service.
 		Watches(&corev1.Service{}, everyProxy).
 		// Certificate issuance and renewal.
-		Watches(&corev1.Secret{}, everyProxy, builder.WithPredicates(tlsSecrets)).
-		Complete(r)
+		Watches(&corev1.Secret{}, everyProxy, builder.WithPredicates(tlsSecrets))
+	if r.GatewayAPI {
+		// What is written to them is their status, which is not a reason
+		// to look at them again.
+		spec := builder.WithPredicates(predicate.GenerationChangedPredicate{})
+		b = b.Watches(&gwv1.GatewayClass{}, everyProxy, spec).
+			Watches(&gwv1.Gateway{}, everyProxy, spec).
+			Watches(&gwv1.HTTPRoute{}, everyProxy, spec).
+			Watches(&gwv1beta1.ReferenceGrant{}, everyProxy).
+			// A listener may choose by their labels which namespaces attach.
+			Watches(&corev1.Namespace{}, everyProxy, builder.WithPredicates(predicate.LabelChangedPredicate{}))
+	}
+	return b.Complete(r)
 }

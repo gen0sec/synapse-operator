@@ -85,6 +85,12 @@ type IngressReconciler struct {
 	// for the long-running sidecar; off for the --render-once
 	// initContainer (synapse isn't running yet).
 	SignalReload bool
+	// RenderExtra, when set, is called on every render with the routes and
+	// certificates of the Ingresses already in the model, to add its own
+	// before anything is written. It is how a SynapseProxy's Gateways get
+	// into the same output as its Ingresses.
+	RenderExtra func(ctx context.Context, m *renderModel) error
+
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
 	// API CRDs to be installed.
@@ -375,6 +381,12 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	if r.GatewayAPI {
 		matched += r.renderGateways(ctx, m)
+	}
+	if r.RenderExtra != nil {
+		if err := r.RenderExtra(ctx, m); err != nil {
+			mRenderErrTotal.Inc()
+			return false, 0, 0, err
+		}
 	}
 
 	// Project referenced TLS Secrets. Central mode (CertsOutSecret set)

@@ -21,6 +21,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -29,8 +30,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -47,6 +50,36 @@ const (
 )
 
 var rbacTestRuns atomic.Int64
+
+var (
+	gatewayAPIOnce sync.Once
+	gatewayAPIIs   bool
+)
+
+// gatewayAPIServed reports whether the test API server has the Gateway API.
+// It takes the CRDs only when it is new enough for them.
+func gatewayAPIServed(t *testing.T) bool {
+	t.Helper()
+	gatewayAPIOnce.Do(func() {
+		cfg := apiServer(t)
+		httpClient, err := rest.HTTPClientFor(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mapper, err := apiutil.NewDynamicRESTMapper(cfg, httpClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gatewayAPIIs = GatewayAPIServed(mapper)
+	})
+	return gatewayAPIIs
+}
+
+// needsGatewayAPI says a grant is there for the Gateway API only, and so is
+// one the operator has no use for on a cluster without it.
+func needsGatewayAPI(g grant) bool {
+	return g.group == gwv1.GroupName || (g.group == "" && g.resource == "namespaces")
+}
 
 // readManifest returns the documents of a YAML file, by kind.
 func readManifest(t *testing.T, path string) map[string][]byte {
@@ -465,6 +498,27 @@ func (s *proxyStory) run() bool {
 	ing.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"shop.example.com"}, SecretName: "shop-tls"}}
 	s.create(ing)
 	s.create(edge)
+	leftovers := []client.Object{edge, ing, class}
+
+	// And the same through the Gateway API, where the cluster has it: a
+	// class that names the proxy, a Gateway of it and a route.
+	gatewayAPI := gatewayAPIServed(s.t)
+	var (
+		gwClassObj = gwClass(s.ns, s.ns, "edge")
+		gw         = gateway(s.ns, "web", httpListener("http", 80, "gw.example.com"))
+		route      = httpRoute("gw", nil, to("app"))
+	)
+	if gatewayAPI {
+		gwClassObj.Generation, gw.Generation, route.Generation = 0, 0, 0
+		gw.Spec.GatewayClassName = gwv1.ObjectName(s.ns)
+		route.Namespace, route.CreationTimestamp = s.ns, metav1.Time{}
+		route.Spec.ParentRefs = []gwv1.ParentReference{{Name: "web"}}
+		s.create(&gwClassObj)
+		s.create(&gw)
+		s.create(&route)
+		leftovers = append(leftovers, &route, &gw, &gwClassObj)
+	}
+
 	// The API server is shared, and every later test that runs these
 	// controllers on the whole cluster would take this proxy on as well. Its
 	// two Services go too: nothing here collects what a deleted proxy owned,
@@ -475,7 +529,7 @@ func (s *proxyStory) run() bool {
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "app"}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "edge"}},
 		}
-		for _, obj := range append([]client.Object{edge, ing, class}, services...) {
+		for _, obj := range append(leftovers, services...) {
 			if err := s.k8s.Delete(s.ctx, obj); client.IgnoreNotFound(err) != nil {
 				s.t.Errorf("delete %T %s: %v", obj, obj.GetName(), err)
 			}
@@ -499,6 +553,30 @@ func (s *proxyStory) run() bool {
 			return "no event about the proxy"
 		case s.events("Ingress", "shop", "Programmed") == 0:
 			return "no event about the Ingress"
+		}
+		if !gatewayAPI {
+			return ""
+		}
+		// Each of the three is told what became of it.
+		if err := s.k8s.Get(s.ctx, client.ObjectKeyFromObject(&gwClassObj), &gwClassObj); err != nil {
+			return err.Error()
+		}
+		if reason := get("web", &gw); reason != "" {
+			return reason
+		}
+		if reason := get("gw", &route); reason != "" {
+			return reason
+		}
+		accepted := func(conditions []metav1.Condition) bool {
+			return meta.IsStatusConditionTrue(conditions, "Accepted")
+		}
+		switch {
+		case !accepted(gwClassObj.Status.Conditions):
+			return "the GatewayClass is not accepted"
+		case !accepted(gw.Status.Conditions) || len(gw.Status.Listeners) != 1:
+			return fmt.Sprintf("the Gateway's status is %+v", gw.Status)
+		case len(route.Status.Parents) != 1 || !accepted(route.Status.Parents[0].Conditions):
+			return fmt.Sprintf("the route's status is %+v", route.Status)
 		}
 		return ""
 	}) {
@@ -637,6 +715,9 @@ func TestProxyRole_IsEnoughToRunAProxy(t *testing.T) {
 		t.Fatal("the story stopped early")
 	}
 	for _, g := range grantsOf(t, role) {
+		if needsGatewayAPI(g) && !gatewayAPIServed(t) {
+			continue
+		}
 		if g.verb == readGrant && !operator.didRead(g) {
 			t.Errorf("the operator may %s and never did", g)
 		}
@@ -660,7 +741,7 @@ func TestProxyRole_GrantsNoWriteItDoesNotUse(t *testing.T) {
 	admin := rbacAdmin(t)
 	grants := grantsOf(t, role)
 	for i, without := range grants {
-		if without.verb == readGrant {
+		if without.verb == readGrant || (needsGatewayAPI(without) && !gatewayAPIServed(t)) {
 			continue
 		}
 		t.Run(without.String(), func(t *testing.T) {
@@ -685,8 +766,8 @@ func TestProxyRole_GrantsNoWriteItDoesNotUse(t *testing.T) {
 			for _, refused := range operator.refusals() {
 				t.Log("refused: " + refused)
 				switch {
-				case !strings.Contains(refused, "/namespaces/"+story.ns+"/"):
-					t.Errorf("refused %s, which is not in %s", refused, story.ns)
+				case !strings.Contains(refused, "/"+story.ns+"/"):
+					t.Errorf("refused %s, which is not this story's", refused)
 				case subresource == "finalizers":
 				case !strings.Contains(refused+"/", "/"+resource+"/") || !strings.HasSuffix(refused, subresource):
 					t.Errorf("refused %s, which is not about %s", refused, without)
