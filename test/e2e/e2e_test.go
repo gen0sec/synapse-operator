@@ -34,10 +34,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -50,9 +52,10 @@ const (
 	appsNamespace  = "e2e-apps"
 	className      = "e2e-edge"
 
-	shopHost  = "shop.e2e.test"
-	apiHost   = "api.e2e.test"
-	otherHost = "other.e2e.test"
+	shopHost    = "shop.e2e.test"
+	apiHost     = "api.e2e.test"
+	otherHost   = "other.e2e.test"
+	gatewayHost = "gw.e2e.test"
 
 	// What a user, or a tool of theirs, sees of a proxy. Written out here
 	// and not taken from the operator's code, on purpose: to rename one is a
@@ -82,6 +85,8 @@ var proxyKey = types.NamespacedName{Namespace: proxyNamespace, Name: "edge"}
 type cluster struct {
 	ctx context.Context
 	k8s client.Client
+	// gatewayAPI says the cluster has the Gateway API's kinds.
+	gatewayAPI bool
 
 	httpAddr, httpsAddr        string
 	synapseImage, backendImage string
@@ -107,7 +112,7 @@ func newCluster(t *testing.T) *cluster {
 	// would otherwise hold the test up until the whole run is cancelled.
 	cfg.Timeout = 30 * time.Second
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, synapsev1alpha1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, synapsev1alpha1.AddToScheme, gwv1.Install} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}
@@ -116,8 +121,17 @@ func newCluster(t *testing.T) *cluster {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Whether the cluster has the Gateway API is asked of the cluster, not
+	// of the operator: an older one refuses its CRDs.
+	gatewayAPI := false
+	if dc, err := discovery.NewDiscoveryClientForConfig(cfg); err == nil {
+		if list, err := dc.ServerResourcesForGroupVersion(gwv1.GroupName + "/v1"); err == nil {
+			gatewayAPI = slices.ContainsFunc(list.APIResources, func(r metav1.APIResource) bool { return r.Kind == "HTTPRoute" })
+		}
+	}
 	return &cluster{
-		ctx: context.Background(), k8s: k8s,
+		gatewayAPI: gatewayAPI,
+		ctx:        context.Background(), k8s: k8s,
 		httpAddr: env(t, "E2E_HTTP_ADDR"), httpsAddr: env(t, "E2E_HTTPS_ADDR"),
 		synapseImage: env(t, "E2E_SYNAPSE_IMAGE"), backendImage: env(t, "E2E_BACKEND_IMAGE"),
 	}
@@ -157,6 +171,9 @@ func (c *cluster) clear(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: proxyNamespace}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: appsNamespace}},
 		&networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: className}},
+	}
+	if c.gatewayAPI {
+		leftovers = append(leftovers, &gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: className}})
 	}
 	for _, obj := range leftovers {
 		if err := c.k8s.Delete(c.ctx, obj); client.IgnoreNotFound(err) != nil {
@@ -273,6 +290,11 @@ type answer struct {
 // get sends one request for host through the load balancer, on a connection
 // of its own.
 func (c *cluster) get(scheme, host string) (answer, error) {
+	return c.request(http.MethodGet, scheme, host, "/")
+}
+
+// request sends one request, as get does, with a method and a path.
+func (c *cluster) request(method, scheme, host, path string) (answer, error) {
 	addr := c.httpAddr
 	if scheme == "https" {
 		addr = c.httpsAddr
@@ -289,7 +311,11 @@ func (c *cluster) get(scheme, host string) (answer, error) {
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	resp, err := requests.Get(scheme + "://" + host + "/")
+	req, err := http.NewRequest(method, scheme+"://"+host+path, nil)
+	if err != nil {
+		return answer{}, err
+	}
+	resp, err := requests.Do(req)
 	if err != nil {
 		return answer{}, err
 	}
@@ -594,6 +620,160 @@ func TestSynapseProxy(t *testing.T) {
 		t.Logf("served %s after it was renewed", took)
 	})
 
+	step("a Gateway's routes are served as the API says they match", func(t *testing.T) {
+		if !c.gatewayAPI {
+			t.Skip("this cluster does not have the Gateway API")
+		}
+		certPEM, keyPEM, cert := certificate(t, gatewayHost)
+		group, ns := gwv1.Group(synapsev1alpha1.GroupVersion.Group), gwv1.Namespace(proxyNamespace)
+		all := &gwv1.AllowedRoutes{Namespaces: &gwv1.RouteNamespaces{From: ptrTo(gwv1.NamespacesFromAll)}}
+		host := gwv1.Hostname(gatewayHost)
+		gw := &gwv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: proxyNamespace, Name: "web"},
+			Spec: gwv1.GatewaySpec{
+				GatewayClassName: className,
+				Listeners: []gwv1.Listener{
+					{Name: "http", Port: 80, Protocol: gwv1.HTTPProtocolType, AllowedRoutes: all},
+					{Name: "https", Port: 443, Protocol: gwv1.HTTPSProtocolType, Hostname: &host, AllowedRoutes: all,
+						TLS: &gwv1.ListenerTLSConfig{CertificateRefs: []gwv1.SecretObjectReference{{Name: "gw-tls"}}}},
+				},
+			},
+		}
+		match := func(kind gwv1.PathMatchType, path, method string) []gwv1.HTTPRouteMatch {
+			m := gwv1.HTTPRouteMatch{Path: &gwv1.HTTPPathMatch{Type: &kind, Value: &path}}
+			if method != "" {
+				m.Method = ptrTo(gwv1.HTTPMethod(method))
+			}
+			return []gwv1.HTTPRouteMatch{m}
+		}
+		to := func(service string) []gwv1.HTTPBackendRef {
+			var ref gwv1.HTTPBackendRef
+			ref.Name, ref.Port = gwv1.ObjectName(service), ptrTo(gwv1.PortNumber(80))
+			return []gwv1.HTTPBackendRef{ref}
+		}
+		parent := []gwv1.ParentReference{{Namespace: &ns, Name: "web"}}
+		route := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{host},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop")},
+					{Matches: match(gwv1.PathMatchExact, "/exact", ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/api", "POST"), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchRegularExpression, "/v[0-9]+/items$", ""), BackendRefs: to("api")},
+				},
+			},
+		}
+		// Something the proxy cannot do: it has to say so, not serve it as
+		// if the condition were not there.
+		onHeader := match(gwv1.PathMatchPathPrefix, "/canary", "")
+		onHeader[0].Headers = []gwv1.HTTPHeaderMatch{{Name: "X-Canary", Value: "1"}}
+		unsupported := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-on-header"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"canary." + host},
+				Rules:           []gwv1.HTTPRouteRule{{Matches: onHeader, BackendRefs: to("api")}},
+			},
+		}
+		c.create(t,
+			&gwv1.GatewayClass{
+				ObjectMeta: metav1.ObjectMeta{Name: className},
+				Spec: gwv1.GatewayClassSpec{
+					ControllerName: controllerName,
+					ParametersRef:  &gwv1.ParametersReference{Group: group, Kind: "SynapseProxy", Name: proxyKey.Name, Namespace: &ns},
+				},
+			},
+			&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: proxyNamespace, Name: "gw-tls"},
+				Type:       corev1.SecretTypeTLS,
+				Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
+			},
+			gw, route, unsupported,
+		)
+
+		accepted := func(rt *gwv1.HTTPRoute) (*metav1.Condition, string) {
+			if err := c.k8s.Get(c.ctx, client.ObjectKeyFromObject(rt), rt); err != nil {
+				return nil, err.Error()
+			}
+			if len(rt.Status.Parents) != 1 {
+				return nil, fmt.Sprintf("route %s has %d parent statuses", rt.Name, len(rt.Status.Parents))
+			}
+			return meta.FindStatusCondition(rt.Status.Parents[0].Conditions, "Accepted"), ""
+		}
+		eventually(t, soon, "each object is told what became of it", func() string {
+			if err := c.k8s.Get(c.ctx, client.ObjectKeyFromObject(gw), gw); err != nil {
+				return err.Error()
+			}
+			switch cond, reason := accepted(route); {
+			case reason != "":
+				return reason
+			case cond == nil || cond.Status != metav1.ConditionTrue:
+				return fmt.Sprintf("the route is %+v", cond)
+			}
+			switch cond, reason := accepted(unsupported); {
+			case reason != "":
+				return reason
+			case cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "UnsupportedValue":
+				return fmt.Sprintf("the route that matches on a header is %+v, want False/UnsupportedValue", cond)
+			}
+			switch {
+			case !meta.IsStatusConditionTrue(gw.Status.Conditions, "Programmed"):
+				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
+			case len(gw.Status.Addresses) == 0:
+				return "the Gateway has no address"
+			// Both routes attach to the listener for every host, the one
+			// that cannot be programmed too: attaching is about who may,
+			// not about what the route then asks for. Only the first is
+			// for the host the other listener serves.
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 2 || gw.Status.Listeners[1].AttachedRoutes != 1:
+				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
+			}
+			return ""
+		})
+
+		// Which backend a request reaches is decided by Synapse, from
+		// expressions the operator wrote: each of these is one where a
+		// looser reading of the route would answer differently.
+		requests := []struct{ method, path, backend string }{
+			{"GET", "/", "shop"},
+			{"GET", "/exact", "api"},
+			{"GET", "/exact/more", "shop"},
+			{"GET", "/exactly", "shop"},
+			{"POST", "/api/x", "api"},
+			{"GET", "/api/x", "shop"},
+			{"POST", "/apiary", "shop"},
+			{"GET", "/v2/items", "api"},
+			{"GET", "/v2/items/9", "shop"},
+		}
+		took := eventually(t, afterASync, "requests reach the backend the route says", func() string {
+			for _, r := range requests {
+				a, err := c.request(r.method, "http", gatewayHost, r.path)
+				switch {
+				case err != nil:
+					return err.Error()
+				case a.status != http.StatusOK || a.backend != r.backend:
+					return fmt.Sprintf("%s %s answered %d from %q, want 200 from %q", r.method, r.path, a.status, a.backend, r.backend)
+				}
+			}
+			a, err := c.request("GET", "https", gatewayHost, "/exact")
+			switch {
+			case err != nil:
+				return err.Error()
+			case !bytes.Equal(a.served, cert):
+				return "the certificate served is not the Gateway listener's"
+			case a.backend != "api":
+				return fmt.Sprintf("over TLS, /exact answered from %q", a.backend)
+			}
+			return ""
+		})
+		t.Logf("served %s after they were created", took)
+		if a, err := c.request("GET", "http", "canary."+gatewayHost, "/canary"); err != nil || a.status != http.StatusNotFound {
+			t.Errorf("a route that could not be programmed answers %d (%v), want 404", a.status, err)
+		}
+	})
+
 	step("a configuration change replaces the pods without a failed request", func(t *testing.T) {
 		before := c.deployment(t)
 		oldConfig, oldPods := configSecret(before), c.pods(t)
@@ -815,3 +995,5 @@ func TestSynapseProxy(t *testing.T) {
 		})
 	})
 }
+
+func ptrTo[T any](v T) *T { return &v }
