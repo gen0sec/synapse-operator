@@ -1203,7 +1203,24 @@ func TestGateway_HeadersARuleSets(t *testing.T) {
 	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
 		t.Fatalf("all of it can be served, yet: %s", c.Message)
 	}
-	rendered := renderUpstreams(m)
+	// As a proxy's routes are written: a v2 file.
+	m.sameAsV1 = true
+	routes := parseV2(t, renderUpstreamsV2(m)).Hosts["shop.example.com"].Paths
+	// A route's headers are its own, each way: the ones of the route that
+	// has the request, and of no route above it.
+	headers := func(path string, response bool) []string {
+		for p := path; ; p = p[:strings.LastIndex(p, "/")] {
+			if route, ok := routes[cmpOr(p, "/")]; ok {
+				if response {
+					return route.Headers.Response
+				}
+				return route.Headers.Request
+			}
+			if p == "" {
+				t.Fatalf("no route for %s", path)
+			}
+		}
+	}
 	for _, c := range []struct {
 		path     string
 		response bool
@@ -1223,14 +1240,14 @@ func TestGateway_HeadersARuleSets(t *testing.T) {
 		{"/resp", false, nil},
 		{"/resp", true, []string{"X-Resp: 3"}},
 	} {
-		if got := synapseHeaders(t, rendered, "shop.example.com", c.path, c.response); !reflect.DeepEqual(got, c.want) {
+		if got := headers(c.path, c.response); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s, response %v: Synapse sets %q, want %q", c.path, c.response, got, c.want)
 		}
 	}
 }
 
-// The same file is written for Ingresses, whose headers come from two
-// annotations. Synapse reads a route with request headers and no word on
+// The older modes write a v1 file for Ingresses, whose headers come from two
+// annotations. Synapse reads a v1 route with request headers and no word on
 // response headers as its older single list, and sends them back to the
 // client.
 func TestRenderUpstreams_RequestHeadersAreNotSentBack(t *testing.T) {

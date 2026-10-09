@@ -92,6 +92,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		Client:                r.Client,
 		IngressClassMatch:     func(name string) bool { return bound[name] },
 		UpstreamsOutConfigMap: proxyUpstreamsName(&proxy),
+		UpstreamsV2:           true,
 		CertsOutSecret:        proxyCertsName(&proxy),
 		OwnerRef:              metav1.NewControllerRef(&proxy, synapsev1alpha1.GroupVersion.WithKind("SynapseProxy")),
 		ClusterDomain:         r.ClusterDomain,

@@ -81,7 +81,7 @@ func TestRoutes_RenderFollowsItsInputs(t *testing.T) {
 			return ""
 		})
 	}
-	floor := renderUpstreams(newRenderModel())
+	floor := proxyFloor()
 
 	create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	edge := testProxy(ns, "edge")
@@ -123,7 +123,7 @@ func TestRoutes_RenderFollowsItsInputs(t *testing.T) {
 	// cert-manager issues a certificate. Wait for the render the Ingress
 	// update causes first, so that what follows can only be the Secret's.
 	rendered("the host is bound to its certificate", func(s string) bool {
-		return strings.Contains(s, `certificate: "shop.example.com"`)
+		return strings.Contains(s, `cert: "shop.example.com"`)
 	})
 	projected := func(what, want string) {
 		t.Helper()

@@ -85,6 +85,13 @@ type IngressReconciler struct {
 	// for the long-running sidecar; off for the --render-once
 	// initContainer (synapse isn't running yet).
 	SignalReload bool
+	// UpstreamsV2 has the routes written in Synapse's v2 schema whatever is
+	// in them, saying what the v1 file said (renderModel.sameAsV1). The
+	// older modes go on writing v1 unless a host is passthrough: the
+	// Synapse they run beside may be one that takes a route chosen by an
+	// expression, or a host without a certificate, for an error in a v2
+	// file, and refuses the file.
+	UpstreamsV2 bool
 	// RenderExtra, when set, is called on every render with the routes and
 	// certificates of the Ingresses already in the model, to add its own
 	// before anything is written. It is how a SynapseProxy's Gateways get
@@ -416,7 +423,8 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	// keep emitting v1 so unrelated deployments see zero behaviour
 	// change.
 	var yaml string
-	if len(m.passthroughHosts) > 0 {
+	if r.UpstreamsV2 || len(m.passthroughHosts) > 0 {
+		m.sameAsV1 = r.UpstreamsV2
 		yaml = renderUpstreamsV2(m)
 	} else {
 		yaml = renderUpstreams(m)
