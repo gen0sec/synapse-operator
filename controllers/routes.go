@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -302,6 +303,31 @@ func (m *renderModel) addRegexRoute(host, regex string, servers []backend, a ann
 	m.hosts[host][key] = rc
 	if a.sticky {
 		m.sticky = true
+	}
+	return true
+}
+
+// addExprRoute records a route that Synapse matches by the given expression,
+// under a label that only has to be unique on the host. It is addRegexRoute
+// for an expression that is more than one regular expression on the path.
+func (m *renderModel) addExprRoute(host, label, expr string, servers []backend, extraReq, extraResp []string) bool {
+	if expr == "" || label == "" {
+		return false
+	}
+	if _, claimed := m.passthroughHosts[host]; claimed {
+		return false
+	}
+	if m.hosts[host] == nil {
+		m.hosts[host] = map[string]*routeCfg{}
+	}
+	if _, exists := m.hosts[host][label]; exists {
+		return false
+	}
+	m.hosts[host][label] = &routeCfg{
+		servers:     servers,
+		reqHeaders:  slices.Clone(extraReq),
+		respHeaders: slices.Clone(extraResp),
+		matchExpr:   expr,
 	}
 	return true
 }
