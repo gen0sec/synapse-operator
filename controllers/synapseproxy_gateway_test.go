@@ -4,15 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/util/retry"
@@ -48,7 +53,7 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := SetupProxyControllers(mgr, "cluster.local"); err != nil {
+	if err := SetupProxyControllers(context.Background(), mgr, "cluster.local", ""); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -251,7 +256,40 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		return ""
 	})
 
-	// Somebody else's controller serves the route as well, and says so.
+	// A second proxy serves the route as well, through a Gateway of its
+	// own, and so does somebody else's controller. A route's status is one
+	// list, and all three write to it.
+	other := testProxy(ns, "other")
+	other.UID = ""
+	create(other)
+	otherClass := gwClass(ns+"-other", ns, "other")
+	otherClass.Generation = 0
+	create(&otherClass)
+	side := gateway(apps, "side", httpListener("http", 80, "side.example.com"))
+	side.Generation, side.Spec.GatewayClassName = 0, gwv1.ObjectName(ns+"-other")
+	create(&side)
+	change(t, k8s, &route, func() {
+		route.Spec.ParentRefs = []gwv1.ParentReference{{Namespace: ptr(gwv1.Namespace(ns)), Name: "web"}, {Name: "side"}}
+	})
+	// entry returns what a controller says of the route for one parent.
+	entry := func(controller, parent string) *gwv1.RouteParentStatus {
+		_ = ours()
+		for i := range route.Status.Parents {
+			if p := &route.Status.Parents[i]; string(p.ControllerName) == controller && string(p.ParentRef.Name) == parent {
+				return p
+			}
+		}
+		return nil
+	}
+	eventually(t, "each proxy speaks for its own Gateway", func() string {
+		for _, parent := range []string{"web", "side"} {
+			p := entry(ControllerName, parent)
+			if p == nil || !meta.IsStatusConditionTrue(p.Conditions, "Accepted") {
+				return fmt.Sprintf("for %s the route says %+v", parent, p)
+			}
+		}
+		return ""
+	})
 	theirs := gwv1.RouteParentStatus{
 		ParentRef:      gwv1.ParentReference{Name: "theirs"},
 		ControllerName: "example.com/another",
@@ -259,35 +297,39 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 			Type: "Accepted", Status: metav1.ConditionTrue, Reason: "Accepted", LastTransitionTime: metav1.Now(),
 		}},
 	}
-	// So does another SynapseProxy, through a Gateway of its own: the same
-	// controller name, and not this proxy's entry to touch.
-	anotherProxys := theirs
-	anotherProxys.ParentRef = gwv1.ParentReference{Name: "another-proxys-gateway"}
-	anotherProxys.ControllerName = ControllerName
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	// In the middle of the list, where neither proxy would have put it.
+	changeStatus(t, k8s, &route, func() {
+		route.Status.Parents = slices.Insert(route.Status.Parents, 1, theirs)
+	})
+	order := func() string {
 		_ = ours()
-		route.Status.Parents = append(route.Status.Parents, theirs, anotherProxys)
-		return k8s.Status().Update(ctx, &route)
-	}); err != nil {
-		t.Fatal(err)
+		var names []string
+		for _, p := range route.Status.Parents {
+			names = append(names, string(p.ParentRef.Name))
+		}
+		return strings.Join(names, ",")
+	}
+	// Every proxy looks again, at something that changes nothing for the
+	// route. Each leaves the list as it found it: one that put its own
+	// entries last would have the other do the same, on every pass.
+	listed, version := order(), route.ResourceVersion
+	for i := range 3 {
+		change(t, k8s, far, func() { far.Annotations = map[string]string{"looked-at": strconv.Itoa(i)} })
+		time.Sleep(700 * time.Millisecond)
+	}
+	if now := order(); now != listed || route.ResourceVersion != version {
+		t.Errorf("the route's status was written again with nothing changed: parents %s at %s, were %s at %s",
+			now, route.ResourceVersion, listed, version)
 	}
 
-	// The route leaves the Gateway: its routes go, and so does what was
-	// said of it here. What the other controller said stays.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		_ = ours()
-		route.Spec.ParentRefs = []gwv1.ParentReference{{Name: "theirs"}}
-		return k8s.Update(ctx, &route)
-	}); err != nil {
-		t.Fatal(err)
-	}
+	// The route leaves the first proxy's Gateway: its routes go, and so
+	// does what that proxy said of it. What the others said stays.
+	change(t, k8s, &route, func() {
+		route.Spec.ParentRefs = []gwv1.ParentReference{{Name: "side"}, {Name: "theirs"}}
+	})
 	eventually(t, "a route that left is no longer rendered or spoken for", func() string {
-		if p := ours(); p != nil {
-			return fmt.Sprintf("the route still carries %+v", *p)
-		}
-		if len(route.Status.Parents) != 2 || route.Status.Parents[0].ControllerName != "example.com/another" ||
-			route.Status.Parents[1].ParentRef.Name != "another-proxys-gateway" {
-			return fmt.Sprintf("what the others said of the route is now %+v", route.Status.Parents)
+		if now := order(); now != "theirs,side" {
+			return "the route's parents are " + now
 		}
 		if body := routes(); strings.Contains(body, "moved.example.com") {
 			return "routes are\n" + body
@@ -295,10 +337,145 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		return ""
 	})
 
-	for _, obj := range []client.Object{&route, &gw, &class, edge} {
+	// The other proxy's Gateway is deleted. Nobody has it among their
+	// Gateways any more, and what was said about it would stay for good.
+	if err := k8s.Delete(ctx, &side); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "what was said for a Gateway that is gone is taken back", func() string {
+		if now := order(); now != "theirs" {
+			return "the route's parents are " + now
+		}
+		return ""
+	})
+
+	// A proxy is deleted under its class. Nothing else changes, and there
+	// is no proxy left whose turn it would be to notice: it is noticed
+	// because the proxy went.
+	if err := k8s.Delete(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the class of a proxy that was deleted says it has none", func() string {
+		if err := k8s.Get(ctx, client.ObjectKeyFromObject(&otherClass), &otherClass); err != nil {
+			return err.Error()
+		}
+		if c := meta.FindStatusCondition(otherClass.Status.Conditions, "Accepted"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != "InvalidParameters" {
+			return fmt.Sprintf("the class says %+v", otherClass.Status.Conditions)
+		}
+		return ""
+	})
+
+	// A class is pointed at a proxy that does not exist. Its Gateway is
+	// served by nothing, and would go on saying programmed, at an address.
+	change(t, k8s, &route, func() {
+		route.Spec.ParentRefs = []gwv1.ParentReference{{Namespace: ptr(gwv1.Namespace(ns)), Name: "web"}}
+	})
+	routeIs("the route is back on the first Gateway", "Accepted", metav1.ConditionTrue, "Accepted")
+	rebind("nobody")
+	eventually(t, "what was said of Gateways no proxy serves is taken back", func() string {
+		if p := ours(); p != nil {
+			return fmt.Sprintf("the route still carries %+v", *p)
+		}
+		if err := k8s.Get(ctx, client.ObjectKeyFromObject(&gw), &gw); err != nil {
+			return err.Error()
+		}
+		if c := meta.FindStatusCondition(gw.Status.Conditions, "Programmed"); c == nil || c.Status != metav1.ConditionUnknown {
+			return fmt.Sprintf("the Gateway still says %+v", gw.Status.Conditions)
+		}
+		if len(gw.Status.Addresses) != 0 || len(gw.Status.Listeners) != 0 {
+			return fmt.Sprintf("the Gateway still has addresses %v and listeners %v", gw.Status.Addresses, gw.Status.Listeners)
+		}
+		for _, gc := range []*gwv1.GatewayClass{&class, &otherClass} {
+			if err := k8s.Get(ctx, client.ObjectKeyFromObject(gc), gc); err != nil {
+				return err.Error()
+			}
+			if c := meta.FindStatusCondition(gc.Status.Conditions, "Accepted"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != "InvalidParameters" {
+				return fmt.Sprintf("class %s says %+v", gc.Name, gc.Status.Conditions)
+			}
+		}
+		return ""
+	})
+	rebind("edge")
+	routeIs("a class that names its proxy again is served again", "Accepted", metav1.ConditionTrue, "Accepted")
+
+	for _, obj := range []client.Object{&route, &gw, &class, &otherClass, edge} {
 		if err := k8s.Delete(ctx, obj); err != nil {
 			t.Errorf("delete %T %s: %v", obj, obj.GetName(), err)
 		}
+	}
+}
+
+// The parents of a route are a list that several write to. A proxy's own
+// entries are replaced where they stand.
+func TestRouteParents(t *testing.T) {
+	entry := func(controller, parent, reason string) gwv1.RouteParentStatus {
+		return gwv1.RouteParentStatus{
+			ParentRef: gwv1.ParentReference{Name: gwv1.ObjectName(parent)}, ControllerName: gwv1.GatewayController(controller),
+			Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue, Reason: reason}},
+		}
+	}
+	names := func(ps []gwv1.RouteParentStatus) string {
+		var out []string
+		for _, p := range ps {
+			out = append(out, string(p.ParentRef.Name)+":"+p.Conditions[0].Reason)
+		}
+		return strings.Join(out, " ")
+	}
+	mine := func(parents ...string) func(gwv1.RouteParentStatus) bool {
+		return func(p gwv1.RouteParentStatus) bool {
+			return string(p.ControllerName) == ControllerName && slices.Contains(parents, string(p.ParentRef.Name))
+		}
+	}
+	have := []gwv1.RouteParentStatus{
+		entry(ControllerName, "a", "Old"), entry("example.com/another", "x", "Theirs"),
+		entry(ControllerName, "b", "Other"), entry(ControllerName, "gone", "Old"),
+	}
+	// This proxy has the Gateways a, gone and new; b is another proxy's.
+	got := routeParents(have, []gwv1.RouteParentStatus{entry(ControllerName, "new", "New"), entry(ControllerName, "a", "New")}, mine("a", "gone", "new"))
+	if want := "a:New x:Theirs b:Other new:New"; names(got) != want {
+		t.Errorf("parents are %q, want %q", names(got), want)
+	}
+	// Written by one proxy and then by the other, the list is as it was.
+	again := routeParents(got, []gwv1.RouteParentStatus{entry(ControllerName, "b", "Other")}, mine("b"))
+	if names(again) != names(got) {
+		t.Errorf("the other proxy turns %q into %q", names(got), names(again))
+	}
+	if again := routeParents(again, []gwv1.RouteParentStatus{entry(ControllerName, "new", "New"), entry(ControllerName, "a", "New")}, mine("a", "gone", "new")); names(again) != names(got) {
+		t.Errorf("and the first one turns it into %q", names(again))
+	}
+	if got := routeParents(have, nil, mine("a", "gone", "new")); names(got) != "x:Theirs b:Other" {
+		t.Errorf("with nothing to say, the parents are %q", names(got))
+	}
+}
+
+func TestUnserved(t *testing.T) {
+	classes := []gwv1.GatewayClass{
+		gwClass("served", "edge", "edge"), gwClass("gone", "edge", "nobody"), gwClass("elsewhere", "far", "edge"),
+		// Ours without a proxy to name, and somebody else's: neither is
+		// for a SynapseProxy to serve, and neither is missing one.
+		{ObjectMeta: metav1.ObjectMeta{Name: "bare"}, Spec: gwv1.GatewayClassSpec{ControllerName: ControllerName}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "theirs"}, Spec: gwv1.GatewayClassSpec{ControllerName: "example.com/another"}},
+	}
+	var gateways []gwv1.Gateway
+	for _, class := range []string{"served", "gone", "elsewhere", "bare", "theirs"} {
+		gw := gateway("apps", "of-"+class)
+		gw.Spec.GatewayClassName = gwv1.ObjectName(class)
+		gateways = append(gateways, gw)
+	}
+	live := map[types.NamespacedName]bool{{Namespace: "edge", Name: "edge"}: true}
+
+	orphanClasses, orphanGateways := unserved(classes, gateways, live, "")
+	if got := sortedKeys(orphanClasses); !reflect.DeepEqual(got, []string{"elsewhere", "gone"}) {
+		t.Errorf("classes without a proxy are %v", got)
+	}
+	if got := sortedKeys(orphanGateways); len(got) != 2 || got[0].Name != "of-elsewhere" || got[1].Name != "of-gone" {
+		t.Errorf("Gateways without a proxy are %v", got)
+	}
+	// Limited to a namespace, the operator does not see far/edge whether it
+	// is there or not.
+	orphanClasses, _ = unserved(classes, gateways, live, "edge")
+	if got := sortedKeys(orphanClasses); !reflect.DeepEqual(got, []string{"gone"}) {
+		t.Errorf("limited to a namespace, classes without a proxy are %v", got)
 	}
 }
 
@@ -330,6 +507,16 @@ func TestMergeConditions(t *testing.T) {
 	}
 }
 
+// failingMapper answers every lookup of a kind with err.
+type failingMapper struct {
+	meta.RESTMapper
+	err error
+}
+
+func (f failingMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMapping, error) {
+	return nil, f.err
+}
+
 // Whether the Gateway API is there is asked of the API server in two ways
 // that have to agree: the one the operator uses, and a plain listing of what
 // the server serves. A wrong "no" would be silent twice over: the operator
@@ -355,6 +542,15 @@ func TestGatewayAPIServed(t *testing.T) {
 	want := served(gwv1.GroupName+"/v1", "GatewayClass", "Gateway", "HTTPRoute") && served(gwv1.GroupName+"/v1beta1", "ReferenceGrant")
 	if got := gatewayAPIServed(t); got != want {
 		t.Errorf("GatewayAPIServed = %v, and the API server serves the kinds = %v", got, want)
+	}
+	// Not being able to tell is not a no.
+	unwell := failingMapper{err: apierrors.NewServiceUnavailable("discovery is down")}
+	if served, err := GatewayAPIServed(unwell); served || err == nil {
+		t.Errorf("asked of an API server that cannot answer: served %v, error %v; want an error", served, err)
+	}
+	missing := failingMapper{err: &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: gwv1.GroupName, Kind: "Gateway"}}}
+	if served, err := GatewayAPIServed(missing); served || err != nil {
+		t.Errorf("asked of an API server without the kinds: served %v, error %v; want a plain no", served, err)
 	}
 	// The version the tests are pinned to takes the CRDs. If it does not,
 	// something is wrong with installing them, not with the server.

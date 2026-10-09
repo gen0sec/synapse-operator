@@ -55,6 +55,9 @@ type SynapseRouteReconciler struct {
 	// GatewayAPI says the cluster has the Gateway API kinds, so that the
 	// Gateways handed to a proxy are rendered too; see GatewayAPIServed.
 	GatewayAPI bool
+	// Namespace is the one the operator is limited to, or empty. What it
+	// does not see outside it is not taken for gone.
+	Namespace string
 }
 
 func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -62,13 +65,15 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &proxy); err != nil {
 		if apierrors.IsNotFound(err) {
 			forgetProxyGauges(req.Namespace, req.Name)
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.sweepGateways(ctx)
 		}
 		return ctrl.Result{}, err
 	}
 	if !proxy.DeletionTimestamp.IsZero() {
 		// Both outputs go with the proxy; there is nothing left to render.
-		return ctrl.Result{}, nil
+		// What it said about its Gateways is not owned by it, and stays
+		// until it is taken back.
+		return ctrl.Result{}, r.sweepGateways(ctx)
 	}
 
 	var classes networkingv1.IngressClassList
@@ -130,6 +135,14 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// sweepGateways is sweepGatewayStatuses where the Gateway API is served.
+func (r *SynapseRouteReconciler) sweepGateways(ctx context.Context) error {
+	if !r.GatewayAPI {
+		return nil
+	}
+	return r.sweepGatewayStatuses(ctx)
 }
 
 // boundIngressClasses returns the names of the IngressClasses that hand

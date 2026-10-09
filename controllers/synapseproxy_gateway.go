@@ -22,15 +22,79 @@ import (
 // SynapseProxy's Gateways are read from. They are CRDs, and a cluster may
 // well not have them; a controller that watches a kind that is not there
 // does not start.
-func GatewayAPIServed(mapper meta.RESTMapper) bool {
-	for kind, version := range map[string]string{
-		"GatewayClass": "v1", "Gateway": "v1", "HTTPRoute": "v1", "ReferenceGrant": "v1beta1",
+//
+// Not being able to tell is an error, and not a no: asked while the API
+// server is unwell, a no would leave every Gateway unserved until the
+// operator is next restarted.
+func GatewayAPIServed(mapper meta.RESTMapper) (bool, error) {
+	for _, kind := range []struct{ kind, version string }{
+		{"GatewayClass", "v1"}, {"Gateway", "v1"}, {"HTTPRoute", "v1"}, {"ReferenceGrant", "v1beta1"},
 	} {
-		if _, err := mapper.RESTMapping(schema.GroupKind{Group: gwv1.GroupName, Kind: kind}, version); err != nil {
-			return false
+		_, err := mapper.RESTMapping(schema.GroupKind{Group: gwv1.GroupName, Kind: kind.kind}, kind.version)
+		switch {
+		case err == nil:
+		case meta.IsNoMatchError(err):
+			return false, nil
+		default:
+			return false, fmt.Errorf("look up %s: %w", kind.kind, err)
 		}
 	}
-	return true
+	return true, nil
+}
+
+// CheckGatewayAccess says why Gateways cannot be served as whoever c acts
+// as, or returns nil. It lists one object of each kind the route controller
+// watches for them, in namespace when that is not empty.
+//
+// Like CheckProxyAccess, it is for use before the controllers start: one
+// that may not read a kind it watches never starts, and stops the manager
+// when its cache does not fill. That would take the Ingresses down with the
+// Gateways.
+func CheckGatewayAccess(ctx context.Context, c client.Reader, namespace string) error {
+	for _, list := range []client.ObjectList{&gwv1.GatewayList{}, &gwv1.HTTPRouteList{}, &gwv1beta1.ReferenceGrantList{}} {
+		if err := c.List(ctx, list, client.InNamespace(namespace), client.Limit(1)); err != nil {
+			return fmt.Errorf("list %T: %w", list, err)
+		}
+	}
+	for _, list := range []client.ObjectList{&gwv1.GatewayClassList{}, &corev1.NamespaceList{}} {
+		if err := c.List(ctx, list, client.Limit(1)); err != nil {
+			return fmt.Errorf("list %T: %w", list, err)
+		}
+	}
+	return nil
+}
+
+// gatewayLists lists everything of the kinds a Gateway translation reads,
+// and every SynapseProxy.
+func (r *SynapseRouteReconciler) gatewayLists(ctx context.Context) (gatewayInputs, error) {
+	in := gatewayInputs{
+		clusterDomain: r.ClusterDomain, namespaces: map[string]map[string]string{},
+		live: map[types.NamespacedName]bool{}, scope: r.Namespace,
+	}
+	var (
+		classes    gwv1.GatewayClassList
+		gateways   gwv1.GatewayList
+		routes     gwv1.HTTPRouteList
+		grants     gwv1beta1.ReferenceGrantList
+		namespaces corev1.NamespaceList
+		proxies    synapsev1alpha1.SynapseProxyList
+	)
+	for _, list := range []client.ObjectList{&classes, &gateways, &routes, &grants, &namespaces, &proxies} {
+		if err := r.List(ctx, list); err != nil {
+			return in, fmt.Errorf("list %T: %w", list, err)
+		}
+	}
+	in.classes, in.gateways, in.routes, in.grants = classes.Items, gateways.Items, routes.Items, grants.Items
+	for i := range namespaces.Items {
+		in.namespaces[namespaces.Items[i].Name] = namespaces.Items[i].Labels
+	}
+	for i := range proxies.Items {
+		// One that is going renders nothing more.
+		if proxies.Items[i].DeletionTimestamp.IsZero() {
+			in.live[client.ObjectKeyFromObject(&proxies.Items[i])] = true
+		}
+	}
+	return in, nil
 }
 
 // gatewayInputs lists everything the translation of proxy's Gateways reads.
@@ -38,23 +102,11 @@ func GatewayAPIServed(mapper meta.RESTMapper) bool {
 // the object not being there: what was translated with it is not to be
 // trusted, and has to be done again.
 func (r *SynapseRouteReconciler) gatewayInputs(ctx context.Context, proxy *synapsev1alpha1.SynapseProxy) (gatewayInputs, func() error, error) {
-	in := gatewayInputs{proxy: proxy, clusterDomain: r.ClusterDomain, namespaces: map[string]map[string]string{}}
-	var (
-		classes    gwv1.GatewayClassList
-		gateways   gwv1.GatewayList
-		routes     gwv1.HTTPRouteList
-		grants     gwv1beta1.ReferenceGrantList
-		namespaces corev1.NamespaceList
-	)
-	for _, list := range []client.ObjectList{&classes, &gateways, &routes, &grants, &namespaces} {
-		if err := r.List(ctx, list); err != nil {
-			return in, nil, fmt.Errorf("list %T: %w", list, err)
-		}
+	in, err := r.gatewayLists(ctx)
+	if err != nil {
+		return in, nil, err
 	}
-	in.classes, in.gateways, in.routes, in.grants = classes.Items, gateways.Items, routes.Items, grants.Items
-	for i := range namespaces.Items {
-		in.namespaces[namespaces.Items[i].Name] = namespaces.Items[i].Labels
-	}
+	in.proxy = proxy
 
 	var failed error
 	get := func(namespace, name string, into client.Object) bool {
@@ -104,17 +156,64 @@ func mergeConditions(have, want []metav1.Condition) []metav1.Condition {
 	return out
 }
 
+// routeParents returns the parents a route's status should list: the ones
+// it lists, with those that are this proxy's to write (mine) replaced by
+// want, each where it stood, and the rest of want after them. One of mine
+// that want does not name is of an earlier state, and goes.
+//
+// Where it stood, because the list is shared. Two proxies that each moved
+// their own entries to the end would find the other's order wrong on every
+// pass, and write the route for ever.
+func routeParents(have, want []gwv1.RouteParentStatus, mine func(gwv1.RouteParentStatus) bool) []gwv1.RouteParentStatus {
+	placed := make([]bool, len(want))
+	var out []gwv1.RouteParentStatus
+	for _, p := range have {
+		if !mine(p) {
+			out = append(out, p)
+			continue
+		}
+		for i := range want {
+			if !placed[i] && apiequality.Semantic.DeepEqual(want[i].ParentRef, p.ParentRef) {
+				placed[i] = true
+				w := want[i]
+				w.Conditions = mergeConditions(p.Conditions, w.Conditions)
+				out = append(out, w)
+				break
+			}
+		}
+	}
+	for i := range want {
+		if !placed[i] {
+			w := want[i]
+			w.Conditions = mergeConditions(nil, w.Conditions)
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // writeGatewayStatuses records what the translation found on the objects it
 // was about, and writes only those whose status that changes.
+//
+// It also takes back what was written about objects no proxy serves any
+// more: a class that names a SynapseProxy that is gone, the Gateways of such
+// a class, and a route's entry for a Gateway that is one of those or is
+// gone itself. Left alone they would go on saying programmed, with the
+// address of a proxy that is not there. With st empty that is all it does.
 //
 // A route's status is a list with an entry for each parent, and other
 // controllers write theirs to it; so do other proxies of this one. An entry
 // is this proxy's when it is ours and its parent is one of this proxy's
 // Gateways, and those are the entries replaced, or removed.
 func (r *SynapseRouteReconciler) writeGatewayStatuses(ctx context.Context, in gatewayInputs, st gatewayStatuses) error {
+	orphanClasses, orphanGateways := unserved(in.classes, in.gateways, in.live, in.scope)
 	for i := range in.classes {
 		gc := &in.classes[i]
 		want, ok := st.classes[gc.Name]
+		if named, orphan := orphanClasses[gc.Name]; orphan {
+			want, ok = []metav1.Condition{condition(string(gwv1.GatewayClassConditionStatusAccepted), false,
+				string(gwv1.GatewayClassReasonInvalidParameters), "there is no SynapseProxy "+named.String(), gc.Generation)}, true
+		}
 		if !ok {
 			continue
 		}
@@ -129,9 +228,20 @@ func (r *SynapseRouteReconciler) writeGatewayStatuses(ctx context.Context, in ga
 		}
 	}
 
+	exists := map[types.NamespacedName]bool{}
 	for i := range in.gateways {
 		gw := &in.gateways[i]
-		want, ok := st.gateways[client.ObjectKeyFromObject(gw)]
+		key := client.ObjectKeyFromObject(gw)
+		exists[key] = true
+		want, ok := st.gateways[key]
+		if orphanGateways[key] {
+			// As a Gateway is before any controller has looked at it.
+			const message = "its GatewayClass names a SynapseProxy that does not exist"
+			want, ok = gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				{Type: string(gwv1.GatewayConditionAccepted), Status: metav1.ConditionUnknown, Reason: string(gwv1.GatewayReasonPending), Message: message, ObservedGeneration: gw.Generation},
+				{Type: string(gwv1.GatewayConditionProgrammed), Status: metav1.ConditionUnknown, Reason: string(gwv1.GatewayReasonPending), Message: message, ObservedGeneration: gw.Generation},
+			}}, true
+		}
 		if !ok {
 			continue
 		}
@@ -157,25 +267,17 @@ func (r *SynapseRouteReconciler) writeGatewayStatuses(ctx context.Context, in ga
 
 	for i := range in.routes {
 		rt := &in.routes[i]
-		var parents []gwv1.RouteParentStatus
-		for _, p := range rt.Status.Parents {
+		mine := func(p gwv1.RouteParentStatus) bool {
 			gwKey, isGateway := parentGateway(rt, p.ParentRef)
+			if string(p.ControllerName) != ControllerName || !isGateway {
+				return false
+			}
 			_, thisProxys := st.gateways[gwKey]
-			if string(p.ControllerName) == ControllerName && isGateway && thisProxys {
-				continue
-			}
-			parents = append(parents, p)
+			// One that is not there, where this operator would see it.
+			gone := !exists[gwKey] && (in.scope == "" || gwKey.Namespace == in.scope)
+			return thisProxys || orphanGateways[gwKey] || gone
 		}
-		for _, p := range st.routes[client.ObjectKeyFromObject(rt)] {
-			var have []metav1.Condition
-			for _, old := range rt.Status.Parents {
-				if string(old.ControllerName) == ControllerName && apiequality.Semantic.DeepEqual(old.ParentRef, p.ParentRef) {
-					have = old.Conditions
-				}
-			}
-			p.Conditions = mergeConditions(have, p.Conditions)
-			parents = append(parents, p)
-		}
+		parents := routeParents(rt.Status.Parents, st.routes[client.ObjectKeyFromObject(rt)], mine)
 		if apiequality.Semantic.DeepEqual(rt.Status.Parents, parents) || (len(rt.Status.Parents) == 0 && len(parents) == 0) {
 			continue
 		}
@@ -186,4 +288,15 @@ func (r *SynapseRouteReconciler) writeGatewayStatuses(ctx context.Context, in ga
 		}
 	}
 	return nil
+}
+
+// sweepGatewayStatuses takes back the statuses of what no proxy serves any
+// more, when there is no proxy to do it while writing its own: the one this
+// was about has just gone.
+func (r *SynapseRouteReconciler) sweepGatewayStatuses(ctx context.Context) error {
+	in, err := r.gatewayLists(ctx)
+	if err != nil {
+		return err
+	}
+	return r.writeGatewayStatuses(ctx, in, gatewayStatuses{})
 }

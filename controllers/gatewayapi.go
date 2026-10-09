@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
@@ -29,13 +30,19 @@ import (
 // cannot be is said in the object's status. Nothing is served more broadly
 // than written, and nothing is dropped without a condition saying so. Synapse
 // routes on host, path and method; a match on a header or a query parameter,
-// and any filter but setting or adding a header, has nowhere to go yet.
+// and any filter but setting a header, has nowhere to go yet.
 //
-// Two things follow from how Synapse routes, and are not per the API:
+// What cannot be done is one of two things; see rules. A rule that cannot be
+// carried out keeps its requests, which are then answered with an error. A
+// match that cannot be evaluated is left out.
+//
+// These follow from how Synapse routes, and are not per the API:
 //   - Routes belong to a host, not to a listener. One attached to a single
 //     listener of a Gateway is served on every listener of the proxy.
 //   - There is no host that stands for every other. A route has to end up
 //     with a host name, its own or its listener's.
+//   - A host is written as plain paths or as expressions, and what it can
+//     carry depends on which; see emitGatewayMatches.
 
 // gatewayInputs is what one translation reads: everything of the kinds
 // involved, as listed, and lookups for what is referred to by name.
@@ -54,6 +61,11 @@ type gatewayInputs struct {
 	// addresses is where the proxy is reached.
 	addresses     []string
 	clusterDomain string
+	// live holds every SynapseProxy there is, and scope the namespace the
+	// operator is limited to, or "". The translation reads neither; they
+	// are for telling what of ours nothing serves any more.
+	live  map[types.NamespacedName]bool
+	scope string
 }
 
 // gatewayStatuses is what the translation found out about each object, in
@@ -79,22 +91,53 @@ const (
 func boundGatewayClasses(classes []gwv1.GatewayClass, proxy *synapsev1alpha1.SynapseProxy) map[string]bool {
 	bound := map[string]bool{}
 	for i := range classes {
-		gc := &classes[i]
-		p := gc.Spec.ParametersRef
-		if string(gc.Spec.ControllerName) != ControllerName || p == nil {
-			continue
+		if named, ok := classProxy(&classes[i]); ok && named == client.ObjectKeyFromObject(proxy) {
+			bound[classes[i].Name] = true
 		}
-		if string(p.Group) != synapsev1alpha1.GroupVersion.Group || string(p.Kind) != "SynapseProxy" {
-			continue
-		}
-		// A SynapseProxy is namespaced; a reference without a namespace
-		// names none.
-		if p.Namespace == nil || string(*p.Namespace) != proxy.Namespace || p.Name != proxy.Name {
-			continue
-		}
-		bound[gc.Name] = true
 	}
 	return bound
+}
+
+// classProxy returns the SynapseProxy a GatewayClass hands its Gateways to,
+// and false for a class that is not ours or names none.
+func classProxy(gc *gwv1.GatewayClass) (types.NamespacedName, bool) {
+	p := gc.Spec.ParametersRef
+	if string(gc.Spec.ControllerName) != ControllerName || p == nil {
+		return types.NamespacedName{}, false
+	}
+	if string(p.Group) != synapsev1alpha1.GroupVersion.Group || string(p.Kind) != "SynapseProxy" {
+		return types.NamespacedName{}, false
+	}
+	// A SynapseProxy is namespaced; a reference without a namespace names
+	// none.
+	if p.Namespace == nil {
+		return types.NamespacedName{}, false
+	}
+	return types.NamespacedName{Namespace: string(*p.Namespace), Name: p.Name}, true
+}
+
+// unserved returns what of ours no proxy serves: the classes that name a
+// SynapseProxy that is not there, each with the name it gives, and the
+// Gateways of those classes. Their status was written while a proxy served
+// them, and nothing else will take it back.
+//
+// An operator limited to a namespace (scope) sees the proxies of that one
+// only. A proxy it does not see elsewhere is not one that is gone.
+func unserved(classes []gwv1.GatewayClass, gateways []gwv1.Gateway, live map[types.NamespacedName]bool, scope string) (map[string]types.NamespacedName, map[types.NamespacedName]bool) {
+	orphanClasses := map[string]types.NamespacedName{}
+	for i := range classes {
+		named, ok := classProxy(&classes[i])
+		if ok && !live[named] && (scope == "" || named.Namespace == scope) {
+			orphanClasses[classes[i].Name] = named
+		}
+	}
+	orphanGateways := map[types.NamespacedName]bool{}
+	for i := range gateways {
+		if _, orphan := orphanClasses[string(gateways[i].Spec.GatewayClassName)]; orphan {
+			orphanGateways[client.ObjectKeyFromObject(&gateways[i])] = true
+		}
+	}
+	return orphanClasses, orphanGateways
 }
 
 func condition(kind string, ok bool, reason, message string, generation int64) metav1.Condition {
@@ -116,14 +159,21 @@ type gwListener struct {
 
 // gwMatch is one way a request can match one rule, on one host.
 type gwMatch struct {
-	host   string
-	kind   gwv1.PathMatchType
-	value  string
+	host  string
+	kind  gwv1.PathMatchType
+	value string
+	// regex is a regular expression's value as it is written for Synapse.
+	regex  string
 	method string
 
+	// refused says the rule cannot be carried out. The match takes its
+	// place among the host's, and no route is written for it.
+	refused     bool
 	servers     []backend
 	reqHeaders  []string
 	respHeaders []string
+	// what names the match in a message: "rule 0, match 1".
+	what string
 
 	// For telling apart two matches that are equally specific: the older
 	// route wins, then the one that sorts first by name, then the order
@@ -179,14 +229,27 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 	listenerConditions := map[*gwListener][]metav1.Condition{}
 	for _, key := range sortedKeys(gateways) {
 		gw := gateways[key]
+		_, refusal := gatewayProblem(gw)
 		for _, l := range listeners[key] {
-			l.usable, listenerConditions[l] = in.listener(gw, l, m)
+			l.usable, listenerConditions[l] = in.listener(gw, l, m, refusal)
 			if l.spec.Hostname != nil {
 				l.hostname = strings.ToLower(string(*l.spec.Hostname))
 			}
 		}
 	}
 
+	// What a route's rules come to is known once every route's matches on
+	// a host are seen together, so the routes are gone through twice.
+	type attached struct {
+		rt        *gwv1.HTTPRoute
+		parents   []gwv1.RouteParentStatus
+		accepted  []int
+		hosts     int
+		conflicts []string
+		partial   []string
+		rules     ruleSet
+	}
+	var all []attached
 	// In any order: the matches are put in theirs when they are emitted.
 	var matches []gwMatch
 	for i := range in.routes {
@@ -194,6 +257,7 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		var parents []gwv1.RouteParentStatus
 		hosts := map[string]bool{}
 		var accepted []int
+		var partial []string
 		for _, ref := range rt.Spec.ParentRefs {
 			gwKey, ok := parentGateway(rt, ref)
 			if !ok || gateways[gwKey] == nil {
@@ -206,6 +270,9 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 			if attach.reason == "" {
 				accepted = append(accepted, len(parents))
 			}
+			if attach.note != "" && !slices.Contains(partial, attach.note) {
+				partial = append(partial, attach.note)
+			}
 			parents = append(parents, gwv1.RouteParentStatus{
 				ParentRef:      ref,
 				ControllerName: gwv1.GatewayController(ControllerName),
@@ -216,7 +283,6 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		if len(parents) == 0 {
 			continue
 		}
-		key := types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}
 
 		// Hosts an Ingress already routes are not this route's to take.
 		var conflicts []string
@@ -228,23 +294,30 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		}
 		rules := in.rules(rt, sortedKeys(hosts))
 		matches = append(matches, rules.matches...)
+		all = append(all, attached{rt: rt, parents: parents, accepted: accepted, hosts: len(hosts), conflicts: conflicts, partial: partial, rules: rules})
+	}
+	done := emitGatewayMatches(m, matches)
 
-		for _, n := range accepted {
+	for _, a := range all {
+		rt, parents, rules := a.rt, a.parents, a.rules
+		key := types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}
+		notes := slices.Concat(rules.unsupported, done.notes[key], a.partial)
+		for _, n := range a.accepted {
 			p := &parents[n]
 			switch {
-			case len(hosts) == 0:
+			case a.hosts == 0:
 				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, reasonHostnameConflict,
-					"already routed by an Ingress: "+strings.Join(conflicts, ", "), rt.Generation)
-			case len(rules.matches) == 0 && len(rules.unsupported) > 0:
+					"already routed by an Ingress: "+strings.Join(a.conflicts, ", "), rt.Generation)
+			case done.served[key] == 0 && len(notes) > 0:
 				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, string(gwv1.RouteReasonUnsupportedValue),
-					strings.Join(rules.unsupported, "; "), rt.Generation)
-			case len(rules.unsupported) > 0 || len(conflicts) > 0:
-				notes := rules.unsupported
-				if len(conflicts) > 0 {
-					notes = append(slices.Clone(notes), "already routed by an Ingress: "+strings.Join(conflicts, ", "))
+					strings.Join(notes, "; "), rt.Generation)
+			case len(notes) > 0 || len(a.conflicts) > 0:
+				said := notes
+				if len(a.conflicts) > 0 {
+					said = append(slices.Clone(said), "already routed by an Ingress: "+strings.Join(a.conflicts, ", "))
 				}
 				p.Conditions = append(p.Conditions, condition(string(gwv1.RouteConditionPartiallyInvalid), true,
-					string(gwv1.RouteReasonUnsupportedValue), "not programmed: "+strings.Join(notes, "; "), rt.Generation))
+					string(gwv1.RouteReasonUnsupportedValue), "not programmed: "+strings.Join(said, "; "), rt.Generation))
 			}
 		}
 		for n := range parents {
@@ -254,7 +327,6 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		}
 		out.routes[key] = parents
 	}
-	emitGatewayMatches(m, matches)
 
 	for _, key := range sortedKeys(gateways) {
 		gw := gateways[key]
@@ -271,7 +343,11 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 				Conditions:     listenerConditions[l],
 			})
 		}
+		reason, refusal := gatewayProblem(gw)
 		switch {
+		case refusal != "":
+			status.Conditions = append(status.Conditions, condition(string(gwv1.GatewayConditionAccepted), false,
+				string(reason), refusal, gw.Generation))
 		case usable == 0:
 			status.Conditions = append(status.Conditions, condition(string(gwv1.GatewayConditionAccepted), false,
 				string(gwv1.GatewayReasonListenersNotValid), "the proxy can serve none of the listeners", gw.Generation))
@@ -320,7 +396,10 @@ func sortedKeys[K comparable, V any](m map[K]V) []K {
 // listener says whether the proxy can serve a Gateway's listener, with the
 // conditions that go into its status. A usable HTTPS listener's certificates
 // are added to m.
-func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel) (bool, []metav1.Condition) {
+//
+// refusal is what the Gateway as a whole asks for that is not done, when
+// there is such a thing: none of its listeners is then served.
+func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel, refusal string) (bool, []metav1.Condition) {
 	spec := l.spec
 	refs := condition(string(gwv1.ListenerConditionResolvedRefs), true, string(gwv1.ListenerReasonResolvedRefs), "nothing is missing", gw.Generation)
 	// finish puts the three conditions together. A listener is programmed
@@ -336,6 +415,9 @@ func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel
 		return usable, []metav1.Condition{accepted, refs, programmed}
 	}
 
+	if refusal != "" {
+		return finish(gwv1.ListenerReasonUnsupportedValue, "the Gateway is not served: "+refusal, false)
+	}
 	var want string
 	switch spec.Protocol {
 	case gwv1.HTTPProtocolType:
@@ -352,6 +434,15 @@ func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel
 	}
 	if spec.TLS != nil && spec.TLS.Mode != nil && *spec.TLS.Mode != gwv1.TLSModeTerminate {
 		return finish(gwv1.ListenerReasonUnsupportedValue, "TLS is terminated at the proxy; passing it through is not served", false)
+	}
+	// Neither is something to leave out quietly: a listener that was to
+	// ask clients for a certificate and does not is open to everyone.
+	if spec.TLS != nil && len(spec.TLS.Options) > 0 {
+		return finish(gwv1.ListenerReasonUnsupportedValue, "TLS options are not supported", false)
+	}
+	if spec.Protocol == gwv1.HTTPSProtocolType && asksForClientCertificates(gw) {
+		return finish(gwv1.ListenerReasonUnsupportedValue,
+			"the Gateway asks for client certificates (spec.tls.frontend), and the proxy validates none", false)
 	}
 	// Reported, and no more: the HTTPRoutes it also allows still attach.
 	if kinds := allowedKinds(spec); kinds != "" {
@@ -405,6 +496,31 @@ func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel
 		}
 	}
 	return finish(gwv1.ListenerReasonAccepted, "served by the proxy", false)
+}
+
+// gatewayProblem returns what a Gateway asks for that is not done and that
+// all of it depends on, as the reason and the message of its Accepted
+// condition; or two empty strings.
+func gatewayProblem(gw *gwv1.Gateway) (gwv1.GatewayConditionReason, string) {
+	switch spec := gw.Spec; {
+	case len(spec.Addresses) > 0:
+		return gwv1.GatewayReasonUnsupportedAddress, "spec.addresses is not supported: the addresses are those of the proxy's Service"
+	case spec.Infrastructure != nil && spec.Infrastructure.ParametersRef != nil:
+		return gwv1.GatewayReasonInvalidParameters, "spec.infrastructure.parametersRef is not supported: the proxy is configured by its SynapseProxy"
+	case spec.TLS != nil && spec.TLS.Backend != nil && spec.TLS.Backend.ClientCertificateRef != nil:
+		return gwv1.GatewayReasonInvalid, "spec.tls.backend is not supported: the proxy presents no certificate to a backend"
+	}
+	return "", ""
+}
+
+// asksForClientCertificates reports whether a Gateway wants the clients of
+// its HTTPS listeners, of any of them, to present a certificate.
+func asksForClientCertificates(gw *gwv1.Gateway) bool {
+	if gw.Spec.TLS == nil || gw.Spec.TLS.Frontend == nil {
+		return false
+	}
+	f := gw.Spec.TLS.Frontend
+	return f.Default.Validation != nil || slices.ContainsFunc(f.PerPort, func(p gwv1.TLSPortConfig) bool { return p.TLS.Validation != nil })
 }
 
 // allowedKinds returns what is wrong with the kinds of route a listener says
@@ -464,6 +580,8 @@ func parentGateway(rt *gwv1.HTTPRoute, ref gwv1.ParentReference) (types.Namespac
 type attachment struct {
 	hosts           map[string]bool
 	reason, message string
+	// note is what of the attachment is not served, when part of it is.
+	note string
 }
 
 // attach works out which listeners of a Gateway a route attaches to through
@@ -515,11 +633,14 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 			a.hosts[h] = true
 		}
 	}
+	const noHost = "neither the route nor its listener names a host, and Synapse routes by host name"
 	switch {
+	case len(a.hosts) > 0 && everyHost:
+		a.note = "not served on a listener that names no host: " + noHost
 	case len(a.hosts) > 0:
 	case everyHost:
 		a.reason = string(gwv1.RouteReasonUnsupportedValue)
-		a.message = "neither the route nor its listener names a host, and Synapse routes by host name"
+		a.message = noHost
 	default:
 		a.reason = string(gwv1.RouteReasonNoMatchingListenerHostname)
 		a.message = "none of the route's hostnames is one a listener serves"
@@ -588,14 +709,26 @@ func hostIntersection(listener, route string) string {
 // ruleSet is what a route's rules come to on the hosts it attached with.
 type ruleSet struct {
 	matches []gwMatch
-	// unsupported says, for everything left out, what and why.
+	// unsupported says, for everything that is not served, what and why.
 	unsupported []string
 	// refReason is why a backend could not be used, when one could not.
 	refReason, refMessage string
 }
 
-// rules turns a route's rules into matches on each of its hosts. A match or
-// a rule that cannot be honoured exactly is left out, and named.
+// rules turns a route's rules into matches on each of its hosts.
+//
+// Two things can be wrong, and they are not treated alike.
+//
+// A rule the proxy cannot carry out — a filter it does not have, a backend
+// that cannot be used — keeps its matches. Its requests are its own: the
+// API has them answered with an error, not served by whichever other rule
+// also matches them. The matches are marked refused, take their place among
+// the host's, and no route is written for them.
+//
+// A match the proxy cannot evaluate, on a header or a query parameter, is
+// left out, and what it would have matched is served as if it were not
+// there. There is no way to hold its place without holding more than it
+// asked for.
 func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 	var set ruleSet
 	position := 0
@@ -614,28 +747,25 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 		case rule.SessionPersistence != nil:
 			problem = "session persistence is not supported"
 		}
+		var servers []backend
+		if problem == "" {
+			// With none and no problem, its backends could not be used,
+			// or are to get no traffic. Which is in set.refReason.
+			servers, problem = in.backends(rt, rule, &set)
+		}
 		if problem != "" {
 			set.unsupported = append(set.unsupported, what+": "+problem)
-			continue
 		}
-		servers, problem := in.backends(rt, rule, &set)
-		if problem != "" {
-			set.unsupported = append(set.unsupported, what+": "+problem)
-			continue
-		}
-		if len(servers) == 0 {
-			// Its backends could not be used, or are to get no traffic.
-			// What was wrong with them is in set.refReason.
-			continue
-		}
+		refused := problem != "" || len(servers) == 0
 
 		ruleMatches := rule.Matches
 		if len(ruleMatches) == 0 {
 			ruleMatches = []gwv1.HTTPRouteMatch{{}}
 		}
 		for mi, mt := range ruleMatches {
+			where := fmt.Sprintf("%s, match %d", what, mi)
 			if len(mt.Headers) > 0 || len(mt.QueryParams) > 0 {
-				set.unsupported = append(set.unsupported, fmt.Sprintf("%s, match %d: matching on a header or a query parameter is not supported", what, mi))
+				set.unsupported = append(set.unsupported, where+": matching on a header or a query parameter is not supported")
 				continue
 			}
 			kind, value := gwv1.PathMatchPathPrefix, "/"
@@ -647,9 +777,11 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 					value = *mt.Path.Value
 				}
 			}
+			written := ""
 			if kind == gwv1.PathMatchRegularExpression {
-				if _, err := regexp.Compile(value); err != nil {
-					set.unsupported = append(set.unsupported, fmt.Sprintf("%s, match %d: %q is not a regular expression", what, mi, value))
+				var err error
+				if written, err = canonicalRegex(value); err != nil {
+					set.unsupported = append(set.unsupported, fmt.Sprintf("%s: %q cannot be used as a regular expression: %v", where, value, err))
 					continue
 				}
 			}
@@ -659,8 +791,8 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 			}
 			for _, host := range hosts {
 				set.matches = append(set.matches, gwMatch{
-					host: host, kind: kind, value: value, method: method,
-					servers: servers, reqHeaders: req, respHeaders: resp,
+					host: host, kind: kind, value: value, regex: written, method: method,
+					refused: refused, servers: servers, reqHeaders: req, respHeaders: resp, what: where,
 					created: rt.CreationTimestamp, route: types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}, position: position,
 				})
 			}
@@ -670,18 +802,23 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 	return set
 }
 
-// headerModifiers returns the headers a rule's filters set or add, as the
+// headerModifiers returns the headers a rule's filters set, as the
 // "Name: value" lines Synapse takes, or what in the filters cannot be done.
+//
+// Synapse replaces a header's value. That is what `set` asks for. `add`
+// asks for a value beside the ones a header has, and would lose them.
 func headerModifiers(filters []gwv1.HTTPRouteFilter) (req, resp []string, problem string) {
 	lines := func(f *gwv1.HTTPHeaderFilter) ([]string, string) {
-		if f == nil {
+		switch {
+		case f == nil:
 			return nil, ""
-		}
-		if len(f.Remove) > 0 {
+		case len(f.Remove) > 0:
 			return nil, "removing a header is not supported"
+		case len(f.Add) > 0:
+			return nil, "adding to a header is not supported; set replaces its value"
 		}
 		var out []string
-		for _, h := range append(slices.Clone(f.Set), f.Add...) {
+		for _, h := range f.Set {
 			out = append(out, fmt.Sprintf("%s: %s", h.Name, h.Value))
 		}
 		return out, ""
@@ -706,15 +843,20 @@ func headerModifiers(filters []gwv1.HTTPRouteFilter) (req, resp []string, proble
 }
 
 // backends resolves a rule's backendRefs to the servers its requests go to.
-// One that cannot be used is left out, and why is recorded in set; the rule
-// may be left with none. A rule that asks for something unsupported is a
-// problem, which is returned.
+//
+// It returns none when one of them cannot be used, and records why in set.
+// The API has the share of requests that would have gone to that one
+// answered with an error. Synapse has no way to fail a share of them, and
+// sending them to the others gives those backends traffic nobody asked them
+// to take; so the rule is not served. A rule that asks for something
+// unsupported is a problem, which is returned.
 func (in gatewayInputs) backends(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule, set *ruleSet) ([]backend, string) {
 	if len(rule.BackendRefs) == 0 {
 		return nil, "it has no backend"
 	}
 	weighted := slices.ContainsFunc(rule.BackendRefs, func(b gwv1.HTTPBackendRef) bool { return b.Weight != nil })
 	var servers []backend
+	unusable := false
 	for _, br := range rule.BackendRefs {
 		if len(br.Filters) > 0 {
 			return nil, "filters on a backend are not supported"
@@ -741,8 +883,9 @@ func (in gatewayInputs) backends(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule, se
 		}
 		if reason != "" {
 			if set.refReason == "" {
-				set.refReason, set.refMessage = string(reason), message
+				set.refReason, set.refMessage = string(reason), message+"; the rule that names it is not served"
 			}
+			unusable = true
 			continue
 		}
 		// A cluster IP when there is one: Synapse then has no name to look
@@ -763,6 +906,9 @@ func (in gatewayInputs) backends(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule, se
 			b.weight = uint32(weight)
 		}
 		servers = append(servers, b)
+	}
+	if unusable {
+		return nil, ""
 	}
 	return servers, ""
 }
@@ -797,21 +943,56 @@ func (a gwMatch) rank(b gwMatch) int {
 	)
 }
 
+// overlaps reports whether some request can match both a and b. It may say
+// yes when there is none, never no when there is one: what a regular
+// expression matches is not worked out.
+func (a gwMatch) overlaps(b gwMatch) bool {
+	if a.method != "" && b.method != "" && a.method != b.method {
+		return false
+	}
+	// under reports whether path is the prefix or below it.
+	under := func(path, prefix string) bool {
+		p := strings.TrimRight(prefix, "/")
+		return path == p || strings.HasPrefix(path, p+"/")
+	}
+	exactA, exactB := a.kind == gwv1.PathMatchExact, b.kind == gwv1.PathMatchExact
+	switch {
+	case a.kind == gwv1.PathMatchRegularExpression || b.kind == gwv1.PathMatchRegularExpression:
+		return true
+	case exactA && exactB:
+		return a.value == b.value
+	case exactA:
+		return under(a.value, b.value)
+	case exactB:
+		return under(b.value, a.value)
+	}
+	return under(strings.TrimRight(a.value, "/"), b.value) || under(strings.TrimRight(b.value, "/"), a.value)
+}
+
+// plain reports whether the match is one Synapse's plain paths express: a
+// path prefix, any method, with somewhere to send the request.
+func (a gwMatch) plain() bool {
+	return a.kind == gwv1.PathMatchPathPrefix && a.method == "" && !a.refused
+}
+
 // expression is the match as Synapse evaluates it.
 func (a gwMatch) expression() string {
 	var parts []string
 	switch a.kind {
 	case gwv1.PathMatchExact:
-		parts = append(parts, fmt.Sprintf("http.request.path eq %q", a.value))
+		parts = append(parts, "http.request.path eq "+wfString(a.value))
 	case gwv1.PathMatchRegularExpression:
-		parts = append(parts, pathRegexExpr(a.value))
+		// In a group, or the anchor would hold for the first alternative
+		// only and `/a|/b` would match every path with /b in it.
+		parts = append(parts, "http.request.path matches "+wfRegex("^(?:"+a.regex+")"))
 	default:
 		if p := strings.TrimRight(a.value, "/"); p != "" {
-			parts = append(parts, fmt.Sprintf("(http.request.path eq %q or http.request.path matches %q)", p, "^"+regexp.QuoteMeta(p)+"/"))
+			parts = append(parts, fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
+				wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/")))
 		}
 	}
 	if a.method != "" {
-		parts = append(parts, fmt.Sprintf("http.request.method eq %q", a.method))
+		parts = append(parts, "http.request.method eq "+wfString(a.method))
 	}
 	if len(parts) == 0 {
 		// Every request. An expression has to say something.
@@ -820,15 +1001,36 @@ func (a gwMatch) expression() string {
 	return strings.Join(parts, " and ")
 }
 
+// emitted is what became of the matches once each host's were seen
+// together: how many of a route's are served, and what is not and why.
+type emitted struct {
+	served map[types.NamespacedName]int
+	notes  map[types.NamespacedName][]string
+}
+
 // emitGatewayMatches adds the matches to m, host by host.
 //
 // A host with nothing but path prefixes is written as plain paths, which
 // Synapse resolves by the longest one: what the API asks. On any other host
 // every match becomes an expression, and each excludes those ranked above
-// it. Synapse tries a host's expressions in no order one can rely on, and
-// before its plain paths; made exclusive, at most one of them is true for a
-// request, and it is the one the API says wins.
-func emitGatewayMatches(m *renderModel, matches []gwMatch) {
+// it that a request could match as well. Synapse tries a host's expressions
+// in no order one can rely on, and before its plain paths; made exclusive,
+// at most one of them is true for a request, and it is the one the API says
+// wins. A refused match is excluded like any other, and has no route.
+//
+// What a host can carry depends on how it is written, and that is decided
+// here, with every route's matches on it in view:
+//   - Synapse finds a route's headers by the request's path, among the
+//     plain paths. An expression's are never found. So on a host written as
+//     expressions a rule that sets headers cannot be carried out.
+//   - Synapse up to 0.8.7 does not try the expressions of a wildcard host.
+//     Such a host is written as plain paths, and a match those cannot
+//     express is left out.
+func emitGatewayMatches(m *renderModel, matches []gwMatch) emitted {
+	out := emitted{served: map[types.NamespacedName]int{}, notes: map[types.NamespacedName][]string{}}
+	note := func(mt gwMatch, why string) {
+		out.notes[mt.route] = append(out.notes[mt.route], fmt.Sprintf("%s on %s: %s", mt.what, mt.host, why))
+	}
 	byHost := map[string][]gwMatch{}
 	for _, mt := range matches {
 		byHost[mt.host] = append(byHost[mt.host], mt)
@@ -836,23 +1038,57 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) {
 	for _, host := range sortedKeys(byHost) {
 		ms := byHost[host]
 		slices.SortStableFunc(ms, gwMatch.rank)
-		plain := !slices.ContainsFunc(ms, func(mt gwMatch) bool { return mt.kind != gwv1.PathMatchPathPrefix || mt.method != "" })
-		var above []string
-		for i, mt := range ms {
-			if plain {
-				m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.reqHeaders, mt.respHeaders)
-				continue
+		if strings.HasPrefix(host, "*.") {
+			ms = slices.DeleteFunc(ms, func(mt gwMatch) bool {
+				if !mt.plain() && !mt.refused {
+					note(mt, "only a path prefix, for any method, is served on a wildcard host")
+				}
+				return !mt.plain()
+			})
+		}
+		if !slices.ContainsFunc(ms, func(mt gwMatch) bool { return !mt.plain() }) {
+			for _, mt := range ms {
+				// Its own headers, even when it has none: without a list
+				// of its own a path takes the nearest one above it, and
+				// one with request headers only has them sent back in
+				// its responses.
+				if m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.reqHeaders, mt.respHeaders) {
+					m.hosts[host][plainPathKey(mt.value)].ownHeaders = true
+					out.served[mt.route]++
+				}
 			}
+			continue
+		}
+		var above []gwMatch
+		var seen []string
+		for i, mt := range ms {
 			own := "(" + mt.expression() + ")"
-			if slices.Contains(above, own) {
+			if slices.Contains(seen, own) {
 				continue // the same match, written twice: the first one has it
 			}
-			expr := own
-			if len(above) > 0 {
-				expr = fmt.Sprintf("%s and not (%s)", own, strings.Join(above, " or "))
+			seen = append(seen, own)
+			if !mt.refused && len(mt.reqHeaders)+len(mt.respHeaders) > 0 {
+				mt.refused = true
+				note(mt, "headers cannot be set on a host that has an exact, a method or a regular-expression match")
 			}
-			m.addExprRoute(host, fmt.Sprintf("gateway:%03d", i), expr, mt.servers, mt.reqHeaders, mt.respHeaders)
-			above = append(above, own)
+			var excluded []string
+			for _, higher := range above {
+				if higher.overlaps(mt) {
+					excluded = append(excluded, "("+higher.expression()+")")
+				}
+			}
+			above = append(above, mt)
+			if mt.refused {
+				continue
+			}
+			expr := own
+			if len(excluded) > 0 {
+				expr = fmt.Sprintf("%s and not (%s)", own, strings.Join(excluded, " or "))
+			}
+			if m.addExprRoute(host, fmt.Sprintf("gateway:%03d", i), expr, mt.servers, nil, nil) {
+				out.served[mt.route]++
+			}
 		}
 	}
+	return out
 }
