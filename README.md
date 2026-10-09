@@ -205,9 +205,82 @@ then add `--proxy-controller` to the operator's arguments in `config/manager.yam
 - **Routes and certificates take about a minute to reach running pods.** They are delivered through mounted volumes, which the kubelet refreshes on its own schedule.
 - **`spec.config` takes the Synapse settings that have no field.** A key the operator owns, such as `mode` or the listeners, is refused there and reported in the `ConfigValid` condition; it is never silently overridden. An invalid configuration changes nothing that is running.
 - **Certificates come from the Ingresses' TLS Secrets,** for example from cert-manager. Synapse's built-in ACME client is not used.
-- **Ingress only.** Gateway API routes are not rendered for a `SynapseProxy` yet.
+- **Ingresses and, where its CRDs are installed, the Gateway API.** See [below](#gateway-api-for-a-synapseproxy) for what of it is served.
 - **Not together with `--ingress-mode` or `--config-sync`** in one operator process.
 - **With `--namespace`, only that namespace is seen.** A proxy elsewhere is not run, and an Ingress elsewhere is not served, whatever its class; nothing reports either.
+
+### Gateway API for a `SynapseProxy`
+
+Where the cluster has the Gateway API's CRDs, a proxy serves Gateways as well. A `GatewayClass` names the proxy, as an `IngressClass` does:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: edge
+spec:
+  controllerName: gen0sec.com/synapse
+  parametersRef:          # which proxy serves this class
+    group: synapse.gen0sec.com
+    kind: SynapseProxy
+    namespace: edge
+    name: edge
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web
+  namespace: edge
+spec:
+  gatewayClassName: edge
+  listeners:
+    - name: http
+      port: 80            # a port the SynapseProxy listens on
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: shop.example.com
+      tls:
+        certificateRefs:
+          - name: shop-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+```
+
+An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule the operator follows: what is programmed is exactly what was asked for, and what cannot be is said in the object's status and not served. Nothing is routed more broadly than written.
+
+| | Served |
+|---|---|
+| Listeners | `HTTP` and `HTTPS` (terminated), on a port the `SynapseProxy` listens on with that protocol |
+| Who may attach | `allowedRoutes` by namespace (`Same`, `All`, `Selector`); a parent's `sectionName` and `port` |
+| Hosts | exact names and wildcards; a route that names no host takes its listener's |
+| Matches | `PathPrefix`, `Exact` and `RegularExpression` paths, and `method`, in the precedence the API gives them |
+| Backends | Services, with weights; one in another namespace needs a `ReferenceGrant` |
+| Certificates | a listener's `certificateRefs`; one in another namespace needs a `ReferenceGrant` |
+| Filters | setting and adding request and response headers |
+| Status | `Accepted`, `Programmed`, `ResolvedRefs` and `PartiallyInvalid`; attached routes per listener; the proxy's addresses |
+
+**Not served, and reported.** A rule or a match that asks for one of these is left out, with `PartiallyInvalid` on the route, or `Accepted: False` when nothing of it is left:
+
+- a match on a header or on a query parameter: Synapse routes on host, path and method;
+- the redirect, URL-rewrite and mirror filters, removing a header, and filters on a backend;
+- timeouts, retries and session persistence;
+- a route where neither it nor its listener names a host: Synapse has no host that stands for all others;
+- TLS passthrough, and every kind of route but `HTTPRoute`.
+
+**Where it differs from the API:**
+
+- **A route belongs to a host, not to a listener.** One attached to a single listener of a Gateway is served on every listener of the proxy, the plain-HTTP ones included.
+- **A host an Ingress of the same proxy routes is taken.** An `HTTPRoute` for it is not accepted (`HostnameConflict`).
+- **A rule none of whose backends can be used is not served,** where the API asks for a 500.
+- **The CRDs are looked for when the operator starts.** Installed later, they are found after a restart.
+
+The Gateway API conformance suite has not been run against it.
 
 ---
 

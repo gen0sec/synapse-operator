@@ -95,6 +95,24 @@ trap finish EXIT
 
 "$here/cluster.sh" load "$operator_image" "$E2E_BACKEND_IMAGE" "$E2E_SYNAPSE_IMAGE"
 
+# The Gateway API, before the operator starts: it looks for it once. k3s
+# installs the CRDs itself in some versions, from a job that may still be
+# running; where it does not, they come from the module the operator is
+# built against. A cluster too old for them refuses them, and the part of
+# the test that needs them is skipped.
+echo "==> Gateway API"
+k --namespace kube-system wait --for=condition=complete job --all --timeout=300s >/dev/null 2>&1 || true
+if ! k get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+  crds="$(cd "$root" && go list -m -f '{{.Dir}}' sigs.k8s.io/gateway-api)/config/crd/standard"
+  k apply --server-side --filename "$crds" >/dev/null 2>&1 ||
+    echo "this cluster does not take the Gateway API's CRDs; the test goes without them"
+fi
+if k get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+  k wait --for=condition=Established crd --timeout=60s \
+    gatewayclasses.gateway.networking.k8s.io gateways.gateway.networking.k8s.io \
+    httproutes.gateway.networking.k8s.io referencegrants.gateway.networking.k8s.io >/dev/null
+fi
+
 echo "==> operator"
 k apply --kustomize "$here/operator"
 k --namespace synapse-os rollout status deployment/synapse-operator --timeout=180s
