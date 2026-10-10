@@ -32,6 +32,10 @@ import (
 // routes on host, path and method; a match on a header or a query parameter,
 // and any filter but setting a header, has nowhere to go yet.
 //
+// The routes are written for a Synapse that tries a host's expressions in
+// the order of their keys, takes them in a v2 file, and has an expression
+// route's own headers follow its requests: one newer than 0.8.7.
+//
 // What cannot be done is one of two things; see rules. A rule that cannot be
 // carried out keeps its requests, which are then answered with an error. A
 // match that cannot be evaluated is left out.
@@ -41,8 +45,8 @@ import (
 //     listener of a Gateway is served on every listener of the proxy.
 //   - There is no host that stands for every other. A route has to end up
 //     with a host name, its own or its listener's.
-//   - A host is written as plain paths or as expressions, and what it can
-//     carry depends on which; see emitGatewayMatches.
+//   - A host is written as plain paths or as expressions; see
+//     emitGatewayMatches.
 
 // gatewayInputs is what one translation reads: everything of the kinds
 // involved, as listed, and lookups for what is referred to by name.
@@ -296,19 +300,19 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		matches = append(matches, rules.matches...)
 		all = append(all, attached{rt: rt, parents: parents, accepted: accepted, hosts: len(hosts), conflicts: conflicts, partial: partial, rules: rules})
 	}
-	done := emitGatewayMatches(m, matches)
+	served := emitGatewayMatches(m, matches)
 
 	for _, a := range all {
 		rt, parents, rules := a.rt, a.parents, a.rules
 		key := types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}
-		notes := slices.Concat(rules.unsupported, done.notes[key], a.partial)
+		notes := slices.Concat(rules.unsupported, a.partial)
 		for _, n := range a.accepted {
 			p := &parents[n]
 			switch {
 			case a.hosts == 0:
 				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, reasonHostnameConflict,
 					"already routed by an Ingress: "+strings.Join(a.conflicts, ", "), rt.Generation)
-			case done.served[key] == 0 && len(notes) > 0:
+			case served[key] == 0 && len(notes) > 0:
 				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, string(gwv1.RouteReasonUnsupportedValue),
 					strings.Join(notes, "; "), rt.Generation)
 			case len(notes) > 0 || len(a.conflicts) > 0:
@@ -1001,36 +1005,22 @@ func (a gwMatch) expression() string {
 	return strings.Join(parts, " and ")
 }
 
-// emitted is what became of the matches once each host's were seen
-// together: how many of a route's are served, and what is not and why.
-type emitted struct {
-	served map[types.NamespacedName]int
-	notes  map[types.NamespacedName][]string
-}
-
 // emitGatewayMatches adds the matches to m, host by host.
 //
 // A host with nothing but path prefixes is written as plain paths, which
 // Synapse resolves by the longest one: what the API asks. On any other host
-// every match becomes an expression, and each excludes those ranked above
-// it that a request could match as well. Synapse tries a host's expressions
-// in no order one can rely on, and before its plain paths; made exclusive,
-// at most one of them is true for a request, and it is the one the API says
-// wins. A refused match is excluded like any other, and has no route.
+// every match becomes a route chosen by an expression. Synapse tries a
+// host's expressions in the order of their keys, and the first that holds
+// has the request; so the keys are numbered in the order the API says the
+// matches win in.
 //
-// What a host can carry depends on how it is written, and that is decided
-// here, with every route's matches on it in view:
-//   - Synapse finds a route's headers by the request's path, among the
-//     plain paths. An expression's are never found. So on a host written as
-//     expressions a rule that sets headers cannot be carried out.
-//   - Synapse up to 0.8.7 does not try the expressions of a wildcard host.
-//     Such a host is written as plain paths, and a match those cannot
-//     express is left out.
-func emitGatewayMatches(m *renderModel, matches []gwMatch) emitted {
-	out := emitted{served: map[types.NamespacedName]int{}, notes: map[types.NamespacedName][]string{}}
-	note := func(mt gwMatch, why string) {
-		out.notes[mt.route] = append(out.notes[mt.route], fmt.Sprintf("%s on %s: %s", mt.what, mt.host, why))
-	}
+// A refused match has no route, and the requests it would have had are to
+// be nobody's. Each match ranked below one, that a request could match as
+// well, excludes it.
+//
+// It returns how many of each route's matches are served.
+func emitGatewayMatches(m *renderModel, matches []gwMatch) map[types.NamespacedName]int {
+	served := map[types.NamespacedName]int{}
 	byHost := map[string][]gwMatch{}
 	for _, mt := range matches {
 		byHost[mt.host] = append(byHost[mt.host], mt)
@@ -1038,54 +1028,44 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) emitted {
 	for _, host := range sortedKeys(byHost) {
 		ms := byHost[host]
 		slices.SortStableFunc(ms, gwMatch.rank)
-		if strings.HasPrefix(host, "*.") {
-			ms = slices.DeleteFunc(ms, func(mt gwMatch) bool {
-				if !mt.plain() && !mt.refused {
-					note(mt, "only a path prefix, for any method, is served on a wildcard host")
-				}
-				return !mt.plain()
-			})
-		}
 		if !slices.ContainsFunc(ms, func(mt gwMatch) bool { return !mt.plain() }) {
 			for _, mt := range ms {
 				// Its headers are its own: a route of a v2 file has the
 				// ones it lists, each way, and no other route's.
 				if m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.reqHeaders, mt.respHeaders) {
-					out.served[mt.route]++
+					served[mt.route]++
 				}
 			}
 			continue
 		}
-		var above []gwMatch
+		var refused []gwMatch
 		var seen []string
 		for i, mt := range ms {
-			own := "(" + mt.expression() + ")"
+			own := mt.expression()
 			if slices.Contains(seen, own) {
 				continue // the same match, written twice: the first one has it
 			}
 			seen = append(seen, own)
-			if !mt.refused && len(mt.reqHeaders)+len(mt.respHeaders) > 0 {
-				mt.refused = true
-				note(mt, "headers cannot be set on a host that has an exact, a method or a regular-expression match")
-			}
-			var excluded []string
-			for _, higher := range above {
-				if higher.overlaps(mt) {
-					excluded = append(excluded, "("+higher.expression()+")")
-				}
-			}
-			above = append(above, mt)
 			if mt.refused {
+				refused = append(refused, mt)
 				continue
 			}
 			expr := own
-			if len(excluded) > 0 {
-				expr = fmt.Sprintf("%s and not (%s)", own, strings.Join(excluded, " or "))
+			var excluded []string
+			for _, hole := range refused {
+				if hole.overlaps(mt) {
+					excluded = append(excluded, "("+hole.expression()+")")
+				}
 			}
-			if m.addExprRoute(host, fmt.Sprintf("gateway:%03d", i), expr, mt.servers, nil, nil) {
-				out.served[mt.route]++
+			if len(excluded) > 0 {
+				expr = fmt.Sprintf("(%s) and not (%s)", own, strings.Join(excluded, " or "))
+			}
+			// Five digits: the keys are compared as text, and `gateway:10`
+			// would come before `gateway:9`.
+			if m.addExprRoute(host, fmt.Sprintf("gateway:%05d", i), expr, mt.servers, mt.reqHeaders, mt.respHeaders) {
+				served[mt.route]++
 			}
 		}
 	}
-	return out
+	return served
 }
