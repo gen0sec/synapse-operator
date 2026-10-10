@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,8 +30,8 @@ import (
 // The rule throughout: what is programmed is what was asked for, and what
 // cannot be is said in the object's status. Nothing is served more broadly
 // than written, and nothing is dropped without a condition saying so. Synapse
-// routes on host, path, method, headers and the query string; any filter
-// but setting a header has nowhere to go yet.
+// routes on host, path, method, headers and the query string. Of the
+// filters it has the ones that change headers.
 //
 // The routes are written for a Synapse that tries a host's expressions in
 // the order of their keys, takes them in a v2 file, and has an expression
@@ -174,10 +175,9 @@ type gwMatch struct {
 
 	// refused says the rule cannot be carried out. The match takes its
 	// place among the host's, and no route is written for it.
-	refused     bool
-	servers     []backend
-	reqHeaders  []string
-	respHeaders []string
+	refused bool
+	servers []backend
+	headers gwHeaders
 	// what names the match in a message: "rule 0, match 1".
 	what string
 
@@ -742,7 +742,7 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 		if rule.Name != nil {
 			what = fmt.Sprintf("rule %q", *rule.Name)
 		}
-		req, resp, problem := headerModifiers(rule.Filters)
+		headers, problem := headerModifiers(rule.Filters)
 		switch {
 		case problem != "":
 		case rule.Timeouts != nil:
@@ -798,7 +798,7 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 			for _, host := range hosts {
 				set.matches = append(set.matches, gwMatch{
 					host: host, kind: kind, value: value, regex: written, method: method, conditions: conditions,
-					refused: refused, servers: servers, reqHeaders: req, respHeaders: resp, what: where,
+					refused: refused, servers: servers, headers: headers, what: where,
 					created: rt.CreationTimestamp, route: types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}, position: position,
 				})
 			}
@@ -874,44 +874,97 @@ func matchConditions(mt gwv1.HTTPRouteMatch) (gwConditions, string) {
 	return c, ""
 }
 
-// headerModifiers returns the headers a rule's filters set, as the
-// "Name: value" lines Synapse takes, or what in the filters cannot be done.
+// gwHeaders is what a rule's filters do to headers, each way: set a value,
+// add one, or remove the header. The first two are "Name: value" lines.
+type gwHeaders struct {
+	reqSet, reqAdd, reqRemove    []string
+	respSet, respAdd, respRemove []string
+}
+
+// headersSynapseKeeps are the ones a header rule may not name: the framing
+// and hop-by-hop headers, and the two that are a WebSocket handshake's
+// proof. Synapse refuses a file with a rule that names one, the whole file.
+var headersSynapseKeeps = map[string]bool{
+	"content-length": true, "transfer-encoding": true, "connection": true, "keep-alive": true, "te": true,
+	"trailer": true, "upgrade": true, "proxy-connection": true, "sec-websocket-key": true, "sec-websocket-accept": true,
+}
+
+// headerName matches what can be a header's name: the characters of an
+// HTTP token, less the `*`. In a rule that removes headers Synapse reads a
+// name ending in `*` as every name that starts so, and takes `*` alone for
+// an error.
+var headerName = regexp.MustCompile("^[A-Za-z0-9!#$%&'+.^_`|~-]+$")
+
+// headerProblem says what is wrong with a header a filter names, or with
+// the value it gives it; "" when Synapse will take it.
 //
-// Synapse replaces a header's value. That is what `set` asks for. `add`
-// asks for a value beside the ones a header has, and would lose them.
-func headerModifiers(filters []gwv1.HTTPRouteFilter) (req, resp []string, problem string) {
-	lines := func(f *gwv1.HTTPHeaderFilter) ([]string, string) {
-		switch {
-		case f == nil:
-			return nil, ""
-		case len(f.Remove) > 0:
-			return nil, "removing a header is not supported"
-		case len(f.Add) > 0:
-			return nil, "adding to a header is not supported; set replaces its value"
+// What is caught here is caught for one rule. Left to Synapse, a name or a
+// value it does not take is an error in the file where a header is added to
+// or removed, and the file is every route of the proxy; where a header is
+// set, it is left out without a word.
+func headerProblem(name, value string) string {
+	switch {
+	case headersSynapseKeeps[strings.ToLower(name)]:
+		return fmt.Sprintf("the header %s cannot be changed", name)
+	case !headerName.MatchString(name):
+		return fmt.Sprintf("%q is not a header name a rule can be written for", name)
+	}
+	// Text, without control characters but for the tab. What is outside
+	// ASCII Synapse sends on as it is written; what is not valid UTF-8
+	// would not be written into the file as it is.
+	if !utf8.ValidString(value) {
+		return fmt.Sprintf("the value given for %s is not text", name)
+	}
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c != '\t' && (c < 0x20 || c == 0x7f) {
+			return fmt.Sprintf("the value given for %s has a character in it that a header's value cannot", name)
 		}
-		var out []string
-		for _, h := range f.Set {
-			out = append(out, fmt.Sprintf("%s: %s", h.Name, h.Value))
+	}
+	return ""
+}
+
+// headerModifiers returns what a rule's filters do to headers, or what in
+// the filters cannot be done.
+func headerModifiers(filters []gwv1.HTTPRouteFilter) (gwHeaders, string) {
+	var out gwHeaders
+	read := func(f *gwv1.HTTPHeaderFilter, set, add, remove *[]string) string {
+		if f == nil {
+			return ""
 		}
-		return out, ""
+		for _, list := range []struct {
+			headers []gwv1.HTTPHeader
+			into    *[]string
+		}{{f.Set, set}, {f.Add, add}} {
+			for _, h := range list.headers {
+				if problem := headerProblem(string(h.Name), h.Value); problem != "" {
+					return problem
+				}
+				*list.into = append(*list.into, fmt.Sprintf("%s: %s", h.Name, h.Value))
+			}
+		}
+		for _, name := range f.Remove {
+			if problem := headerProblem(name, ""); problem != "" {
+				return problem
+			}
+			*remove = append(*remove, name)
+		}
+		return ""
 	}
 	for i := range filters {
-		var add []string
+		problem := ""
 		switch filters[i].Type {
 		case gwv1.HTTPRouteFilterRequestHeaderModifier:
-			add, problem = lines(filters[i].RequestHeaderModifier)
-			req = append(req, add...)
+			problem = read(filters[i].RequestHeaderModifier, &out.reqSet, &out.reqAdd, &out.reqRemove)
 		case gwv1.HTTPRouteFilterResponseHeaderModifier:
-			add, problem = lines(filters[i].ResponseHeaderModifier)
-			resp = append(resp, add...)
+			problem = read(filters[i].ResponseHeaderModifier, &out.respSet, &out.respAdd, &out.respRemove)
 		default:
 			problem = fmt.Sprintf("the %s filter is not supported", filters[i].Type)
 		}
 		if problem != "" {
-			return nil, nil, problem
+			return gwHeaders{}, problem
 		}
 	}
-	return req, resp, ""
+	return out, ""
 }
 
 // backends resolves a rule's backendRefs to the servers its requests go to.
@@ -1099,6 +1152,12 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) map[types.NamespacedN
 	for _, mt := range matches {
 		byHost[mt.host] = append(byHost[mt.host], mt)
 	}
+	// What a route sets goes in with it; what it adds to and removes is
+	// written beside that.
+	changes := func(rc *routeCfg, h gwHeaders) {
+		rc.reqAdd, rc.reqRemove = h.reqAdd, h.reqRemove
+		rc.respAdd, rc.respRemove = h.respAdd, h.respRemove
+	}
 	for _, host := range sortedKeys(byHost) {
 		ms := byHost[host]
 		slices.SortStableFunc(ms, gwMatch.rank)
@@ -1106,7 +1165,8 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) map[types.NamespacedN
 			for _, mt := range ms {
 				// Its headers are its own: a route of a v2 file has the
 				// ones it lists, each way, and no other route's.
-				if m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.reqHeaders, mt.respHeaders) {
+				if m.addRoute(host, mt.value, mt.servers, annSettings{}, mt.headers.reqSet, mt.headers.respSet) {
+					changes(m.hosts[host][plainPathKey(mt.value)], mt.headers)
 					served[mt.route]++
 				}
 			}
@@ -1136,7 +1196,9 @@ func emitGatewayMatches(m *renderModel, matches []gwMatch) map[types.NamespacedN
 			}
 			// Five digits: the keys are compared as text, and `gateway:10`
 			// would come before `gateway:9`.
-			if m.addExprRoute(host, fmt.Sprintf("gateway:%05d", i), expr, mt.servers, mt.reqHeaders, mt.respHeaders) {
+			label := fmt.Sprintf("gateway:%05d", i)
+			if m.addExprRoute(host, label, expr, mt.servers, mt.headers.reqSet, mt.headers.respSet) {
+				changes(m.hosts[host][label], mt.headers)
 				served[mt.route]++
 			}
 		}

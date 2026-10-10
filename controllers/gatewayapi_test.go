@@ -1112,8 +1112,6 @@ func TestGateway_WhatCannotBeHonouredIsNotProgrammed(t *testing.T) {
 		"a redirect":                           filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestRedirect, RequestRedirect: &gwv1.HTTPRequestRedirectFilter{}}),
 		"a rewrite":                            filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterURLRewrite, URLRewrite: &gwv1.HTTPURLRewriteFilter{}}),
 		"a mirror":                             filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestMirror}),
-		"a header taken off a request":         filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &gwv1.HTTPHeaderFilter{Remove: []string{"X"}}}),
-		"a header taken off a response":        filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterResponseHeaderModifier, ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{Remove: []string{"X"}}}),
 		"a filter on a backend":                backendFilter,
 		"a timeout":                            timeouts,
 		"a rule with no backend":               noBackend,
@@ -1308,25 +1306,137 @@ func TestRenderUpstreams_RequestHeadersAreNotSentBack(t *testing.T) {
 	}
 }
 
-// Synapse replaces a header's value. `add` asks for one more beside those a
-// header has: of Set-Cookie it would drop the backend's own.
-func TestGateway_AddingToAHeaderIsRefused(t *testing.T) {
+// A rule's header filters go with its route, on a host of plain paths and
+// on one of expressions alike: what they set is the route's headers, and
+// what they add to or remove is the route's transforms.
+func TestGateway_HeadersARuleChanges(t *testing.T) {
 	w := newGwWorld()
-	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
-	rule := to("app2", prefix("/cookie"))
-	rule.Filters = []gwv1.HTTPRouteFilter{{Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
-		ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{Add: []gwv1.HTTPHeader{{Name: "Set-Cookie", Value: "flag=1"}}}}}
-	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app", prefix("/")), rule)}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+	changed := func(m gwv1.HTTPRouteMatch) gwv1.HTTPRouteRule {
+		rule := to("app", m)
+		rule.Filters = []gwv1.HTTPRouteFilter{
+			{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &gwv1.HTTPHeaderFilter{
+				Set: []gwv1.HTTPHeader{{Name: "X-Set", Value: "1"}},
+				// One value for a name: the API takes a name once in a list.
+				Add:    []gwv1.HTTPHeader{{Name: "X-Add", Value: "a"}, {Name: "X-Via", Value: "b"}},
+				Remove: []string{"X-Debug"},
+			}},
+			{Type: gwv1.HTTPRouteFilterResponseHeaderModifier, ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{
+				Set:    []gwv1.HTTPHeader{{Name: "X-Frame-Options", Value: "DENY"}},
+				Add:    []gwv1.HTTPHeader{{Name: "Set-Cookie", Value: "flag=1"}},
+				Remove: []string{"Server"},
+			}},
+		}
+		return rule
+	}
+	w.in.routes = []gwv1.HTTPRoute{
+		httpRoute("plain", []string{"plain.example.com"}, changed(prefix("/")), to("app2", prefix("/api"))),
+		httpRoute("mixed", []string{"mixed.example.com"}, changed(prefix("/")), to("app2", exact("/x"))),
+	}
 	m, st := w.translate()
-	c := routeCondition(t, st, "shop", "PartiallyInvalid")
-	if c == nil || !strings.Contains(c.Message, "adding to a header") {
-		t.Fatalf("PartiallyInvalid = %+v, want it to say that adding is not supported", c)
+	for _, route := range []string{"plain", "mixed"} {
+		wantRoute(t, st, route, "Accepted", metav1.ConditionTrue, "Accepted")
+		if c := routeCondition(t, st, route, "PartiallyInvalid"); c != nil {
+			t.Errorf("route %s can be served whole, yet: %s", route, c.Message)
+		}
 	}
-	if got := server(t, m, "shop.example.com", "GET", "/cookie/x"); got != "" {
-		t.Errorf("/cookie/x is served by %s, without the header that was asked for", got)
+	for _, host := range []string{"plain.example.com", "mixed.example.com"} {
+		for key, rc := range m.hosts[host] {
+			got := [][]string{rc.reqHeaders, rc.reqAdd, rc.reqRemove, rc.respHeaders, rc.respAdd, rc.respRemove}
+			want := [][]string{nil, nil, nil, nil, nil, nil}
+			if rc.servers[0].addr == "10.0.0.1:80" {
+				want = [][]string{{"X-Set: 1"}, {"X-Add: a", "X-Via: b"}, {"X-Debug"}, {"X-Frame-Options: DENY"}, {"Set-Cookie: flag=1"}, {"Server"}}
+			}
+			for i := range got {
+				if !slices.Equal(got[i], want[i]) {
+					t.Errorf("%s route %q: header changes are %q, want %q", host, key, got, want)
+					break
+				}
+			}
+		}
 	}
-	if got := server(t, m, "shop.example.com", "GET", "/other"); got != "10.0.0.1:80" {
-		t.Errorf("/other goes to %q", got)
+	// And the file they are written into is one Synapse reads.
+	doc := parseV2(t, renderUpstreamsV2(m))
+	for key, route := range doc.Hosts["mixed.example.com"].Paths {
+		if route.MatchExpr == "" {
+			t.Errorf("route %q of a host with an exact match is a plain path", key)
+		}
+	}
+}
+
+// Synapse refuses a file with a header rule it does not take, and the file
+// is every route of the proxy. What it does not take is refused here, for
+// the one rule.
+func TestGateway_HeaderChangesSynapseDoesNotTake(t *testing.T) {
+	request := func(f gwv1.HTTPHeaderFilter) gwv1.HTTPRouteFilter {
+		return gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &f}
+	}
+	response := func(f gwv1.HTTPHeaderFilter) gwv1.HTTPRouteFilter {
+		return gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterResponseHeaderModifier, ResponseHeaderModifier: &f}
+	}
+	for name, filter := range map[string]gwv1.HTTPRouteFilter{
+		"setting a framing header":         request(gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "Connection", Value: "close"}}}),
+		"adding to one":                    response(gwv1.HTTPHeaderFilter{Add: []gwv1.HTTPHeader{{Name: "content-length", Value: "0"}}}),
+		"removing one":                     request(gwv1.HTTPHeaderFilter{Remove: []string{"Upgrade"}}),
+		"a WebSocket handshake's proof":    request(gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "Sec-WebSocket-Key", Value: "x"}}}),
+		"a value with a line break":        response(gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "X-A", Value: "a\r\nX-B: b"}}}),
+		"removing by a prefix":             response(gwv1.HTTPHeaderFilter{Remove: []string{"X-Internal-*"}}),
+		"removing every header":            response(gwv1.HTTPHeaderFilter{Remove: []string{"*"}}),
+		"a name that is a line of its own": request(gwv1.HTTPHeaderFilter{Remove: []string{"X-A: b"}}),
+		// A name that no header can have. Synapse leaves such a header out
+		// of what a route sets, and refuses the file for one it is to add
+		// to or remove.
+		"setting a name with a slash in it":     request(gwv1.HTTPHeaderFilter{Set: []gwv1.HTTPHeader{{Name: "X/A", Value: "1"}}}),
+		"adding to a name in brackets":          response(gwv1.HTTPHeaderFilter{Add: []gwv1.HTTPHeader{{Name: "X(A)", Value: "1"}}}),
+		"removing a name with a quote in it":    request(gwv1.HTTPHeaderFilter{Remove: []string{`X"A`}}),
+		"removing a name outside ASCII":         response(gwv1.HTTPHeaderFilter{Remove: []string{"X-\u00dcn\u00ef"}}),
+		"removing a name with a tab in it":      request(gwv1.HTTPHeaderFilter{Remove: []string{"X\tA"}}),
+		"removing a name with a comma in it":    request(gwv1.HTTPHeaderFilter{Remove: []string{"X-A,X-B"}}),
+		"removing a name with nothing in it":    request(gwv1.HTTPHeaderFilter{Remove: []string{""}}),
+		"adding to a name that ends in a space": request(gwv1.HTTPHeaderFilter{Add: []gwv1.HTTPHeader{{Name: "X-A ", Value: "1"}}}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newGwWorld()
+			w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+			rule := to("app2", prefix("/changed"))
+			rule.Filters = []gwv1.HTTPRouteFilter{filter}
+			w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app", prefix("/")), rule)}
+			m, st := w.translate()
+			if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c == nil || !strings.Contains(c.Message, "rule 1") {
+				t.Fatalf("PartiallyInvalid = %+v, want it to name the rule", c)
+			}
+			// Not served without the change it asked for, and not by the
+			// rule above it.
+			for path, want := range map[string]string{"/changed/x": "", "/other": "10.0.0.1:80"} {
+				if got := server(t, m, "shop.example.com", "GET", path); got != want {
+					t.Errorf("GET %s goes to %q, want %q", path, got, want)
+				}
+			}
+			for key, rc := range m.hosts["shop.example.com"] {
+				if n := len(rc.reqHeaders) + len(rc.reqAdd) + len(rc.reqRemove) + len(rc.respHeaders) + len(rc.respAdd) + len(rc.respRemove); n != 0 {
+					t.Errorf("route %q carries %d header changes", key, n)
+				}
+			}
+		})
+	}
+	// A tab is a character a header's value can have, and so is one
+	// outside ASCII, which Synapse sends on as it is written.
+	for _, value := range []string{"a\tb", "caf\u00e9", " a ", "~", `a"b\c`} {
+		if problem := headerProblem("X-A", value); problem != "" {
+			t.Errorf("the value %q: %s", value, problem)
+		}
+	}
+	// What is not text cannot be written into the file as it is.
+	for _, value := range []string{"\x7f", "\x00", "a\x80", "a\rb"} {
+		if problem := headerProblem("X-A", value); problem == "" {
+			t.Errorf("the value %q is taken", value)
+		}
+	}
+	// And these are all names a header can have.
+	for _, name := range []string{"X-A", "x_a", "X.A", "0", "X!#$%&'+^`|~A", "Sec-WebSocket-Protocol", "Host"} {
+		if problem := headerProblem(name, "1"); problem != "" {
+			t.Errorf("the name %q: %s", name, problem)
+		}
 	}
 }
 

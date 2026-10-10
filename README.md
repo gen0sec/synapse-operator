@@ -264,13 +264,14 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
 | Matches | `PathPrefix`, `Exact` and `RegularExpression` paths, `method`, headers (`Exact` and `RegularExpression`) and query parameters (`Exact`), in the precedence the API gives them |
 | Backends | Services, with weights; one in another namespace needs a `ReferenceGrant` |
 | Certificates | a listener's `certificateRefs`; one in another namespace needs a `ReferenceGrant` |
-| Filters | setting request and response headers |
+| Filters | request and response headers: `set`, `add` and `remove` |
 | Status | `Accepted`, `Programmed`, `ResolvedRefs` and `PartiallyInvalid`; attached routes per listener; the proxy's addresses |
 
 **What cannot be done is one of two things, and they are not treated alike.**
 
 - **A rule the proxy cannot carry out keeps its requests.** They are answered `404`, and are not served by another rule that happens to match them too: a rule for `/admin` that cannot be served does not hand `/admin` to the rule for `/`. The route says `PartiallyInvalid`, or `Accepted: False` when nothing of it is served. This is a rule with:
-  - a redirect, URL-rewrite or mirror filter, a filter on a backend, or a header filter that removes a header or adds to one. Synapse replaces a header's value, which is what `set` asks for;
+  - a redirect, URL-rewrite or mirror filter, or a filter on a backend;
+  - a header filter Synapse does not take: one that names a framing or hop-by-hop header (`Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Upgrade`, `Proxy-Connection`) or `Sec-WebSocket-Key` or `Sec-WebSocket-Accept`, a name that is not a header's or has a `*` in it, or a value with a control character in it;
   - timeouts, retries or session persistence;
   - a backend that cannot be used: one that does not exist, is not a Service, or is in another namespace without a `ReferenceGrant`. One such backend among several is enough. Synapse cannot fail a share of the requests, and the other backends were not asked to take them. The route says which in `ResolvedRefs`.
 - **A match the proxy cannot evaluate is left out,** and what it would have matched is served as if the match were not there, by the route's other matches and by other routes. This is a query parameter matched by a regular expression, a query parameter whose name or value would be percent-encoded in a URL, and a regular expression that cannot be used.
