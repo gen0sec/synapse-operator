@@ -20,7 +20,7 @@ import (
 const ControllerName = "gen0sec.com/synapse"
 
 // renderGateways merges HTTPRoutes (attached to Gateways of a
-// GatewayClass we control) into the same host/path map + acmeBackend
+// GatewayClass we control) into the same host/path map + solvers
 // the Ingress path uses, and sets the GatewayClass/Gateway/HTTPRoute
 // status conditions cert-manager's gatewayHTTPRoute solver waits on.
 // Tolerant of the Gateway API CRDs being absent (returns silently).
@@ -159,9 +159,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				for _, h := range hostnames {
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
-						if m.acme == "" {
-							m.acme = servers[0].addr
-						}
+						m.addSolver(host, path, servers[0].addr)
 						continue
 					}
 					if !m.addRoute(host, path, servers, a, req, resp) {

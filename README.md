@@ -134,7 +134,7 @@ In `--ingress-mode`, each Ingress/HTTPRoute path is rendered into a Synapse rout
 | Ingress `Exact` · Gateway `Exact` | Approximated as a prefix (Synapse matches longest-prefix) + a warning event |
 | Ingress `ImplementationSpecific` + `nginx.ingress.kubernetes.io/use-regex: "true"` | Regex route — `match_expr: http.request.path matches "<regex>"` |
 | Gateway `RegularExpression` | Regex route — `match_expr: http.request.path matches "<regex>"` |
-| `/.well-known/acme-challenge/*` | `internal_paths` (cert-manager HTTP-01 solver) |
+| `/.well-known/acme-challenge/<token>` (cert-manager HTTP-01 solver) | A plain-HTTP path of the host that serves the solver's name (`ssl_enabled: false`). A solver for the whole challenge directory on a host that has regex routes is a `match_expr` route under the key `acme:challenge` |
 
 Regex paths are **anchored at the start** (`^`) since they match from the beginning of the request path (the Kubernetes Ingress spec also requires the stored path to begin with `/`, so the leading `^` is supplied by the renderer). The path-map key for a regex route is a unique label; matching is driven entirely by `match_expr`. Header / method / query-param match conditions are not representable in Synapse's host+path model and are dropped with a warning event.
 

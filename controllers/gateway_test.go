@@ -193,7 +193,7 @@ func TestEnsureCond(t *testing.T) {
 	}
 }
 
-// HTTPRoute attached to our GatewayClass: ACME path → model.acme;
+// HTTPRoute attached to our GatewayClass: ACME path → a solver of its host;
 // app path → weighted servers + header-filter injection.
 func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	gc := &gwv1.GatewayClass{}
@@ -237,8 +237,12 @@ func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	if n := r.renderGateways(context.Background(), m); n < 2 {
 		t.Fatalf("expected ≥2 programmed HTTPRoutes, got %d", n)
 	}
-	if m.acme != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
-		t.Fatalf("acme backend not set from Gateway solver HTTPRoute: %q", m.acme)
+	const token = "/.well-known/acme-challenge/tok"
+	if got := m.solvers["app.example.com"][token]; got != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
+		t.Fatalf("solver not recorded from Gateway solver HTTPRoute: %v", m.solvers)
+	}
+	if _, routed := m.hosts["app.example.com"][token]; routed {
+		t.Fatal("the solver was added as an ordinary route")
 	}
 	rc := m.hosts["app.example.com"]["/"]
 	if rc == nil || len(rc.servers) != 2 ||
@@ -268,7 +272,7 @@ func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
 	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true}
 	m := newRenderModel()
-	if n := r.renderGateways(context.Background(), m); n != 0 || m.acme != "" || len(m.hosts) != 0 {
-		t.Fatalf("foreign GatewayClass leaked: n=%d acme=%q hosts=%v", n, m.acme, m.hosts)
+	if n := r.renderGateways(context.Background(), m); n != 0 || len(m.solvers) != 0 || len(m.hosts) != 0 {
+		t.Fatalf("foreign GatewayClass leaked: n=%d solvers=%v hosts=%v", n, m.solvers, m.hosts)
 	}
 }

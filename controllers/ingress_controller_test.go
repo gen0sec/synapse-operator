@@ -2,8 +2,10 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	"sigs.k8s.io/yaml"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -41,42 +44,139 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 func ptr[T any](v T) *T { return &v }
 
-// ACME challenge backend MUST be an internal_paths override (the crux
-// of cert-manager HTTP-01 working); other paths are host upstreams.
-func TestRenderUpstreams_ACMEOverrideAndHosts(t *testing.T) {
-	m := newRenderModel()
-	m.acme = "cm-acme-http-solver-x.default.svc.cluster.local:8089"
-	m.addRoute("app.example.com", "/",
-		[]backend{{addr: "whoami.default.svc.cluster.local:80"}}, annSettings{}, nil, nil)
-	out := renderUpstreams(m)
+// v1File is as much of the legacy upstreams file as the solver tests read.
+type v1File struct {
+	InternalPaths map[string]any `json:"internal_paths"`
+	Upstreams     map[string]struct {
+		Certificate string `json:"certificate"`
+		Paths       map[string]struct {
+			Servers    []any  `json:"servers"`
+			MatchExpr  string `json:"match_expr"`
+			SSLEnabled *bool  `json:"ssl_enabled"`
+		} `json:"paths"`
+	} `json:"upstreams"`
+}
 
-	if !strings.Contains(out, `internal_paths:`) ||
-		!strings.Contains(out, `"/.well-known/acme-challenge/*":`) ||
-		!strings.Contains(out, "cm-acme-http-solver-x.default.svc.cluster.local:8089") {
-		t.Fatalf("ACME internal_paths override missing:\n%s", out)
+func parseV1(t *testing.T, rendered string) v1File {
+	t.Helper()
+	var doc v1File
+	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered file: %v\n%s", err, rendered)
 	}
-	if !strings.Contains(out, `upstreams:`) ||
-		!strings.Contains(out, `"app.example.com":`) ||
-		!strings.Contains(out, "whoami.default.svc.cluster.local:80") {
-		t.Fatalf("host upstream missing:\n%s", out)
+	return doc
+}
+
+// Synapse tries internal paths before any host, so one entry for the whole
+// challenge directory sends every challenge to one solver. Each solver is
+// the path of the host that serves its name instead, and the file has no
+// internal_paths. (The old test of this name wanted a single `internal_paths`
+// entry made from one address, which is the fault.)
+func TestRenderUpstreams_EverySolverIsARouteOfItsHost(t *testing.T) {
+	m := newRenderModel()
+	web := []backend{{addr: "whoami.default.svc.cluster.local:80"}}
+	m.addRoute("a.example.com", "/", web, annSettings{}, nil, nil)
+	m.addRoute("b.example.com", "/", web, annSettings{}, nil, nil)
+	m.addSolver("a.example.com", "/.well-known/acme-challenge/tokA", "solver-a:8089")
+	m.addSolver("b.example.com", "/.well-known/acme-challenge/tokB", "solver-b:8089")
+	// A path the host routes itself stays the host's: a solver for it is
+	// not written over it.
+	const kept = "/.well-known/acme-challenge/kept"
+	m.hosts["b.example.com"][kept] = &routeCfg{servers: web}
+	m.addSolver("b.example.com", kept, "solver-c:8089")
+	out := renderUpstreams(m)
+	doc := parseV1(t, out)
+	if len(doc.InternalPaths) != 0 || strings.Contains(out, "internal_paths:") {
+		t.Fatalf("the file has internal_paths:\n%s", out)
 	}
-	if strings.Index(out, "internal_paths:") > strings.Index(out, "upstreams:") {
-		t.Fatalf("internal_paths must precede upstreams:\n%s", out)
+	if route := doc.Upstreams["b.example.com"].Paths[kept]; len(route.Servers) != 1 || route.Servers[0] != web[0].addr {
+		t.Errorf("the host's own route for %s is %+v\n%s", kept, route, out)
+	}
+	if n := strings.Count(out, fmt.Sprintf("%q:", kept)); n != 1 {
+		t.Errorf("%s is written %d times\n%s", kept, n, out)
+	}
+	delete(doc.Upstreams["b.example.com"].Paths, kept)
+	for host, want := range map[string]struct{ token, addr string }{
+		"a.example.com": {"/.well-known/acme-challenge/tokA", "solver-a:8089"},
+		"b.example.com": {"/.well-known/acme-challenge/tokB", "solver-b:8089"},
+	} {
+		paths := doc.Upstreams[host].Paths
+		route, ok := paths[want.token]
+		if !ok || len(route.Servers) != 1 || route.Servers[0] != want.addr || route.MatchExpr != "" {
+			t.Errorf("%s: the solver's route is %+v\n%s", host, route, out)
+		}
+		if route.SSLEnabled == nil || *route.SSLEnabled {
+			t.Errorf("%s: the solver is not said to be reached in plain HTTP", host)
+		}
+		if len(paths) != 2 {
+			t.Errorf("%s has %d routes, want 2", host, len(paths))
+		}
 	}
 }
 
-func TestRenderUpstreams_NoACMENoInternalPaths(t *testing.T) {
+// A name that has a solver and no host serving it is given a host of its own
+// in the file; a name that a routed wildcard covers lands on the wildcard,
+// and no host is written for it.
+func TestRenderUpstreams_ASolverOnlyNameAndAWildcardsName(t *testing.T) {
+	m := newRenderModel()
+	m.addRoute("*.example.com", "/", []backend{{addr: "wild:80"}}, annSettings{}, nil, nil)
+	const token = "/.well-known/acme-challenge/tok"
+	m.addSolver("only.test", token, "solver-1:8089")
+	m.addSolver("x.example.com", token, "solver-2:8089")
+	out := renderUpstreams(m)
+	doc := parseV1(t, out)
+	if got := sortedKeys(doc.Upstreams); !slices.Equal(got, []string{"*.example.com", "only.test"}) {
+		t.Fatalf("the hosts are %q\n%s", got, out)
+	}
+	if r, ok := doc.Upstreams["only.test"].Paths[token]; !ok || r.Servers[0] != "solver-1:8089" || r.SSLEnabled == nil || *r.SSLEnabled {
+		t.Errorf("only.test: %+v\n%s", r, out)
+	}
+	if r, ok := doc.Upstreams["*.example.com"].Paths[token]; !ok || r.Servers[0] != "solver-2:8089" {
+		t.Errorf("*.example.com: %+v\n%s", r, out)
+	}
+	if _, taken := m.hosts["only.test"]; taken {
+		t.Error("a solver made its host one that is routed")
+	}
+}
+
+// A solver for the whole challenge directory is a prefix, which Synapse tries
+// after the host's expressions. On a host that has a regex route it is an
+// expression too, under the key that sorts first.
+func TestRenderUpstreams_AWholeDirectorySolverOnAHostWithARegexRoute(t *testing.T) {
+	m := newRenderModel()
+	m.addRoute("api.example.com", "/", []backend{{addr: "web:80"}}, annSettings{}, nil, nil)
+	m.addRegexRoute("api.example.com", `/v\d+/items`, []backend{{addr: "items:80"}}, annSettings{}, nil, nil)
+	m.addSolver("api.example.com", "/.well-known/acme-challenge/", "solver:8089")
+	out := renderUpstreams(m)
+	paths := parseV1(t, out).Upstreams["api.example.com"].Paths
+	route, ok := paths[solverDirKey]
+	if !ok || route.Servers[0] != "solver:8089" || route.SSLEnabled == nil || *route.SSLEnabled {
+		t.Fatalf("no solver route under %q: %+v\n%s", solverDirKey, route, out)
+	}
+	for _, want := range []string{`http.request.path eq "/.well-known/acme-challenge"`, `^/\.well-known/acme-challenge/`} {
+		if !strings.Contains(route.MatchExpr, want) {
+			t.Errorf("match_expr %q lacks %s", route.MatchExpr, want)
+		}
+	}
+	if _, plain := paths["/.well-known/acme-challenge"]; plain {
+		t.Errorf("the directory is also a plain path:\n%s", out)
+	}
+	if len(paths) != 3 {
+		t.Errorf("%d routes, want 3:\n%s", len(paths), out)
+	}
+}
+
+func TestRenderUpstreams_NoSolverNoInternalPaths(t *testing.T) {
 	m := newRenderModel()
 	m.addRoute("a.example.com", "/", []backend{{addr: "b:80"}}, annSettings{}, nil, nil)
 	if strings.Contains(renderUpstreams(m), "internal_paths:") {
-		t.Fatal("no acme backend ⇒ no internal_paths block")
+		t.Fatal("no solver => no internal_paths block")
 	}
 }
 
 func TestRenderUpstreams_Deterministic(t *testing.T) {
 	build := func() string {
 		m := newRenderModel()
-		m.acme = "s:8089"
+		m.addSolver("b.example.com", "/.well-known/acme-challenge/t", "s:8089")
 		m.addRoute("b.example.com", "/x", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
 		m.addRoute("b.example.com", "/a", []backend{{addr: "a:1"}}, annSettings{}, nil, nil)
 		m.addRoute("a.example.com", "/", []backend{{addr: "y:2"}}, annSettings{}, nil, nil)
@@ -352,9 +452,10 @@ func TestWriteIfChanged(t *testing.T) {
 	}
 }
 
-// End-to-end (fake client): an Ingress with the cert-manager solver
-// path + an annotation must produce the internal_paths override AND
-// honor the annotation on the normal route.
+// End-to-end (fake client): an Ingress with the cert-manager solver path and
+// an annotation must write the solver as a route of its host AND honor the
+// annotation on the normal route. (The old test wanted the `internal_paths`
+// override, which sent every challenge to one solver.)
 func TestRender_IngressACMESolverAndAnnotation(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "upstreams.yaml")
 	ing := &networkingv1.Ingress{}
@@ -378,9 +479,12 @@ func TestRender_IngressACMESolverAndAnnotation(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	s, _ := os.ReadFile(out)
-	if !strings.Contains(string(s), `"/.well-known/acme-challenge/*":`) ||
-		!strings.Contains(string(s), "solver.default.svc.cluster.local:8089") {
-		t.Fatalf("solver internal_paths override missing:\n%s", s)
+	if strings.Contains(string(s), "internal_paths:") {
+		t.Fatalf("the file has internal_paths:\n%s", s)
+	}
+	route, ok := parseV1(t, string(s)).Upstreams["app.example.com"].Paths["/.well-known/acme-challenge/tok"]
+	if !ok || route.Servers[0] != "solver.default.svc.cluster.local:8089" {
+		t.Fatalf("the solver is not a route of its host:\n%s", s)
 	}
 	if !strings.Contains(string(s), "read_timeout: 42") {
 		t.Fatalf("annotation not applied to route:\n%s", s)
@@ -890,11 +994,10 @@ func TestAddPassthroughHost_FirstWriterWins(t *testing.T) {
 // renderUpstreamsV2: when at least one passthrough host is present,
 // the whole file switches to v2 schema. Verifies passthrough block
 // shape, terminate block shape with all v1-compat knobs threaded, and
-// the top-level scaffolding (version, sticky, internal ACME).
+// the top-level scaffolding (version, sticky) and a solver as a route.
 func TestRenderUpstreamsV2_MixedTerminateAndPassthrough(t *testing.T) {
 	m := newRenderModel()
 	m.sticky = true
-	m.acme = "10.0.0.99:8080" // ACME challenge backend
 	m.addPassthroughHost("pt.example.com", "10.0.0.1:443")
 	m.hostCert["app.example.com"] = "app.example.com"
 	tru := true
@@ -912,11 +1015,12 @@ func TestRenderUpstreamsV2_MixedTerminateAndPassthrough(t *testing.T) {
 			reqHeaders:       []string{"X-A: 1"},
 			respHeaders:      []string{"X-B: 2"},
 		}, nil, nil)
+	m.addSolver("app.example.com", "/.well-known/acme-challenge/tok", "10.0.0.99:8080") // ACME challenge backend
 	out := renderUpstreamsV2(m)
 	for _, want := range []string{
 		"version: 2",
 		"sticky_sessions:\n    enabled: true",
-		`"/.well-known/acme-challenge/*"`,
+		`"/.well-known/acme-challenge/tok":`,
 		`upstream: "10.0.0.99:8080"`,
 		`"app.example.com":`,
 		"      terminate:",

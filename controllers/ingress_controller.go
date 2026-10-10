@@ -212,11 +212,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	// Whole config is rebuilt from scratch every reconcile:
 	// idempotent and self-healing. ACME HTTP-01 challenge paths are
-	// special-cased into `internal_paths` (see routes.go) because
-	// synapse registers a built-in default `/.well-known/
-	// acme-challenge/* -> (empty) internal ACME server` matched BEFORE
-	// host `upstreams:` routes; cert-manager's ephemeral solver lands
-	// there. Per-Ingress annotations configure upstream settings.
+	// special-cased into solvers (see routes.go): each is written as a
+	// path of the host that serves its name, since synapse tries
+	// `internal_paths` BEFORE any host and one entry there would send
+	// every challenge to one solver. Per-Ingress annotations configure
+	// upstream settings.
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
 
@@ -390,12 +390,9 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 						"Exact pathType on host %s path %s is approximated as a prefix (synapse v1 matches longest-prefix)", host, path)
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
-					// m.acme is a single address, so the solver keeps
-					// Service addressing rather than pinning one pod.
+					// The solver keeps Service addressing rather than
+					// pinning one pod.
 					if addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
-						if m.acme == "" {
-							m.acme = addr
-						}
 						m.addSolver(host, path, addr)
 						solvers = append(solvers, solverOf{ing, host})
 					}
@@ -438,15 +435,13 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	}
 
 	// A solver that the file has no place for, now that every host is
-	// known. Only a proxy's file has solvers as routes.
-	if r.UpstreamsV2 {
-		for _, s := range solvers {
-			if by, ok := m.solverHost(s.host); !ok {
-				logger.Info("solver ignored: its host is passed through",
-					"host", s.host, "passthrough_host", by, "ingress", s.ing.Namespace+"/"+s.ing.Name)
-				r.emit(s.ing, corev1.EventTypeWarning, "SolverUnreachable",
-					"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
-			}
+	// known.
+	for _, s := range solvers {
+		if by, ok := m.solverHost(s.host); !ok {
+			logger.Info("solver ignored: its host is passed through",
+				"host", s.host, "passthrough_host", by, "ingress", s.ing.Namespace+"/"+s.ing.Name)
+			r.emit(s.ing, corev1.EventTypeWarning, "SolverUnreachable",
+				"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
 		}
 	}
 
