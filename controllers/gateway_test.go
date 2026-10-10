@@ -300,3 +300,21 @@ func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 		t.Fatalf("foreign GatewayClass leaked: n=%d acme=%q hosts=%v", n, m.acme, m.hosts)
 	}
 }
+
+// The path the end-to-end test asks for keeps its alternatives at the top
+// when it is read as Synapse's engine will read it, which is what makes that
+// test one of the anchoring: anchored in front alone, it takes /x/bar.
+func TestRegexAlternativesSurviveTheCanonicalForm(t *testing.T) {
+	written, err := canonicalRegex("/foo|(/bar)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evalRouteExpr(t, "http.request.path matches "+wfRegex("^"+written), gwRequest{method: "GET", path: "/x/bar"}) {
+		t.Fatalf("%q anchored in front alone does not take /x/bar: the end-to-end test proves nothing", written)
+	}
+	for path, want := range map[string]bool{"/bar": true, "/foo/x": true, "/x/bar": false} {
+		if got := evalRouteExpr(t, pathRegexExpr(written), gwRequest{method: "GET", path: path}); got != want {
+			t.Errorf("%s on %s = %v, want %v", written, path, got, want)
+		}
+	}
+}

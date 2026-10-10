@@ -52,11 +52,14 @@ const (
 	appsNamespace  = "e2e-apps"
 	className      = "e2e-edge"
 
-	shopHost    = "shop.e2e.test"
-	apiHost     = "api.e2e.test"
-	regexHost   = "regex.e2e.test"
-	otherHost   = "other.e2e.test"
-	gatewayHost = "gw.e2e.test"
+	shopHost  = "shop.e2e.test"
+	apiHost   = "api.e2e.test"
+	regexHost = "regex.e2e.test"
+	// A path that begins with a slash, as the API asks, and whose two
+	// alternatives are not read as one with a part in common.
+	regexAlternatives = "/foo|(/bar)"
+	otherHost         = "other.e2e.test"
+	gatewayHost       = "gw.e2e.test"
 
 	// What a user, or a tool of theirs, sees of a proxy. Written out here
 	// and not taken from the operator's code, on purpose: to rename one is a
@@ -510,7 +513,9 @@ func TestSynapseProxy(t *testing.T) {
 		// own: each alternative is anchored at the start of the path.
 		regexed := ingress("regex", className, regexHost, "api")
 		regexed.Annotations = map[string]string{"synapse.gen0sec.com/use-regex": "true"}
-		regexed.Spec.Rules[0].HTTP.Paths[0].Path = "/foo|/bar"
+		// Written so that the alternatives stay at its top: `/foo|/bar` is
+		// read as `/(?:foo|bar)` on the way, which was anchored either way.
+		regexed.Spec.Rules[0].HTTP.Paths[0].Path = regexAlternatives
 		regexed.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
 
 		// The class hands its Ingresses to a proxy that does not exist yet.
