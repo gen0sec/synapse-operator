@@ -320,7 +320,12 @@ func (m *renderModel) solverHosts(hostKeys []string, solved map[string]map[strin
 // A solver is reached in plain HTTP, which is said so, whichever schema it
 // is written in; and with no headers of its host's, which a v1 file has to
 // be told.
-func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[string]*routeCfg {
+//
+// byPath is for a v1 file, where a request's headers are found by its path
+// and not by the route that was chosen: the directory is then a plain path
+// as well, to the same solver, so that the challenge finds lists that say
+// it has none and not those of `/`.
+func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string, byPath bool) map[string]*routeCfg {
 	out := map[string]*routeCfg{}
 	expressions := slices.ContainsFunc(sortedKeys(paths), func(p string) bool { return paths[p].matchExpr != "" })
 	for p, addr := range solved {
@@ -330,6 +335,9 @@ func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[s
 		plain := false
 		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain, noHeaders: true}
 		if p == acmeChallengePrefix && expressions {
+			if byPath {
+				out[p] = &routeCfg{servers: rc.servers, ssl: &plain, noHeaders: true}
+			}
 			rc.matchExpr = fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
 				wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/"))
 			p = solverDirKey
@@ -889,7 +897,7 @@ func renderUpstreams(m *renderModel) string {
 		}
 		b.WriteString("    paths:\n")
 		paths := m.hosts[h]
-		solvers := solverRoutesFor(paths, solved[h])
+		solvers := solverRoutesFor(paths, solved[h], true)
 		pathKeys := make([]string, 0, len(paths)+len(solvers))
 		for p := range paths {
 			pathKeys = append(pathKeys, p)
@@ -1078,7 +1086,7 @@ func renderUpstreamsV2(m *renderModel) string {
 		for p := range paths {
 			pathKeys = append(pathKeys, p)
 		}
-		solvers := solverRoutesFor(paths, solved[h])
+		solvers := solverRoutesFor(paths, solved[h], false)
 		for p := range solvers {
 			pathKeys = append(pathKeys, p)
 		}
