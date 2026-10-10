@@ -203,11 +203,23 @@ func TestRenderUpstreams_AWholeDirectorySolverOnAHostWithARegexRoute(t *testing.
 			t.Errorf("match_expr %q lacks %s", route.MatchExpr, want)
 		}
 	}
-	if _, plain := paths["/.well-known/acme-challenge"]; plain {
-		t.Errorf("the directory is also a plain path:\n%s", out)
+	// And a plain path beside it. A v1 file's headers are found by the
+	// request's path, whichever route was chosen: without a path of its
+	// own that says it has none, the challenge would take those of `/`.
+	plain, ok := paths["/.well-known/acme-challenge"]
+	if !ok || plain.MatchExpr != "" || len(plain.Servers) != 1 || plain.Servers[0] != "solver:8089" {
+		t.Errorf("the directory is not a plain path to the solver as well: %+v\n%s", plain, out)
 	}
-	if len(paths) != 3 {
-		t.Errorf("%d routes, want 3:\n%s", len(paths), out)
+	if n := strings.Count(out, "        request_headers: []\n        response_headers: []\n"); n != 2 {
+		t.Errorf("%d routes say they have no headers, want the solver's two:\n%s", n, out)
+	}
+	if len(paths) != 4 {
+		t.Errorf("%d routes, want 4:\n%s", len(paths), out)
+	}
+	// A v2 file's headers are the route's own: no second route there.
+	v2 := parseV2(t, renderUpstreamsV2(m)).Hosts["api.example.com"].Paths
+	if _, plain := v2["/.well-known/acme-challenge"]; plain || len(v2) != 3 {
+		t.Errorf("a v2 file has %d routes for the host, want 3", len(v2))
 	}
 }
 
