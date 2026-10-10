@@ -489,6 +489,13 @@ func TestSynapseProxy(t *testing.T) {
 		c.create(t, c.backend("shop")...)
 		c.create(t, c.backend("api")...)
 
+		// What cert-manager puts beside an Ingress to answer an HTTP-01
+		// challenge for its host: one path, to a backend of its own.
+		const challenge = "/.well-known/acme-challenge/token"
+		solver := ingress("cm-acme-http-solver", className, shopHost, "api")
+		solver.Spec.Rules[0].HTTP.Paths[0].Path = challenge
+		solver.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
+
 		// The class hands its Ingresses to a proxy that does not exist yet.
 		group, scope, ns := synapsev1alpha1.GroupVersion.Group, networkingv1.IngressClassParametersReferenceScopeNamespace, proxyNamespace
 		c.create(t,
@@ -502,6 +509,7 @@ func TestSynapseProxy(t *testing.T) {
 				},
 			},
 			ingress("shop", className, shopHost, "shop"),
+			solver,
 		)
 
 		c.create(t, &synapsev1alpha1.SynapseProxy{
@@ -538,6 +546,9 @@ func TestSynapseProxy(t *testing.T) {
 		}
 		if file := routes.Data[routesKey]; !strings.Contains(file, "\nversion: 2\n") {
 			t.Errorf("the proxy's routes are not a v2 file:\n%s", file)
+		}
+		if a, err := c.request(http.MethodGet, "http", shopHost, challenge); err != nil || a.status != http.StatusOK || a.backend != "api" {
+			t.Errorf("the challenge is answered %d by %q (%v), want 200 by the solver", a.status, a.backend, err)
 		}
 		a, err := c.get("http", shopHost)
 		if err != nil {

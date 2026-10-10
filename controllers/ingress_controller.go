@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -246,6 +247,19 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if a.sticky {
 			m.sticky = true
 		}
+		// An alias Synapse would not take as a host is left out here: in
+		// a v2 file it is an error, and the file is every route there is.
+		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
+			problem := hostKeyProblem(alias)
+			if alias == "" || problem == "" {
+				return false
+			}
+			logger.Info("server-alias ignored: not a host name Synapse takes",
+				"alias", alias, "ingress", ing.Namespace+"/"+ing.Name, "problem", problem)
+			r.emit(ing, corev1.EventTypeWarning, "InvalidServerAlias",
+				"server-alias %s cannot be used as a host: %s; this alias is ignored", alias, problem)
+			return true
+		})
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -322,6 +336,19 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				// render a synapse match_expr regex route (under the primary host
 				// and any server-aliases). Otherwise fall through to prefix/Exact.
 				if a.useRegex {
+					// As Synapse's engine will read it, or not at all: an
+					// expression it cannot compile is an error in a v2
+					// file, and the file is every route there is.
+					written, err := canonicalRegex(path)
+					if err != nil {
+						logger.Info("regex path ignored: not a regular expression Synapse takes",
+							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "error", err.Error())
+						mUnsupportedMatch.Inc()
+						r.emit(ing, corev1.EventTypeWarning, "UnsupportedMatch",
+							"path %s on host %s cannot be used as a regular expression: %v; this path is ignored", path, host, err)
+						continue
+					}
+					path = written
 					if !m.addRegexRoute(host, path, servers, a, nil, nil) {
 						logger.Info("regex route conflict ignored (first-writer-wins)",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
@@ -353,10 +380,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				if strings.HasPrefix(path, acmeChallengePrefix) {
 					// m.acme is a single address, so the solver keeps
 					// Service addressing rather than pinning one pod.
-					if m.acme == "" {
-						if a, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
-							m.acme = a
+					if addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
+						if m.acme == "" {
+							m.acme = addr
 						}
+						m.addSolver(host, path, addr)
 					}
 					continue
 				}
