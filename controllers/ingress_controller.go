@@ -253,11 +253,13 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if a.sticky {
 			m.sticky = true
 		}
-		// An alias Synapse would not take as a host is left out here: in
-		// a v2 file it is an error, and the file is every route there is.
+		// An alias Synapse would not take as a host of a proxy's file is
+		// left out here: in a v2 file it is an error, and the file is
+		// every route there is. The older modes write it as it came: in a
+		// v1 file `*` is the host of every name that has no other.
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
 			problem := hostKeyProblem(alias)
-			if alias == "" || problem == "" {
+			if !r.UpstreamsV2 || alias == "" || problem == "" {
 				return false
 			}
 			logger.Info("server-alias ignored: not a host name Synapse takes",
