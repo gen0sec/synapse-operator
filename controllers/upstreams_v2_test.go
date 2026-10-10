@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	networkingv1 "k8s.io/api/networking/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 )
@@ -311,5 +313,102 @@ func TestRender_TheOlderModesV2FileIsAsItWas(t *testing.T) {
 	}
 	if got := doc.Proxy.Fingerprints.Forward; got != nil {
 		t.Errorf("the file says fingerprints.forward: %v", *got)
+	}
+}
+
+// cert-manager answers an HTTP-01 challenge from a solver it puts behind an
+// Ingress of its own. In a v2 file Synapse has no list of paths outside the
+// hosts that it routes by, so the solver's path is a route of its host: a
+// plain path, which Synapse tries before the host's expressions.
+func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
+	const token = "/.well-known/acme-challenge/tok"
+	m := newRenderModel()
+	m.sameAsV1 = true
+	servers := []backend{{addr: "10.0.0.1:80"}}
+	m.addRoute("plain.example.com", "/", servers, annSettings{}, nil, nil)
+	m.addExprRoute("expr.example.com", "gateway:00000", `http.request.path matches "^/"`, servers, nil, nil)
+	for _, host := range []string{"plain.example.com", "expr.example.com", "new.example.com"} {
+		m.addSolver(host, token, "solver.ns.svc:8089")
+	}
+	m.acme = "solver.ns.svc:8089"
+	rendered := renderUpstreamsV2(m)
+	doc := parseV2(t, rendered)
+	if len(doc.Internal) != 0 {
+		t.Errorf("the file has a list of internal paths, which Synapse reads and does not route by:\n%s", rendered)
+	}
+	for host, others := range map[string]int{"plain.example.com": 1, "expr.example.com": 1, "new.example.com": 0} {
+		paths := doc.Hosts[host].Paths
+		route, ok := paths[token]
+		switch {
+		case !ok || route.Upstream != "solver.ns.svc:8089" || route.MatchExpr != "":
+			t.Errorf("%s: the solver's route is %+v\n%s", host, route, rendered)
+		case route.SSLEnabled == nil || *route.SSLEnabled:
+			t.Errorf("%s: the solver is not said to be reached in plain HTTP", host)
+		case len(paths) != others+1:
+			t.Errorf("%s has %d routes, want %d", host, len(paths), others+1)
+		}
+	}
+	if got := doc.Hosts["new.example.com"].TLS.Terminate; got == nil || got.Cert != "" {
+		t.Errorf("a host that has only a solver: terminate is %+v", got)
+	}
+	// A solver does not take its host: what else may route it is decided
+	// by what is in the model's hosts.
+	if _, taken := m.hosts["new.example.com"]; taken {
+		t.Error("a solver made its host one that is routed")
+	}
+
+	// The older modes write what they wrote.
+	m.sameAsV1 = false
+	doc = parseV2(t, renderUpstreamsV2(m))
+	if len(doc.Internal) != 1 || doc.Internal[0].Upstream != "solver.ns.svc:8089" {
+		t.Errorf("the older modes' internal paths are %+v", doc.Internal)
+	}
+	if _, ok := doc.Hosts["plain.example.com"].Paths[token]; ok {
+		t.Error("the older modes' file has the solver as a route")
+	}
+}
+
+// What an Ingress asks for that Synapse would refuse a v2 file over is left
+// out for itself, and the rest of the Ingress is served.
+func TestRoutes_WhatSynapseWouldRefuseTheFileOver(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	path := func(p string) networkingv1.HTTPIngressPath {
+		return networkingv1.HTTPIngressPath{Path: p, PathType: ptr(networkingv1.PathTypeImplementationSpecific), Backend: networkingv1.IngressBackend{
+			Service: &networkingv1.IngressServiceBackend{Name: "app", Port: networkingv1.ServiceBackendPort{Number: 80}}}}
+	}
+	versioned := routedIngress("versioned", ptr("public"), "api.example.com")
+	versioned.Annotations = map[string]string{"synapse.gen0sec.com/use-regex": "true"}
+	// The second is no regular expression Synapse has: a look-ahead.
+	versioned.Spec.Rules[0].HTTP.Paths = []networkingv1.HTTPIngressPath{path(`/v\d+/items`), path("/app/(?!admin).*"), path("/ok")}
+	aliased := routedIngress("aliased", ptr("public"), "www.example.com")
+	aliased.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "*, www.*.example.com, *., alt.example.com, *.wild.example.com"}
+	solver := routedIngress("cm-acme-http-solver", ptr("public"), "www.example.com")
+	solver.Spec.Rules[0].HTTP.Paths[0].Path = "/.well-known/acme-challenge/tok"
+
+	r := newRouteReconciler(t, edge, classFor("public", edge), versioned, aliased, solver)
+	mustReconcileRoutes(t, r, edge)
+	rendered := upstreamsOf(t, r, edge)
+	doc := parseV2(t, rendered)
+
+	var exprs []string
+	for _, route := range doc.Hosts["api.example.com"].Paths {
+		exprs = append(exprs, route.MatchExpr)
+	}
+	slices.Sort(exprs)
+	// As Synapse's engine has them: a class written out, and nothing of the
+	// path it would not compile.
+	want := []string{`http.request.path matches "^/ok"`, `http.request.path matches "^/v[0-9]+/items"`}
+	if !slices.Equal(exprs, want) {
+		t.Errorf("api.example.com is routed by %q, want %q\n%s", exprs, want, rendered)
+	}
+	hosts := sortedKeys(doc.Hosts)
+	if want := []string{"*.wild.example.com", "alt.example.com", "api.example.com", "www.example.com"}; !slices.Equal(hosts, want) {
+		t.Errorf("the hosts are %q, want %q", hosts, want)
+	}
+	if route, ok := doc.Hosts["www.example.com"].Paths["/.well-known/acme-challenge/tok"]; !ok || route.Upstream != "app.default.svc.cluster.local:80" {
+		t.Errorf("the solver's route on its host is %+v\n%s", route, rendered)
+	}
+	if len(doc.Internal) != 0 {
+		t.Errorf("the file has internal paths: %+v", doc.Internal)
 	}
 }

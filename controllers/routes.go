@@ -162,6 +162,11 @@ type renderModel struct {
 	// terminate hosts in `hosts` and other passthrough entries.
 	passthroughHosts map[string]string
 	sticky           bool
+	// solvers are the paths of cert-manager's HTTP-01 solvers, by host,
+	// each with where it is answered. They are no routes of the host as
+	// far as anything else goes: a solver does not take a host from what
+	// may route it. See renderUpstreamsV2.
+	solvers map[string]map[string]string
 	// sameAsV1 has the v2 writer say what Synapse made of the v1 file the
 	// same routes used to be written in, where the two schemas do not
 	// mean the same by saying nothing: see renderUpstreamsV2. A
@@ -176,7 +181,32 @@ func newRenderModel() *renderModel {
 		hostCert:         map[string]string{},
 		certProjections:  map[string]certProjection{},
 		passthroughHosts: map[string]string{},
+		solvers:          map[string]map[string]string{},
 	}
+}
+
+// addSolver records the path of an HTTP-01 solver on host and the address
+// it is answered at. The first one for a path keeps it.
+func (m *renderModel) addSolver(host, path, addr string) {
+	if m.solvers[host] == nil {
+		m.solvers[host] = map[string]string{}
+	}
+	if _, ok := m.solvers[host][path]; !ok {
+		m.solvers[host][path] = addr
+	}
+}
+
+// hostKeyProblem says why Synapse would not take name as a host of a v2
+// file, which it then refuses as a whole; "" when it would.
+func hostKeyProblem(name string) string {
+	name = strings.TrimRight(name, ".")
+	switch {
+	case name == "":
+		return "it is empty"
+	case strings.Contains(strings.TrimPrefix(name, "*."), "*"):
+		return "a `*` can only stand for the labels in front, as in `*.example.com`"
+	}
+	return ""
 }
 
 // addCert records a host→Secret TLS binding: it schedules the Secret
@@ -858,7 +888,9 @@ func renderUpstreamsV2(m *renderModel) string {
 
 	// ACME HTTP-01 challenge backend: v2 expresses internal paths as a
 	// top-level `internal:` list (the v1 `internal_paths:` override).
-	if m.acme != "" {
+	// Synapse reads that list and does not route by it, so a proxy's file
+	// has each solver's path as a route of its host instead: see below.
+	if m.acme != "" && !m.sameAsV1 {
 		fmt.Fprintf(&b, "internal:\n  - path: \"/.well-known/acme-challenge/*\"\n    upstream: %q\n", m.acme)
 	}
 
@@ -871,6 +903,16 @@ func renderUpstreamsV2(m *renderModel) string {
 	}
 	for h := range m.passthroughHosts {
 		hostKeys = append(hostKeys, h)
+	}
+	if m.sameAsV1 {
+		// A host that has a solver and nothing else is written for it.
+		for h := range m.solvers {
+			if _, routed := m.hosts[h]; !routed {
+				if _, passed := m.passthroughHosts[h]; !passed {
+					hostKeys = append(hostKeys, h)
+				}
+			}
+		}
 	}
 	sort.Strings(hostKeys)
 
@@ -901,9 +943,26 @@ func renderUpstreamsV2(m *renderModel) string {
 			pathKeys = append(pathKeys, p)
 		}
 		sort.Strings(pathKeys)
+		// A solver's path, as a plain path of the host: the whole path of
+		// the challenge, which Synapse tries before the host's
+		// expressions and, among plain paths, is the longest. A route the
+		// host has for that very path keeps it.
+		solvers := map[string]*routeCfg{}
+		if m.sameAsV1 {
+			for p, addr := range m.solvers[h] {
+				if _, routed := paths[p]; !routed {
+					solvers[p] = &routeCfg{servers: []backend{{addr: addr}}}
+					pathKeys = append(pathKeys, p)
+				}
+			}
+			sort.Strings(pathKeys)
+		}
 		b.WriteString("    paths:\n")
 		for _, p := range pathKeys {
 			rc := paths[p]
+			if rc == nil {
+				rc = solvers[p]
+			}
 			fmt.Fprintf(&b, "      %q:\n", p)
 			writeRouteV2(&b, rc, m.sameAsV1)
 		}
