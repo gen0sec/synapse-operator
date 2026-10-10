@@ -233,7 +233,9 @@ func (m *renderModel) solverHost(name string) (host string, ok bool) {
 // sameOrCovering is the key of hosts that is name in another spelling, or
 // else the wildcard with the longest suffix that covers name; "" when there
 // is neither. Of several spellings it is the first in order, so that it is
-// the same one each time.
+// the same one each time. The host `*`, which in a v1 file serves every
+// name that has no other, covers any name and is the shortest wildcard
+// there is.
 func sameOrCovering[V any](name string, hosts map[string]V) string {
 	asked := strings.TrimRight(name, ".")
 	same, wildcard, longest := "", "", 0
@@ -246,7 +248,7 @@ func sameOrCovering[V any](name string, hosts map[string]V) string {
 			continue
 		}
 		if suffix, wild := strings.CutPrefix(spelled, "*"); wild && len(asked) > len(suffix) &&
-			(len(suffix) > longest || len(suffix) == longest && h < wildcard) &&
+			(len(suffix) > longest || len(suffix) == longest && (wildcard == "" || h < wildcard)) &&
 			strings.EqualFold(asked[len(asked)-len(suffix):], suffix) {
 			wildcard, longest = h, len(suffix)
 		}
