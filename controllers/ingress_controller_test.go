@@ -113,6 +113,35 @@ func TestRenderUpstreams_EverySolverIsARouteOfItsHost(t *testing.T) {
 	}
 }
 
+// In a v1 file the host `*` serves every name that has no other. A solver
+// for such a name is a path of `*`: a host written for it would take the
+// name's other requests from there.
+func TestRenderUpstreams_ASolverDoesNotTakeItsNameFromTheDefaultHost(t *testing.T) {
+	const token = "/.well-known/acme-challenge/tok"
+	m := newRenderModel()
+	m.addRoute("*", "/", []backend{{addr: "any:80"}}, annSettings{}, nil, nil)
+	m.addRoute("*.example.com", "/", []backend{{addr: "wild:80"}}, annSettings{}, nil, nil)
+	m.addSolver("other.test", token, "solver-1:8089")
+	m.addSolver("x.example.com", token+"2", "solver-2:8089")
+	for range 64 {
+		if host, ok := m.solverHost("other.test"); host != "*" || !ok {
+			t.Fatalf("other.test is served as %q (%v), want the default host", host, ok)
+		}
+		// A wildcard that covers the name comes before the default host.
+		if host, _ := m.solverHost("x.example.com"); host != "*.example.com" {
+			t.Fatalf("x.example.com is served as %q", host)
+		}
+	}
+	out := renderUpstreams(m)
+	doc := parseV1(t, out)
+	if _, own := doc.Upstreams["other.test"]; own || len(doc.Upstreams) != 2 {
+		t.Errorf("a host is written for the solver beside the default host:\n%s", out)
+	}
+	if route := doc.Upstreams["*"].Paths[token]; len(route.Servers) != 1 || route.Servers[0] != "solver-1:8089" {
+		t.Errorf("the default host's route for the challenge is %+v\n%s", route, out)
+	}
+}
+
 // A name that has a solver and no host serving it is given a host of its own
 // in the file; a name that a routed wildcard covers lands on the wildcard,
 // and no host is written for it.
