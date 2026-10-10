@@ -236,6 +236,12 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	matched := 0
 	var matchedIngs []*networkingv1.Ingress
+	// solverOf is a solver's Ingress and the name it answers for.
+	type solverOf struct {
+		ing  *networkingv1.Ingress
+		host string
+	}
+	var solvers []solverOf
 	for i := range list.Items {
 		ing := &list.Items[i]
 		if !r.isOurs(ing, defaultOurs) {
@@ -336,10 +342,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				// render a synapse match_expr regex route (under the primary host
 				// and any server-aliases). Otherwise fall through to prefix/Exact.
 				if a.useRegex {
-					// As Synapse's engine will read it, or not at all: an
-					// expression it cannot compile is an error in a v2
-					// file, and the file is every route there is.
-					written, err := canonicalRegex(path)
+					// For a proxy's file, as Synapse's engine will read it,
+					// or not at all: an expression it cannot compile is an
+					// error in a v2 file, and the file is every route there
+					// is. The older modes write it as it came.
+					written, err := path, error(nil)
+					if r.UpstreamsV2 {
+						written, err = canonicalRegex(path)
+					}
 					if err != nil {
 						logger.Info("regex path ignored: not a regular expression Synapse takes",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "error", err.Error())
@@ -385,6 +395,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 							m.acme = addr
 						}
 						m.addSolver(host, path, addr)
+						solvers = append(solvers, solverOf{ing, host})
 					}
 					continue
 				}
@@ -421,6 +432,19 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if err := r.RenderExtra(ctx, m); err != nil {
 			mRenderErrTotal.Inc()
 			return false, 0, 0, err
+		}
+	}
+
+	// A solver that the file has no place for, now that every host is
+	// known. Only a proxy's file has solvers as routes.
+	if r.UpstreamsV2 {
+		for _, s := range solvers {
+			if by, ok := m.solverHost(s.host); !ok {
+				logger.Info("solver ignored: its host is passed through",
+					"host", s.host, "passthrough_host", by, "ingress", s.ing.Namespace+"/"+s.ing.Name)
+				r.emit(s.ing, corev1.EventTypeWarning, "SolverUnreachable",
+					"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
+			}
 		}
 	}
 
