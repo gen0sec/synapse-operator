@@ -207,43 +207,55 @@ func (m *renderModel) addSolver(host, path, addr string) {
 
 // solverHost is the host that serves requests for name, which is where a
 // solver for name has to be a path: Synapse serves a request as one host
-// and looks no further. That is the host of that name; or else the wildcard
-// host with the longest suffix that covers it; or else none yet, and name
-// is written for the solver. ok is false when the host is a passthrough
-// host, which is handed on as it comes and has no paths.
+// and looks no further. It is looked for as Synapse looks, among the hosts
+// it routes plain HTTP by, which a passthrough host is not one of: the name
+// as it is spelled; or the same name in another spelling, compared without
+// regard to case or to a dot at the end; or the wildcard host with the
+// longest suffix that covers it. The host is returned as the file spells
+// it.
 //
-// Names are compared as Synapse compares them, without regard to case or to
-// a dot at the end, and the host is returned as it is spelled in the file.
+// When no host serves the name, it is written for the solver, unless the
+// name is a passthrough host's or one a passthrough wildcard covers: a host
+// of its own would take the name's TLS from that one. ok is then false,
+// and host the passthrough host.
 func (m *renderModel) solverHost(name string) (host string, ok bool) {
-	asked := strings.TrimRight(name, ".")
-	// suffix is that of the longest wildcard found so far.
-	suffix := ""
-	look := func(h string, routed bool) (found bool) {
-		spelled := strings.TrimRight(h, ".")
-		if strings.EqualFold(spelled, asked) {
-			host, ok = h, routed
-			return true
-		}
-		if rest, wild := strings.CutPrefix(spelled, "*"); wild && len(rest) > len(suffix) && len(asked) > len(rest) &&
-			strings.EqualFold(asked[len(asked)-len(rest):], rest) {
-			host, ok, suffix = h, routed, rest
-		}
-		return false
-	}
-	for h := range m.passthroughHosts {
-		if look(h, false) {
-			return host, ok
-		}
-	}
-	for h := range m.hosts {
-		if look(h, true) {
-			return host, ok
-		}
-	}
-	if suffix == "" {
+	if _, routed := m.hosts[name]; routed {
 		return name, true
 	}
-	return host, ok
+	if host := sameOrCovering(name, m.hosts); host != "" {
+		return host, true
+	}
+	if host := sameOrCovering(name, m.passthroughHosts); host != "" {
+		return host, false
+	}
+	return name, true
+}
+
+// sameOrCovering is the key of hosts that is name in another spelling, or
+// else the wildcard with the longest suffix that covers name; "" when there
+// is neither. Of several spellings it is the first in order, so that it is
+// the same one each time.
+func sameOrCovering[V any](name string, hosts map[string]V) string {
+	asked := strings.TrimRight(name, ".")
+	same, wildcard, longest := "", "", 0
+	for h := range hosts {
+		spelled := strings.TrimRight(h, ".")
+		if strings.EqualFold(spelled, asked) {
+			if same == "" || h < same {
+				same = h
+			}
+			continue
+		}
+		if suffix, wild := strings.CutPrefix(spelled, "*"); wild && len(asked) > len(suffix) &&
+			(len(suffix) > longest || len(suffix) == longest && h < wildcard) &&
+			strings.EqualFold(asked[len(asked)-len(suffix):], suffix) {
+			wildcard, longest = h, len(suffix)
+		}
+	}
+	if same != "" {
+		return same
+	}
+	return wildcard
 }
 
 // solverRoutes are the solvers' paths by the host each is written under,

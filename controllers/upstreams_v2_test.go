@@ -385,17 +385,21 @@ func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 // resolves it: the host of that name, or else the wildcard host with the
 // longest suffix that covers it; on that host a plain path that is the
 // request's, then the expression routes in the order of their keys, then the
-// longest plain path that is a prefix. host is the host it was served as.
+// longest plain path that is a prefix. A passthrough host is not one it
+// routes a request by. host is the host it was served as.
 func v2Server(t *testing.T, doc v2File, name, path string) (host, upstream string) {
 	t.Helper()
-	for h := range doc.Hosts {
-		if strings.EqualFold(strings.TrimRight(h, "."), name) {
+	if entry, ok := doc.Hosts[name]; ok && !entry.TLS.Passthrough {
+		host = name
+	}
+	for _, h := range sortedKeys(doc.Hosts) {
+		if host == "" && !doc.Hosts[h].TLS.Passthrough && strings.EqualFold(strings.TrimRight(h, "."), name) {
 			host = h
 		}
 	}
 	if host == "" {
-		for h := range doc.Hosts {
-			if suffix, wild := strings.CutPrefix(strings.ToLower(h), "*"); wild && len(name) > len(suffix) &&
+		for h, entry := range doc.Hosts {
+			if suffix, wild := strings.CutPrefix(strings.ToLower(h), "*"); wild && !entry.TLS.Passthrough && len(name) > len(suffix) &&
 				strings.HasSuffix(name, suffix) && len(h) > len(host) {
 				host = h
 			}
@@ -614,6 +618,57 @@ func TestRoutes_ASolversHostHoweverItIsSpelled(t *testing.T) {
 	}
 	if told != 1 {
 		t.Errorf("%d solvers were told they cannot be reached, want the one on the passthrough host", told)
+	}
+}
+
+// Synapse looks for a name as it is spelled before it looks for another
+// spelling of it, and routes plain HTTP by the hosts it terminates alone: a
+// passthrough host is not among them. A solver's host is found the same
+// way, and the same way every time.
+func TestSolverHost_InTheOrderSynapseLooks(t *testing.T) {
+	servers := []backend{{addr: "10.0.0.1:80"}}
+	m := newRenderModel()
+	m.sameAsV1 = true
+	for _, host := range []string{"example.com", "Example.com", "eXample.com", "*.wild.test", "plain.test", "*.Two.test", "*.two.test", "App.wild.test"} {
+		m.addRoute(host, "/", servers, annSettings{}, nil, nil)
+	}
+	m.addPassthroughHost("a.wild.test", "10.0.0.2:443")
+	m.addPassthroughHost("*.deep.wild.test", "10.0.0.2:443")
+	m.addPassthroughHost("raw.test", "10.0.0.2:443")
+	m.addPassthroughHost("*.raw.test", "10.0.0.2:443")
+	m.addPassthroughHost("PLAIN.test", "10.0.0.2:443")
+	for _, c := range []struct {
+		name, host string
+		ok         bool
+	}{
+		{"example.com", "example.com", true},
+		{"eXample.com", "eXample.com", true},
+		// Neither spelling: the first of them, so that it is one.
+		{"EXAMPLE.com", "Example.com", true},
+		// A passthrough host is not what serves the name's plain HTTP.
+		{"a.wild.test", "*.wild.test", true},
+		{"x.deep.wild.test", "*.wild.test", true},
+		{"plain.test", "plain.test", true},
+		// With no host that serves it, the name is left to the passthrough.
+		{"raw.test", "raw.test", false},
+		{"RAW.test.", "raw.test", false},
+		{"x.raw.test", "*.raw.test", false},
+		{"new.test", "new.test", true},
+		{"x.two.test", "*.Two.test", true},
+		// Another spelling of the name before any wildcard.
+		{"app.wild.test", "App.wild.test", true},
+	} {
+		for range 64 {
+			if host, ok := m.solverHost(c.name); host != c.host || ok != c.ok {
+				t.Fatalf("%s is served as %q (%v), want %q (%v)", c.name, host, ok, c.host, c.ok)
+			}
+		}
+	}
+	m.addSolver("a.wild.test", "/.well-known/acme-challenge/tok", "solver.ns.svc:8089")
+	rendered := renderUpstreamsV2(m)
+	doc := parseV2(t, rendered)
+	if _, ok := doc.Hosts["*.wild.test"].Paths["/.well-known/acme-challenge/tok"]; !ok || !doc.Hosts["a.wild.test"].TLS.Passthrough {
+		t.Errorf("the solver is not a path of the wildcard host beside the passthrough host:\n%s", rendered)
 	}
 }
 
