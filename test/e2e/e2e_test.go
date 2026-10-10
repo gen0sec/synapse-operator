@@ -297,6 +297,11 @@ func (c *cluster) get(scheme, host string) (answer, error) {
 
 // request sends one request, as get does, with a method and a path.
 func (c *cluster) request(method, scheme, host, path string) (answer, error) {
+	return c.requestWith(method, scheme, host, path, nil)
+}
+
+// requestWith sends one request, as request does, with headers of its own.
+func (c *cluster) requestWith(method, scheme, host, path string, headers http.Header) (answer, error) {
 	addr := c.httpAddr
 	if scheme == "https" {
 		addr = c.httpsAddr
@@ -316,6 +321,9 @@ func (c *cluster) request(method, scheme, host, path string) (answer, error) {
 	req, err := http.NewRequest(method, scheme+"://"+host+path, nil)
 	if err != nil {
 		return answer{}, err
+	}
+	for name, values := range headers {
+		req.Header[name] = values
 	}
 	resp, err := requests.Do(req)
 	if err != nil {
@@ -748,16 +756,33 @@ func TestSynapseProxy(t *testing.T) {
 				},
 			},
 		}
-		// Something the proxy cannot do: it has to say so, not serve it as
-		// if the condition were not there.
-		onHeader := match(gwv1.PathMatchPathPrefix, "/canary", "")
+		// A header and a query parameter decide where a request goes.
+		onHeader := match(gwv1.PathMatchPathPrefix, "/", "")
 		onHeader[0].Headers = []gwv1.HTTPHeaderMatch{{Name: "X-Canary", Value: "1"}}
-		unsupported := &gwv1.HTTPRoute{
-			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-on-header"},
+		onQuery := match(gwv1.PathMatchPathPrefix, "/", "")
+		onQuery[0].QueryParams = []gwv1.HTTPQueryParamMatch{{Name: "beta", Value: "1"}}
+		canary := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-canary"},
 			Spec: gwv1.HTTPRouteSpec{
 				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
 				Hostnames:       []gwv1.Hostname{"canary." + host},
-				Rules:           []gwv1.HTTPRouteRule{{Matches: onHeader, BackendRefs: to("api")}},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop")},
+					{Matches: onHeader, BackendRefs: to("api")},
+					{Matches: onQuery, BackendRefs: to("api")},
+				},
+			},
+		}
+		// Something the proxy cannot do: it has to say so, not serve it as
+		// if the condition were not there.
+		onQueryRegex := match(gwv1.PathMatchPathPrefix, "/versioned", "")
+		onQueryRegex[0].QueryParams = []gwv1.HTTPQueryParamMatch{{Type: ptrTo(gwv1.QueryParamMatchRegularExpression), Name: "v", Value: "[0-9]+"}}
+		unsupported := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-on-query-regex"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"versioned." + host},
+				Rules:           []gwv1.HTTPRouteRule{{Matches: onQueryRegex, BackendRefs: to("api")}},
 			},
 		}
 		c.create(t,
@@ -773,7 +798,7 @@ func TestSynapseProxy(t *testing.T) {
 				Type:       corev1.SecretTypeTLS,
 				Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
 			},
-			gw, route, unsupported, headers, headersByExpression, wildcard,
+			gw, route, canary, unsupported, headers, headersByExpression, wildcard,
 		)
 
 		accepted := func(rt *gwv1.HTTPRoute) (*metav1.Condition, string) {
@@ -799,10 +824,10 @@ func TestSynapseProxy(t *testing.T) {
 			case reason != "":
 				return reason
 			case cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "UnsupportedValue":
-				return fmt.Sprintf("the route that matches on a header is %+v, want False/UnsupportedValue", cond)
+				return fmt.Sprintf("the route that matches a query parameter by a regular expression is %+v, want False/UnsupportedValue", cond)
 			}
 			// What is left out of a route that is served is said too.
-			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", wildcard: "", headers: "", headersByExpression: ""} {
+			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", canary: "", wildcard: "", headers: "", headersByExpression: ""} {
 				switch cond, reason := accepted(rt); {
 				case reason != "":
 					return reason
@@ -822,11 +847,11 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
 			case len(gw.Status.Addresses) == 0:
 				return "the Gateway has no address"
-			// All five routes attach to the listener for every host, the
+			// All six routes attach to the listener for every host, the
 			// one that cannot be programmed too: attaching is about who
 			// may, not about what the route then asks for. Only the first
 			// is for the host the other listener serves.
-			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 5 || gw.Status.Listeners[1].AttachedRoutes != 1:
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 6 || gw.Status.Listeners[1].AttachedRoutes != 1:
 				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
 			}
 			return ""
@@ -874,9 +899,38 @@ func TestSynapseProxy(t *testing.T) {
 			return ""
 		})
 		t.Logf("served %s after they were created", took)
-		if a, err := c.request("GET", "http", "canary."+gatewayHost, "/canary"); err != nil || a.status != http.StatusNotFound {
+		if a, err := c.request("GET", "http", "versioned."+gatewayHost, "/versioned?v=2"); err != nil || a.status != http.StatusNotFound {
 			t.Errorf("a route that could not be programmed answers %d (%v), want 404", a.status, err)
 		}
+		eventually(t, afterASync, "a header and a query parameter choose the backend", func() string {
+			for _, hc := range []struct {
+				path, header, backend string
+			}{
+				{"/", "", "shop"},
+				{"/", "1", "api"},
+				{"/deep/down", "1", "api"},
+				{"/", "0", "shop"},
+				{"/?beta=1", "", "api"},
+				{"/cart?page=2&beta=1", "", "api"},
+				{"/?beta=10", "", "shop"},
+				{"/?notbeta=1", "", "shop"},
+			} {
+				sent := http.Header{}
+				if hc.header != "" {
+					// In a case a client is free to write it in, and
+					// the match is not written in.
+					sent["x-CANARY"] = []string{hc.header}
+				}
+				a, err := c.requestWith(http.MethodGet, "http", "canary."+gatewayHost, hc.path, sent)
+				switch {
+				case err != nil:
+					return err.Error()
+				case a.status != http.StatusOK || a.backend != hc.backend:
+					return fmt.Sprintf("%s with X-Canary %q answered %d from %q, want 200 from %q", hc.path, hc.header, a.status, a.backend, hc.backend)
+				}
+			}
+			return ""
+		})
 		// Under the first rule's prefix, and not the first rule's.
 		for _, path := range []string{"/held", "/held/x"} {
 			if a, err := c.request("GET", "http", gatewayHost, path); err != nil || a.status != http.StatusNotFound {

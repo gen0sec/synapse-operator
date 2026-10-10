@@ -200,12 +200,25 @@ func wantListener(t *testing.T, st gatewayStatuses, listener, kind string, statu
 	}
 }
 
-// server returns where a request ends up, by the rules Synapse applies to
+// gwRequest is a request as far as routing looks at it.
+type gwRequest struct {
+	method, path, query string
+	// headers are by name in lower case, as Synapse holds them.
+	headers map[string][]string
+}
+
+// server is serverFor for a request with neither a query nor headers.
+func server(t *testing.T, m *renderModel, host, method, path string) string {
+	t.Helper()
+	return serverFor(t, m, host, gwRequest{method: method, path: path})
+}
+
+// serverFor returns where a request ends up, by the rules Synapse applies to
 // what was rendered for the host: a plain path that is the request's path;
 // then the routes chosen by an expression, in the order of their keys, the
 // first whose expression holds; then the longest plain path that is a
 // prefix. The expressions are evaluated here, by evalRouteExpr.
-func server(t *testing.T, m *renderModel, host, method, path string) string {
+func serverFor(t *testing.T, m *renderModel, host string, req gwRequest) string {
 	t.Helper()
 	routes := m.hosts[host]
 	first := func(rc *routeCfg) string {
@@ -214,15 +227,20 @@ func server(t *testing.T, m *renderModel, host, method, path string) string {
 		}
 		return rc.servers[0].addr
 	}
-	if rc, ok := routes[path]; ok && rc.matchExpr == "" {
+	if rc, ok := routes[req.path]; ok && rc.matchExpr == "" {
 		return first(rc)
 	}
-	for _, label := range sortedKeys(routes) {
-		if rc := routes[label]; rc.matchExpr != "" && evalRouteExpr(t, rc.matchExpr, method, path) {
+	labels := make([]string, 0, len(routes))
+	for label := range routes {
+		labels = append(labels, label)
+	}
+	slices.Sort(labels)
+	for _, label := range labels {
+		if rc := routes[label]; rc.matchExpr != "" && evalRouteExpr(t, rc.matchExpr, req) {
 			return first(rc)
 		}
 	}
-	for p := path; ; {
+	for p := req.path; ; {
 		i := strings.LastIndex(p, "/")
 		if i < 0 {
 			return ""
@@ -330,11 +348,12 @@ func wfRegexValue(t *testing.T, lit string) string {
 }
 
 // evalRouteExpr evaluates the subset of Synapse's route expressions the
-// operator writes: `eq` and `matches` on the path and the method, `and`,
-// `or`, `not` and parentheses.
-func evalRouteExpr(t *testing.T, expr, method, path string) bool {
+// operator writes: `eq` and `matches` on the path, the method and the query
+// string; `any(...)` of either over the values of a header; `and`, `or`,
+// `not` and parentheses.
+func evalRouteExpr(t *testing.T, expr string, req gwRequest) bool {
 	t.Helper()
-	tokens := regexp.MustCompile(`"(?:[^"\\]|\\.)*"|[()]|[A-Za-z_.]+`).FindAllString(expr, -1)
+	tokens := regexp.MustCompile(`"(?:[^"\\]|\\.)*"|\[\*\]|[()\[\]]|[A-Za-z_.]+`).FindAllString(expr, -1)
 	pos := 0
 	next := func() string {
 		if pos >= len(tokens) {
@@ -343,11 +362,30 @@ func evalRouteExpr(t *testing.T, expr, method, path string) bool {
 		pos++
 		return tokens[pos-1]
 	}
+	expect := func(want string) {
+		if got := next(); got != want {
+			t.Fatalf("%q where %q was expected in %s", got, want, expr)
+		}
+	}
 	peek := func() string {
 		if pos < len(tokens) {
 			return tokens[pos]
 		}
 		return ""
+	}
+	// compare reads an operator and a literal, and applies them to value.
+	compare := func() func(value string) bool {
+		op, lit := next(), next()
+		switch op {
+		case "eq":
+			want := wfStringValue(t, lit)
+			return func(value string) bool { return value == want }
+		case "matches":
+			re := regexp.MustCompile(wfRegexValue(t, lit))
+			return re.MatchString
+		}
+		t.Fatalf("unknown operator %q in %s", op, expr)
+		return nil
 	}
 	var or func() bool
 	unary := func() bool { return false }
@@ -357,23 +395,27 @@ func evalRouteExpr(t *testing.T, expr, method, path string) bool {
 			return !unary()
 		case "(":
 			v := or()
-			if next() != ")" {
-				t.Fatalf("unbalanced parentheses: %s", expr)
-			}
+			expect(")")
 			return v
-		case "http.request.path", "http.request.method":
-			field := path
-			if tok == "http.request.method" {
-				field = method
+		case "any":
+			expect("(")
+			expect("http.request.headers")
+			expect("[")
+			name := wfStringValue(t, next())
+			expect("]")
+			expect("[*]")
+			holds := compare()
+			expect(")")
+			if name != strings.ToLower(name) {
+				t.Fatalf("a header is named with a capital in it, which Synapse refuses: %s", expr)
 			}
-			op, lit := next(), next()
-			switch op {
-			case "eq":
-				return field == wfStringValue(t, lit)
-			case "matches":
-				return regexp.MustCompile(wfRegexValue(t, lit)).MatchString(field)
-			}
-			t.Fatalf("unknown operator %q in %s", op, expr)
+			return slices.ContainsFunc(req.headers[name], holds)
+		case "http.request.path":
+			return compare()(req.path)
+		case "http.request.method":
+			return compare()(req.method)
+		case "http.request.query":
+			return compare()(req.query)
 		default:
 			t.Fatalf("unexpected %q in %s", tok, expr)
 		}
@@ -1055,10 +1097,6 @@ func TestGateway_TheOlderRouteWins(t *testing.T) {
 }
 
 func TestGateway_WhatCannotBeHonouredIsNotProgrammed(t *testing.T) {
-	header := prefix("/h")
-	header.Headers = []gwv1.HTTPHeaderMatch{{Name: "X-Env", Value: "canary"}}
-	query := prefix("/q")
-	query.QueryParams = []gwv1.HTTPQueryParamMatch{{Name: "v", Value: "2"}}
 	filtered := func(f gwv1.HTTPRouteFilter) gwv1.HTTPRouteRule {
 		r := to("app2", prefix("/f"))
 		r.Filters = []gwv1.HTTPRouteFilter{f}
@@ -1071,8 +1109,6 @@ func TestGateway_WhatCannotBeHonouredIsNotProgrammed(t *testing.T) {
 	noBackend := gwv1.HTTPRouteRule{Matches: []gwv1.HTTPRouteMatch{prefix("/f")}}
 
 	for name, rule := range map[string]gwv1.HTTPRouteRule{
-		"a match on a header":                  to("app2", header),
-		"a match on a query parameter":         to("app2", query),
 		"a redirect":                           filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestRedirect, RequestRedirect: &gwv1.HTTPRequestRedirectFilter{}}),
 		"a rewrite":                            filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterURLRewrite, URLRewrite: &gwv1.HTTPURLRewriteFilter{}}),
 		"a mirror":                             filtered(gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestMirror}),
@@ -1336,6 +1372,174 @@ func TestGateway_HeadersOnAHostOfExpressions(t *testing.T) {
 	}
 }
 
+func headerMatch(m gwv1.HTTPRouteMatch, name, value string) gwv1.HTTPRouteMatch {
+	m.Headers = append(slices.Clone(m.Headers), gwv1.HTTPHeaderMatch{Name: gwv1.HTTPHeaderName(name), Value: value})
+	return m
+}
+
+func queryMatch(m gwv1.HTTPRouteMatch, name, value string) gwv1.HTTPRouteMatch {
+	m.QueryParams = append(slices.Clone(m.QueryParams), gwv1.HTTPQueryParamMatch{Name: gwv1.HTTPHeaderName(name), Value: value})
+	return m
+}
+
+// A match can ask for headers and for query parameters, and the request
+// goes to the rule the API says wins: a method before headers, more headers
+// before fewer, headers before query parameters.
+func TestGateway_HeaderAndQueryMatches(t *testing.T) {
+	w := newGwWorld()
+	for i, name := range []string{"canary", "team", "version", "post", "beta", "both"} {
+		w.service("apps", name, fmt.Sprintf("10.0.1.%d", i+1))
+	}
+	const stable, canary, team, version, post, beta, both = "10.0.0.1:80", "10.0.1.1:80", "10.0.1.2:80", "10.0.1.3:80", "10.0.1.4:80", "10.0.1.5:80", "10.0.1.6:80"
+	versioned := prefix("/")
+	versioned.Headers = []gwv1.HTTPHeaderMatch{{Type: ptr(gwv1.HeaderMatchRegularExpression), Name: "X-Version", Value: `v\d+`}}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil,
+		to("app", prefix("/")),
+		to("beta", queryMatch(prefix("/"), "v", "2")),
+		to("canary", headerMatch(prefix("/"), "X-Canary", "1")),
+		to("team", headerMatch(headerMatch(prefix("/"), "X-Canary", "1"), "X-Team", "a")),
+		to("version", versioned),
+		to("post", onMethod("POST", prefix("/"))),
+		to("both", queryMatch(headerMatch(exact("/both"), "X-Canary", "1"), "v", "2")),
+	)}
+	m, st := w.translate()
+	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
+	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
+		t.Fatalf("all of it can be served, yet: %s", c.Message)
+	}
+	h := func(pairs ...string) map[string][]string {
+		out := map[string][]string{}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			out[pairs[i]] = append(out[pairs[i]], pairs[i+1])
+		}
+		return out
+	}
+	for _, c := range []struct {
+		what string
+		req  gwRequest
+		want string
+	}{
+		{"nothing asked for", gwRequest{method: "GET", path: "/cart"}, stable},
+		{"the header", gwRequest{method: "GET", path: "/cart", headers: h("x-canary", "1")}, canary},
+		{"another value", gwRequest{method: "GET", path: "/cart", headers: h("x-canary", "0")}, stable},
+		{"one of two values", gwRequest{method: "GET", path: "/cart", headers: h("x-canary", "0", "x-canary", "1")}, canary},
+		{"two headers over one", gwRequest{method: "GET", path: "/cart", headers: h("x-canary", "1", "x-team", "a")}, team},
+		{"the second header alone", gwRequest{method: "GET", path: "/cart", headers: h("x-team", "a")}, stable},
+		{"a header by a regular expression", gwRequest{method: "GET", path: "/", headers: h("x-version", "v12")}, version},
+		{"all of the value, not a part", gwRequest{method: "GET", path: "/", headers: h("x-version", "xv12")}, stable},
+		{"the parameter", gwRequest{method: "GET", path: "/cart", query: "v=2"}, beta},
+		{"among others", gwRequest{method: "GET", path: "/cart", query: "a=1&v=2&b=3"}, beta},
+		{"a longer value", gwRequest{method: "GET", path: "/cart", query: "v=20"}, stable},
+		{"a longer name", gwRequest{method: "GET", path: "/cart", query: "xv=2"}, stable},
+		{"a header before a parameter", gwRequest{method: "GET", path: "/cart", query: "v=2", headers: h("x-canary", "1")}, canary},
+		{"a method before a header", gwRequest{method: "POST", path: "/cart", headers: h("x-canary", "1")}, post},
+		{"an exact path first of all", gwRequest{method: "POST", path: "/both", query: "v=2", headers: h("x-canary", "1")}, both},
+		{"and only with what it asks for", gwRequest{method: "GET", path: "/both", query: "v=2"}, beta},
+	} {
+		if got := serverFor(t, m, "shop.example.com", c.req); got != c.want {
+			t.Errorf("%s: %+v goes to %q, want %q", c.what, c.req, got, c.want)
+		}
+	}
+	// Synapse holds headers by their names in lower case, and refuses an
+	// expression that names one otherwise.
+	for key, rc := range m.hosts["shop.example.com"] {
+		if strings.Contains(rc.matchExpr, "X-Canary") || strings.Contains(rc.matchExpr, "X-Version") {
+			t.Errorf("route %q names a header with capitals: %s", key, rc.matchExpr)
+		}
+	}
+}
+
+// What a header or a query match asks for, where it could be read more
+// than one way.
+func TestGateway_WhatAHeaderOrAQueryMatchAsksFor(t *testing.T) {
+	either := prefix("/")
+	either.Headers = []gwv1.HTTPHeaderMatch{{Type: ptr(gwv1.HeaderMatchRegularExpression), Name: "X-Env", Value: "dev|test"}}
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+	w.in.routes = []gwv1.HTTPRoute{
+		// Nothing but path prefixes, and still not plain paths: a plain
+		// path would serve the request whatever its headers.
+		httpRoute("either", []string{"either.example.com"}, to("app", prefix("/")), to("app2", either)),
+		httpRoute("dotted", []string{"dotted.example.com"}, to("app", prefix("/")), to("app2", queryMatch(prefix("/"), "a.b", "1.0"))),
+		// A name given twice counts the first time, as the API has it:
+		// for a header, in whatever case it is written.
+		httpRoute("twice", []string{"twice.example.com"}, to("app", prefix("/")),
+			to("app2", headerMatch(headerMatch(prefix("/"), "X-Tier", "gold"), "x-tier", "silver")),
+			to("app3", queryMatch(queryMatch(prefix("/"), "tier", "gold"), "tier", "silver"))),
+		// More query parameters before fewer.
+		httpRoute("two", []string{"two.example.com"}, to("app", prefix("/")),
+			to("app2", queryMatch(prefix("/"), "v", "2")),
+			to("app3", queryMatch(queryMatch(prefix("/"), "v", "2"), "w", "3"))),
+	}
+	m, st := w.translate()
+	const plain, second, third = "10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"
+	header := func(name, value string) map[string][]string { return map[string][]string{name: {value}} }
+	for _, c := range []struct {
+		host string
+		req  gwRequest
+		want string
+	}{
+		{"either", gwRequest{}, plain},
+		{"either", gwRequest{headers: header("x-env", "dev")}, second},
+		{"either", gwRequest{headers: header("x-env", "test")}, second},
+		// The whole of the value is either one, not a value that starts
+		// with the first or ends with the second.
+		{"either", gwRequest{headers: header("x-env", "devx")}, plain},
+		{"either", gwRequest{headers: header("x-env", "xtest")}, plain},
+		{"dotted", gwRequest{query: "a.b=1.0"}, second},
+		{"dotted", gwRequest{query: "aXb=1.0"}, plain},
+		{"dotted", gwRequest{query: "a.b=1X0"}, plain},
+		{"twice", gwRequest{headers: header("x-tier", "gold")}, second},
+		{"twice", gwRequest{headers: header("x-tier", "silver")}, plain},
+		{"twice", gwRequest{query: "tier=gold"}, third},
+		{"twice", gwRequest{query: "tier=silver"}, plain},
+		{"two", gwRequest{query: "v=2&w=3"}, third},
+		{"two", gwRequest{query: "w=3&v=2"}, third},
+		{"two", gwRequest{query: "v=2"}, second},
+		{"two", gwRequest{query: "w=3"}, plain},
+	} {
+		c.req.method, c.req.path = "GET", "/cart"
+		if got := serverFor(t, m, c.host+".example.com", c.req); got != c.want {
+			t.Errorf("%s: %+v goes to %q, want %q", c.host, c.req, got, c.want)
+		}
+	}
+	for _, name := range []string{"either", "dotted", "twice", "two"} {
+		wantRoute(t, st, name, "Accepted", metav1.ConditionTrue, "Accepted")
+		for key, rc := range m.hosts[name+".example.com"] {
+			if rc.matchExpr == "" {
+				t.Errorf("%s: route %q is a plain path on a host where a header or the query decides", name, key)
+			}
+		}
+	}
+}
+
+// A match the proxy cannot evaluate is left out and said, and what it would
+// have matched is served as if it were not there.
+func TestGateway_MatchesTheProxyCannotEvaluate(t *testing.T) {
+	queryRegex := prefix("/")
+	queryRegex.QueryParams = []gwv1.HTTPQueryParamMatch{{Type: ptr(gwv1.QueryParamMatchRegularExpression), Name: "v", Value: "1.0"}}
+	headerRegex := prefix("/")
+	headerRegex.Headers = []gwv1.HTTPHeaderMatch{{Type: ptr(gwv1.HeaderMatchRegularExpression), Name: "X-V", Value: "v("}}
+	for name, match := range map[string]gwv1.HTTPRouteMatch{
+		"a query parameter by a regular expression": queryRegex,
+		"a value that is percent-encoded in a URL":  queryMatch(prefix("/"), "q", "a b"),
+		"a name that is":                         queryMatch(prefix("/"), "q[]", "1"),
+		"a header by something that is no regex": headerRegex,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newGwWorld()
+			w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+			w.in.routes = []gwv1.HTTPRoute{httpRoute("web", nil, to("app", prefix("/"))), httpRoute("special", nil, to("app2", match))}
+			m, st := w.translate()
+			wantRoute(t, st, "special", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+			if got := server(t, m, "shop.example.com", "GET", "/x"); got != "10.0.0.1:80" {
+				t.Errorf("GET /x goes to %q: the match is left out, and the rest serves", got)
+			}
+		})
+	}
+}
+
 // A rule the proxy cannot carry out keeps its requests: they are answered
 // with an error, and are not served by whichever other rule matches them
 // too. A match the proxy cannot evaluate is left out, and its requests are
@@ -1376,15 +1580,14 @@ func TestGateway_ARuleThatCannotBeCarriedOutKeepsItsRequests(t *testing.T) {
 	}
 
 	// What cannot be evaluated has no place to keep.
-	header := prefix("/admin")
-	header.Headers = []gwv1.HTTPHeaderMatch{{Name: "X-Env", Value: "canary"}}
+	encoded := queryMatch(prefix("/admin"), "q", "a b")
 	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
-	w.in.routes = []gwv1.HTTPRoute{httpRoute("web", nil, to("app", prefix("/"))), httpRoute("canary", nil, to("app2", header))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("web", nil, to("app", prefix("/"))), httpRoute("special", nil, to("app2", encoded))}
 	m, st := w.translate()
-	wantRoute(t, st, "canary", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
+	wantRoute(t, st, "special", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
 	if got := server(t, m, "shop.example.com", "GET", "/admin/x"); got != "10.0.0.1:80" {
-		t.Errorf("GET /admin/x goes to %q: a match on a header is left out, and the rest serves", got)
+		t.Errorf("GET /admin/x goes to %q: a match that cannot be evaluated is left out, and the rest serves", got)
 	}
 }
 
