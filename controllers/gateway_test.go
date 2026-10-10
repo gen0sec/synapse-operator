@@ -62,7 +62,7 @@ func TestRegexRouteRender(t *testing.T) {
 		[]backend{{addr: "other:1"}}, annSettings{}, nil, nil) {
 		t.Fatal("duplicate regex route must be rejected (first-writer-wins)")
 	}
-	wantExpr := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
+	wantExpr := `match_expr: "http.request.path matches \"^(?:^/api/runs/[^/]+/stream$)\""`
 	for _, out := range []string{renderUpstreams(m), renderUpstreamsV2(m)} {
 		if !strings.Contains(out, wantExpr) {
 			t.Fatalf("rendered config missing match_expr:\nwant substring: %s\ngot:\n%s", wantExpr, out)
@@ -82,8 +82,36 @@ func TestRegexRouteKeepsItsBackslashes(t *testing.T) {
 	for _, rc := range m.hosts["h"] {
 		got = rc.matchExpr
 	}
-	if want := `http.request.path matches "^/api/v\d+/x\.json$"`; got != want {
+	if want := `http.request.path matches "^(?:/api/v\d+/x\.json$)"`; got != want {
 		t.Fatalf("match_expr = %s\nwant         %s", got, want)
+	}
+}
+
+// Every alternative of a path regex is anchored at the start of the path:
+// `/a|/b` is "/a, or /b", not "/a at the start, or /b anywhere".
+func TestRegexAlternativesAreAllAnchored(t *testing.T) {
+	cases := []struct {
+		regex string
+		path  string
+		want  bool
+	}{
+		{"/a|/b", "/a", true},
+		{"/a|/b", "/a/x", true},
+		{"/a|/b", "/b/x", true},
+		{"/a|/b", "/x/b", false},
+		{"^/x", "/x/y", true},
+		{"^/x", "/a/x", false},
+	}
+	for _, c := range cases {
+		m := newRenderModel()
+		m.addRegexRoute("h", c.regex, []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+		rc := m.hosts["h"][regexRouteKey(c.regex)]
+		if rc == nil {
+			t.Fatalf("%s: no route under regexRouteKey; keys: %v", c.regex, m.hosts["h"])
+		}
+		if got := evalRouteExpr(t, rc.matchExpr, gwRequest{method: "GET", path: c.path}); got != c.want {
+			t.Errorf("%s on %s = %v, want %v (%s)", c.regex, c.path, got, c.want, rc.matchExpr)
+		}
 	}
 }
 
@@ -92,7 +120,7 @@ func TestRegexRouteKeepsItsBackslashes(t *testing.T) {
 func TestRegexAnchoring(t *testing.T) {
 	m := newRenderModel()
 	m.addRegexRoute("h", "/api/runs/[^/]+/stream$", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
-	want := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
+	want := `match_expr: "http.request.path matches \"^(?:/api/runs/[^/]+/stream$)\""`
 	if out := renderUpstreams(m); !strings.Contains(out, want) {
 		t.Fatalf("unanchored path regex must be ^-anchored:\nwant %s\ngot:\n%s", want, out)
 	}

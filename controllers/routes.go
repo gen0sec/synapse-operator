@@ -381,16 +381,14 @@ func regexRouteKey(regex string) string {
 }
 
 // pathRegexExpr renders the synapse wirefilter match expression for a path
-// regex, e.g. `http.request.path matches "^/api/runs/[^/]+/stream$"`. The
-// regex is anchored at the start (`^`) when not already, because an
-// Ingress/HTTPRoute path regex matches from the beginning of the request
-// path (nginx use-regex / Gateway semantics) — k8s also requires the stored
-// path to begin with `/`, so the `^` is supplied here rather than in the spec.
+// regex, e.g. `http.request.path matches "^(?:/api/runs/[^/]+/stream$)"`. The
+// regex is anchored at the start of the request path (nginx use-regex /
+// Gateway semantics) as a whole, so each alternative of `/a|/b` is anchored
+// and not only the first; a `^` the regex starts with is harmless inside the
+// group. k8s also requires the stored path to begin with `/`, so the anchor
+// is supplied here rather than in the spec.
 func pathRegexExpr(regex string) string {
-	if !strings.HasPrefix(regex, "^") {
-		regex = "^" + regex
-	}
-	return "http.request.path matches " + wfRegex(regex)
+	return "http.request.path matches " + wfRegex("^(?:"+regex+")")
 }
 
 // wfString writes s as a string literal of Synapse's expression language.

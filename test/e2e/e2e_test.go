@@ -54,6 +54,7 @@ const (
 
 	shopHost    = "shop.e2e.test"
 	apiHost     = "api.e2e.test"
+	regexHost   = "regex.e2e.test"
 	otherHost   = "other.e2e.test"
 	gatewayHost = "gw.e2e.test"
 
@@ -505,6 +506,13 @@ func TestSynapseProxy(t *testing.T) {
 		wildSolver.Spec.Rules[0].HTTP.Paths[0].Path = challenge
 		wildSolver.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
 
+		// A regular-expression path with two alternatives, on a host of its
+		// own: each alternative is anchored at the start of the path.
+		regexed := ingress("regex", className, regexHost, "api")
+		regexed.Annotations = map[string]string{"synapse.gen0sec.com/use-regex": "true"}
+		regexed.Spec.Rules[0].HTTP.Paths[0].Path = "/foo|/bar"
+		regexed.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
+
 		// The class hands its Ingresses to a proxy that does not exist yet.
 		group, scope, ns := synapsev1alpha1.GroupVersion.Group, networkingv1.IngressClassParametersReferenceScopeNamespace, proxyNamespace
 		c.create(t,
@@ -521,6 +529,7 @@ func TestSynapseProxy(t *testing.T) {
 			solver,
 			ingress("wild", className, wildHost, "shop"),
 			wildSolver,
+			regexed,
 		)
 
 		c.create(t, &synapsev1alpha1.SynapseProxy{
@@ -579,6 +588,28 @@ func TestSynapseProxy(t *testing.T) {
 			if strings.Contains(name, "ja4") || strings.Contains(name, "g0s") {
 				t.Errorf("the backend was sent the client's fingerprint in %q; all it was sent: %s", name, seen)
 			}
+		}
+	})
+
+	step("every alternative of a regular-expression path is anchored", func(t *testing.T) {
+		eventually(t, afterASync, "the regular-expression path is served", func() string {
+			a, err := c.request(http.MethodGet, "http", regexHost, "/bar")
+			switch {
+			case err != nil:
+				return err.Error()
+			case a.status != http.StatusOK || a.backend != "api":
+				return fmt.Sprintf("/bar answered %d from backend %q, want 200 from \"api\"", a.status, a.backend)
+			}
+			return ""
+		})
+		// The second alternative anchored only if it is not found inside
+		// another path: /x/bar is not the path's.
+		a, err := c.request(http.MethodGet, "http", regexHost, "/x/bar")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.backend == "api" {
+			t.Errorf("/x/bar answered %d from backend %q, want none of the path's", a.status, a.backend)
 		}
 	})
 

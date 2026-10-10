@@ -730,7 +730,7 @@ func TestRoutes_WhatSynapseWouldRefuseTheFileOver(t *testing.T) {
 	slices.Sort(exprs)
 	// As Synapse's engine has them: a class written out, and nothing of the
 	// path it would not compile.
-	want := []string{`http.request.path matches "^/ok"`, `http.request.path matches "^/v[0-9]+/items"`}
+	want := []string{`http.request.path matches "^(?:/ok)"`, `http.request.path matches "^(?:/v[0-9]+/items)"`}
 	if !slices.Equal(exprs, want) {
 		t.Errorf("api.example.com is routed by %q, want %q\n%s", exprs, want, rendered)
 	}
