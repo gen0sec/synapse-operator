@@ -10,6 +10,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Annotation support for synapse upstream settings.
@@ -176,6 +178,10 @@ type renderModel struct {
 	// far as anything else goes: a solver does not take a host from what
 	// may route it. See solverRoutesFor.
 	solvers map[string]map[string]string
+	// solverSources are the Ingresses and HTTPRoutes the solvers came
+	// from, each with the name it answers for: who is told when a solver
+	// cannot be served.
+	solverSources []solverSource
 	// sameAsV1 has the v2 writer say what Synapse made of the v1 file the
 	// same routes used to be written in, where the two schemas do not
 	// mean the same by saying nothing: see renderUpstreamsV2. A
@@ -206,6 +212,18 @@ func (m *renderModel) addSolver(host, path, addr string) {
 	if _, ok := m.solvers[host][path]; !ok {
 		m.solvers[host][path] = addr
 	}
+}
+
+// solverSource is an object that brought a solver, and the name the solver
+// answers for.
+type solverSource struct {
+	obj  client.Object
+	host string
+}
+
+// solverFrom records where a solver for host came from.
+func (m *renderModel) solverFrom(obj client.Object, host string) {
+	m.solverSources = append(m.solverSources, solverSource{obj, host})
 }
 
 // solverHost is the host that serves requests for name, which is where a

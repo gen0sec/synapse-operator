@@ -2,10 +2,13 @@ package controllers
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -274,5 +277,47 @@ func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 	m := newRenderModel()
 	if n := r.renderGateways(context.Background(), m); n != 0 || len(m.solvers) != 0 || len(m.hosts) != 0 {
 		t.Fatalf("foreign GatewayClass leaked: n=%d solvers=%v hosts=%v", n, m.solvers, m.hosts)
+	}
+}
+
+// A solver that an HTTPRoute brings is told as an Ingress's is when the
+// name it answers for is passed through and nothing can serve its path.
+func TestRender_AnHTTPRouteSolverOnAPassthroughHostIsSaid(t *testing.T) {
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "synapse-gw", "default"
+	gw.Spec.GatewayClassName = gwv1.ObjectName("synapse")
+	solver := &gwv1.HTTPRoute{}
+	solver.Name, solver.Namespace = "cm-acme-http-solver-xyz", "default"
+	solver.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	solver.Spec.Hostnames = []gwv1.Hostname{"raw.example.com"}
+	solver.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{
+			Type: ptr(gwv1.PathMatchExact), Value: ptr("/.well-known/acme-challenge/tok")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{
+			Name: "cm-acme-http-solver-svc", Port: ptr(gwv1.PortNumber(8089))}}}},
+	}}
+	raw := routedIngress("raw", ptr("synapse"), "raw.example.com")
+	raw.Annotations = map[string]string{"synapse.gen0sec.com/ssl-passthrough": "true"}
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(gc, gw, solver, raw).
+		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", ClusterDomain: "cluster.local", GatewayAPI: true,
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "u.yaml"), CertsOutDir: t.TempDir(), Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	told := 0
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.HasPrefix(event, corev1.EventTypeWarning+" SolverUnreachable ") {
+			told++
+		}
+	}
+	if told != 1 {
+		t.Errorf("%d solvers were told they cannot be reached, want 1", told)
 	}
 }

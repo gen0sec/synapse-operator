@@ -236,12 +236,6 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	matched := 0
 	var matchedIngs []*networkingv1.Ingress
-	// solverOf is a solver's Ingress and the name it answers for.
-	type solverOf struct {
-		ing  *networkingv1.Ingress
-		host string
-	}
-	var solvers []solverOf
 	for i := range list.Items {
 		ing := &list.Items[i]
 		if !r.isOurs(ing, defaultOurs) {
@@ -394,7 +388,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 					// pinning one pod.
 					if addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
 						m.addSolver(host, path, addr)
-						solvers = append(solvers, solverOf{ing, host})
+						m.solverFrom(ing, host)
 					}
 					continue
 				}
@@ -436,11 +430,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	// A solver that the file has no place for, now that every host is
 	// known.
-	for _, s := range solvers {
+	for _, s := range m.solverSources {
 		if by, ok := m.solverHost(s.host); !ok {
 			logger.Info("solver ignored: its host is passed through",
-				"host", s.host, "passthrough_host", by, "ingress", s.ing.Namespace+"/"+s.ing.Name)
-			r.emit(s.ing, corev1.EventTypeWarning, "SolverUnreachable",
+				"host", s.host, "passthrough_host", by, "from", s.obj.GetNamespace()+"/"+s.obj.GetName())
+			r.emit(s.obj, corev1.EventTypeWarning, "SolverUnreachable",
 				"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
 		}
 	}

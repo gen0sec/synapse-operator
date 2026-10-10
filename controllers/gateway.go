@@ -160,6 +160,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
 						m.addSolver(host, path, servers[0].addr)
+						m.solverFrom(rt, host)
 						continue
 					}
 					if !m.addRoute(host, path, servers, a, req, resp) {
