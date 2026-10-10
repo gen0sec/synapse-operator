@@ -211,30 +211,36 @@ func (m *renderModel) addSolver(host, path, addr string) {
 // host with the longest suffix that covers it; or else none yet, and name
 // is written for the solver. ok is false when the host is a passthrough
 // host, which is handed on as it comes and has no paths.
+//
+// Names are compared as Synapse compares them, without regard to case or to
+// a dot at the end, and the host is returned as it is spelled in the file.
 func (m *renderModel) solverHost(name string) (host string, ok bool) {
-	if _, passed := m.passthroughHosts[name]; passed {
-		return name, false
-	}
-	if _, routed := m.hosts[name]; routed {
-		return name, true
-	}
-	covers := func(h string) bool {
-		suffix, wild := strings.CutPrefix(h, "*")
-		return wild && len(suffix) > len(host)-1 && len(name) > len(suffix) &&
-			strings.EqualFold(name[len(name)-len(suffix):], suffix)
-	}
-	ok = true
-	for h := range m.hosts {
-		if covers(h) {
-			host, ok = h, true
+	asked := strings.TrimRight(name, ".")
+	// suffix is that of the longest wildcard found so far.
+	suffix := ""
+	look := func(h string, routed bool) (found bool) {
+		spelled := strings.TrimRight(h, ".")
+		if strings.EqualFold(spelled, asked) {
+			host, ok = h, routed
+			return true
 		}
+		if rest, wild := strings.CutPrefix(spelled, "*"); wild && len(rest) > len(suffix) && len(asked) > len(rest) &&
+			strings.EqualFold(asked[len(asked)-len(rest):], rest) {
+			host, ok, suffix = h, routed, rest
+		}
+		return false
 	}
 	for h := range m.passthroughHosts {
-		if covers(h) {
-			host, ok = h, false
+		if look(h, false) {
+			return host, ok
 		}
 	}
-	if host == "" {
+	for h := range m.hosts {
+		if look(h, true) {
+			return host, ok
+		}
+	}
+	if suffix == "" {
 		return name, true
 	}
 	return host, ok

@@ -388,11 +388,14 @@ func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 // longest plain path that is a prefix. host is the host it was served as.
 func v2Server(t *testing.T, doc v2File, name, path string) (host, upstream string) {
 	t.Helper()
-	if _, ok := doc.Hosts[name]; ok {
-		host = name
-	} else {
+	for h := range doc.Hosts {
+		if strings.EqualFold(strings.TrimRight(h, "."), name) {
+			host = h
+		}
+	}
+	if host == "" {
 		for h := range doc.Hosts {
-			if suffix, wild := strings.CutPrefix(h, "*"); wild && len(name) > len(suffix) &&
+			if suffix, wild := strings.CutPrefix(strings.ToLower(h), "*"); wild && len(name) > len(suffix) &&
 				strings.HasSuffix(name, suffix) && len(h) > len(host) {
 				host = h
 			}
@@ -435,6 +438,10 @@ func TestRenderUpstreamsV2_ASolverDoesNotTakeItsNameFromAWildcardHost(t *testing
 		if host, ok := m.solverHost("x.a.example.com"); host != "*.a.example.com" || !ok {
 			t.Fatalf("x.a.example.com is served as %q (%v)", host, ok)
 		}
+	}
+	// A wildcard stands for at least one label: not for its own suffix.
+	if host, _ := m.solverHost(".example.com"); host != ".example.com" {
+		t.Errorf("the suffix alone is served as %q", host)
 	}
 	rendered := renderUpstreamsV2(m)
 	doc := parseV2(t, rendered)
@@ -565,6 +572,76 @@ func TestRender_TheOlderModesRegularExpressionsAreAsTheyCame(t *testing.T) {
 	for _, want := range []string{pathRegexExpr(`/v\d+/items`), pathRegexExpr("/app/(?!admin).*")} {
 		if !strings.Contains(string(rendered), fmt.Sprintf("%q", want)) {
 			t.Errorf("the file has no route by %s\n%s", want, rendered)
+		}
+	}
+}
+
+// Synapse compares host names without regard to case, and to a dot at the
+// end. A solver's name is found among the hosts as Synapse will find it, or
+// it would be written as a host of its own beside the one that serves it.
+func TestRoutes_ASolversHostHoweverItIsSpelled(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	aliased := routedIngress("aliased", ptr("public"), "www.example.com")
+	aliased.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "App.Example.com., *.Wild.Example.COM"}
+	raw := routedIngress("raw", ptr("public"), "raw.example.com")
+	raw.Annotations = map[string]string{"synapse.gen0sec.com/ssl-passthrough": "true", "synapse.gen0sec.com/server-alias": ""}
+	objs := []client.Object{edge, classFor("public", edge), aliased, raw}
+	for i, host := range []string{"app.example.com", "x.wild.example.com", "RAW.example.com."} {
+		solver := routedIngress(fmt.Sprintf("cm-acme-http-solver-%d", i), ptr("public"), host)
+		solver.Spec.Rules[0].HTTP.Paths[0].Path = fmt.Sprintf("/.well-known/acme-challenge/tok%d", i)
+		objs = append(objs, solver)
+	}
+	r := newRouteReconciler(t, objs...)
+	events := record.NewFakeRecorder(16)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+	rendered := upstreamsOf(t, r, edge)
+	doc := parseV2(t, rendered)
+
+	if want := []string{"*.Wild.Example.COM", "App.Example.com.", "raw.example.com", "www.example.com"}; !slices.Equal(sortedKeys(doc.Hosts), want) {
+		t.Fatalf("the hosts are %q, want %q\n%s", sortedKeys(doc.Hosts), want, rendered)
+	}
+	for host, token := range map[string]string{"App.Example.com.": "tok0", "*.Wild.Example.COM": "tok1"} {
+		if _, ok := doc.Hosts[host].Paths["/.well-known/acme-challenge/"+token]; !ok || len(doc.Hosts[host].Paths) != 2 {
+			t.Errorf("%s has not its route and its solver's:\n%s", host, rendered)
+		}
+	}
+	told := 0
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.HasPrefix(event, corev1.EventTypeWarning+" SolverUnreachable ") {
+			told++
+		}
+	}
+	if told != 1 {
+		t.Errorf("%d solvers were told they cannot be reached, want the one on the passthrough host", told)
+	}
+}
+
+// To the older modes' Synapse an alias is whatever it is: `*` in a v1 file
+// is the host for every name that has no other. They write it as it came.
+func TestRender_TheOlderModesAliasesAreAsTheyCame(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	ing := routedIngress("aliased", ptr("synapse"), "www.example.com")
+	ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "*, www.*.example.com, alt.example.com"}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out,
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	rendered, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"*", "www.*.example.com", "alt.example.com", "www.example.com"} {
+		if !strings.Contains(string(rendered), fmt.Sprintf("\n  %q:\n", host)) {
+			t.Errorf("the file has no host %q\n%s", host, rendered)
+		}
+	}
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.Contains(event, " InvalidServerAlias ") {
+			t.Errorf("the Ingress was told: %s", event)
 		}
 	}
 }
