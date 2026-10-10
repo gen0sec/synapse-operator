@@ -29,8 +29,8 @@ import (
 // The rule throughout: what is programmed is what was asked for, and what
 // cannot be is said in the object's status. Nothing is served more broadly
 // than written, and nothing is dropped without a condition saying so. Synapse
-// routes on host, path and method; a match on a header or a query parameter,
-// and any filter but setting a header, has nowhere to go yet.
+// routes on host, path, method, headers and the query string; any filter
+// but setting a header has nowhere to go yet.
 //
 // The routes are written for a Synapse that tries a host's expressions in
 // the order of their keys, takes them in a v2 file, and has an expression
@@ -169,6 +169,8 @@ type gwMatch struct {
 	// regex is a regular expression's value as it is written for Synapse.
 	regex  string
 	method string
+	// conditions are what it asks of the headers and the query string.
+	conditions gwConditions
 
 	// refused says the rule cannot be carried out. The match takes its
 	// place among the host's, and no route is written for it.
@@ -729,10 +731,9 @@ type ruleSet struct {
 // also matches them. The matches are marked refused, take their place among
 // the host's, and no route is written for them.
 //
-// A match the proxy cannot evaluate, on a header or a query parameter, is
-// left out, and what it would have matched is served as if it were not
-// there. There is no way to hold its place without holding more than it
-// asked for.
+// A match the proxy cannot evaluate is left out, and what it would have
+// matched is served as if it were not there. There is no way to hold its
+// place without holding more than it asked for.
 func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 	var set ruleSet
 	position := 0
@@ -768,10 +769,6 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 		}
 		for mi, mt := range ruleMatches {
 			where := fmt.Sprintf("%s, match %d", what, mi)
-			if len(mt.Headers) > 0 || len(mt.QueryParams) > 0 {
-				set.unsupported = append(set.unsupported, where+": matching on a header or a query parameter is not supported")
-				continue
-			}
 			kind, value := gwv1.PathMatchPathPrefix, "/"
 			if mt.Path != nil {
 				if mt.Path.Type != nil {
@@ -789,13 +786,18 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 					continue
 				}
 			}
+			conditions, problem := matchConditions(mt)
+			if problem != "" {
+				set.unsupported = append(set.unsupported, where+": "+problem)
+				continue
+			}
 			method := ""
 			if mt.Method != nil {
 				method = string(*mt.Method)
 			}
 			for _, host := range hosts {
 				set.matches = append(set.matches, gwMatch{
-					host: host, kind: kind, value: value, regex: written, method: method,
+					host: host, kind: kind, value: value, regex: written, method: method, conditions: conditions,
 					refused: refused, servers: servers, reqHeaders: req, respHeaders: resp, what: where,
 					created: rt.CreationTimestamp, route: types.NamespacedName{Namespace: rt.Namespace, Name: rt.Name}, position: position,
 				})
@@ -804,6 +806,72 @@ func (in gatewayInputs) rules(rt *gwv1.HTTPRoute, hosts []string) ruleSet {
 		}
 	}
 	return set
+}
+
+// gwConditions is what a match asks of a request beside its path and its
+// method: of its headers and of its query string.
+type gwConditions struct {
+	// exprs are the conditions as Synapse evaluates them, all of which
+	// have to hold.
+	exprs []string
+	// headers and query count them, for the order of precedence.
+	headers, query int
+}
+
+// queryLiteral matches a name or a value of a query parameter that reads
+// the same before and after percent-encoding. Synapse matches the query
+// string as the client sent it, and one that needs encoding can be sent in
+// more than one way.
+var queryLiteral = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+
+// matchConditions turns a match's headers and query parameters into
+// conditions, or says which of them cannot be evaluated.
+func matchConditions(mt gwv1.HTTPRouteMatch) (gwConditions, string) {
+	var c gwConditions
+	// A name given more than once counts the first time, as the API has it.
+	seen := map[string]bool{}
+	for _, h := range mt.Headers {
+		// Synapse holds headers by their names in lower case.
+		name := strings.ToLower(string(h.Name))
+		if seen["h "+name] {
+			continue
+		}
+		seen["h "+name] = true
+		values := "http.request.headers[" + wfString(name) + "][*]"
+		switch {
+		case h.Type == nil || *h.Type == gwv1.HeaderMatchExact:
+			c.exprs = append(c.exprs, fmt.Sprintf("any(%s eq %s)", values, wfString(h.Value)))
+		case *h.Type == gwv1.HeaderMatchRegularExpression:
+			written, err := canonicalRegex(h.Value)
+			if err != nil {
+				return c, fmt.Sprintf("header %s: %q cannot be used as a regular expression: %v", h.Name, h.Value, err)
+			}
+			// All of a value, as a header's value is one thing.
+			c.exprs = append(c.exprs, fmt.Sprintf("any(%s matches %s)", values, wfRegex("^(?:"+written+")$")))
+		default:
+			return c, fmt.Sprintf("header %s: a %s match is not supported", h.Name, *h.Type)
+		}
+		c.headers++
+	}
+	for _, q := range mt.QueryParams {
+		name := string(q.Name)
+		if seen["q "+name] {
+			continue
+		}
+		seen["q "+name] = true
+		switch {
+		case q.Type != nil && *q.Type != gwv1.QueryParamMatchExact:
+			return c, fmt.Sprintf("query parameter %s: a %s match is not supported", name, *q.Type)
+		case !queryLiteral.MatchString(name) || !queryLiteral.MatchString(q.Value):
+			return c, fmt.Sprintf("query parameter %s: a name or a value that is percent-encoded in a URL is not supported", name)
+		}
+		// One parameter of the query string, whole: `v=2`, not `xv=2` and
+		// not `v=20`.
+		c.exprs = append(c.exprs, "http.request.query matches "+
+			wfRegex("(^|&)"+regexp.QuoteMeta(name)+"="+regexp.QuoteMeta(q.Value)+"(&|$)"))
+		c.query++
+	}
+	return c, ""
 }
 
 // headerModifiers returns the headers a rule's filters set, as the
@@ -919,7 +987,8 @@ func (in gatewayInputs) backends(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule, se
 
 // rank orders matches the way the API says a request picks between them: an
 // exact path first, then the longest prefix, then a match on a method over
-// one without, then the older route. A regular expression, which the API
+// one without, then the one that asks for more headers, then for more query
+// parameters, then the older route. A regular expression, which the API
 // leaves open, goes between exact and prefix.
 func (a gwMatch) rank(b gwMatch) int {
 	kind := func(k gwv1.PathMatchType) int {
@@ -941,6 +1010,8 @@ func (a gwMatch) rank(b gwMatch) int {
 		cmp.Compare(kind(a.kind), kind(b.kind)),
 		cmp.Compare(length(a), length(b)),
 		cmp.Compare(hasMethod(a), hasMethod(b)),
+		cmp.Compare(b.conditions.headers, a.conditions.headers),
+		cmp.Compare(b.conditions.query, a.conditions.query),
 		a.created.Compare(b.created.Time),
 		cmp.Compare(a.route.String(), b.route.String()),
 		cmp.Compare(a.position, b.position),
@@ -949,7 +1020,8 @@ func (a gwMatch) rank(b gwMatch) int {
 
 // overlaps reports whether some request can match both a and b. It may say
 // yes when there is none, never no when there is one: what a regular
-// expression matches is not worked out.
+// expression matches is not worked out, nor what two matches ask of the
+// headers and the query string.
 func (a gwMatch) overlaps(b gwMatch) bool {
 	if a.method != "" && b.method != "" && a.method != b.method {
 		return false
@@ -974,9 +1046,10 @@ func (a gwMatch) overlaps(b gwMatch) bool {
 }
 
 // plain reports whether the match is one Synapse's plain paths express: a
-// path prefix, any method, with somewhere to send the request.
+// path prefix, any method, nothing asked of headers or of the query string,
+// with somewhere to send the request.
 func (a gwMatch) plain() bool {
-	return a.kind == gwv1.PathMatchPathPrefix && a.method == "" && !a.refused
+	return a.kind == gwv1.PathMatchPathPrefix && a.method == "" && len(a.conditions.exprs) == 0 && !a.refused
 }
 
 // expression is the match as Synapse evaluates it.
@@ -998,6 +1071,7 @@ func (a gwMatch) expression() string {
 	if a.method != "" {
 		parts = append(parts, "http.request.method eq "+wfString(a.method))
 	}
+	parts = append(parts, a.conditions.exprs...)
 	if len(parts) == 0 {
 		// Every request. An expression has to say something.
 		return `http.request.path matches "^/"`
