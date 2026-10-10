@@ -113,6 +113,23 @@ func TestRenderUpstreams_EverySolverIsARouteOfItsHost(t *testing.T) {
 	}
 }
 
+// In a v1 file a path that says nothing of headers takes the lists of the
+// nearest path above it. A solver says that it has none, or what its host
+// sets for `/`, a credential for the backend it may be, would go to the
+// solver's pod.
+func TestRenderUpstreams_ASolverTakesNoHeadersFromItsHost(t *testing.T) {
+	const token = "/.well-known/acme-challenge/tok"
+	m := newRenderModel()
+	m.addRoute("a.example.com", "/", []backend{{addr: "app:80"}},
+		annSettings{reqHeaders: []string{"Authorization: Bearer x"}, respHeaders: []string{"X-Frame-Options: DENY"}}, nil, nil)
+	m.addSolver("a.example.com", token, "solver:8089")
+	out := renderUpstreams(m)
+	want := fmt.Sprintf("      %q:\n        servers:\n          - \"solver:8089\"\n        ssl_enabled: false\n        request_headers: []\n        response_headers: []\n", token)
+	if !strings.Contains(out, want) {
+		t.Errorf("the solver's route does not say it has no headers:\n%s", out)
+	}
+}
+
 // In a v1 file the host `*` serves every name that has no other. A solver
 // for such a name is a path of `*`: a host written for it would take the
 // name's other requests from there.
