@@ -721,8 +721,21 @@ func TestSynapseProxy(t *testing.T) {
 				},
 			},
 		}
-		// Every name under a wildcard, where Synapse 0.8.7 tries plain
-		// paths and nothing else.
+		// And on one that has an exact match, where every route is chosen
+		// by an expression and has no path its headers could be found by.
+		headersByExpression := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-headers-by-expression"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"xheaders." + host},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop"), Filters: []gwv1.HTTPRouteFilter{setRequest}},
+					{Matches: match(gwv1.PathMatchExact, "/exact", ""), BackendRefs: to("api"), Filters: []gwv1.HTTPRouteFilter{setResponse}},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/bare", ""), BackendRefs: to("api")},
+				},
+			},
+		}
+		// Every name under a wildcard, with every kind of match.
 		wildcard := &gwv1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-wildcard"},
 			Spec: gwv1.HTTPRouteSpec{
@@ -760,7 +773,7 @@ func TestSynapseProxy(t *testing.T) {
 				Type:       corev1.SecretTypeTLS,
 				Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
 			},
-			gw, route, unsupported, headers, wildcard,
+			gw, route, unsupported, headers, headersByExpression, wildcard,
 		)
 
 		accepted := func(rt *gwv1.HTTPRoute) (*metav1.Condition, string) {
@@ -789,7 +802,7 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the route that matches on a header is %+v, want False/UnsupportedValue", cond)
 			}
 			// What is left out of a route that is served is said too.
-			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", wildcard: "wildcard host", headers: ""} {
+			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", wildcard: "", headers: "", headersByExpression: ""} {
 				switch cond, reason := accepted(rt); {
 				case reason != "":
 					return reason
@@ -809,11 +822,11 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
 			case len(gw.Status.Addresses) == 0:
 				return "the Gateway has no address"
-			// Both routes attach to the listener for every host, the one
-			// that cannot be programmed too: attaching is about who may,
-			// not about what the route then asks for. Only the first is
-			// for the host the other listener serves.
-			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 4 || gw.Status.Listeners[1].AttachedRoutes != 1:
+			// All five routes attach to the listener for every host, the
+			// one that cannot be programmed too: attaching is about who
+			// may, not about what the route then asks for. Only the first
+			// is for the host the other listener serves.
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 5 || gw.Status.Listeners[1].AttachedRoutes != 1:
 				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
 			}
 			return ""
@@ -874,41 +887,45 @@ func TestSynapseProxy(t *testing.T) {
 		// Headers are set by Synapse, by rules of its own about which
 		// route's it takes for a request.
 		type headerCase struct {
-			path, backend string
+			host, path, backend string
 			// seen is what the backend was sent in X-From-Gateway, and
 			// resp what the client got in X-Resp.
 			seen, resp string
 		}
 		eventually(t, afterASync, "each rule's headers are set, on its requests and on no others", func() string {
 			for _, hc := range []headerCase{
-				{"/", "shop", "yes", ""},
-				{"/deep/down", "shop", "yes", ""},
+				{"headers", "/", "shop", "yes", ""},
+				{"headers", "/deep/down", "shop", "yes", ""},
 				// Not the ones of the rule above it.
-				{"/bare/x", "api", "", ""},
-				{"/resp", "api", "", "1"},
+				{"headers", "/bare/x", "api", "", ""},
+				{"headers", "/resp", "api", "", "1"},
+				// The same where the routes are chosen by expressions.
+				{"xheaders", "/", "shop", "yes", ""},
+				{"xheaders", "/deep/down", "shop", "yes", ""},
+				{"xheaders", "/exact", "api", "", "1"},
+				{"xheaders", "/exact/x", "shop", "yes", ""},
+				{"xheaders", "/bare/x", "api", "", ""},
 			} {
-				a, err := c.request("GET", "http", "headers."+gatewayHost, hc.path)
+				a, err := c.request("GET", "http", hc.host+"."+gatewayHost, hc.path)
 				switch {
 				case err != nil:
 					return err.Error()
 				case a.status != http.StatusOK || a.backend != hc.backend:
-					return fmt.Sprintf("%s answered %d from %q, want 200 from %q", hc.path, a.status, a.backend, hc.backend)
+					return fmt.Sprintf("%s answered %d from %q, want 200 from %q", hc.host+hc.path, a.status, a.backend, hc.backend)
 				case a.header.Get("X-Seen-From-Gateway") != hc.seen:
-					return fmt.Sprintf("%s: the backend was sent X-From-Gateway %q, want %q", hc.path, a.header.Get("X-Seen-From-Gateway"), hc.seen)
+					return fmt.Sprintf("%s: the backend was sent X-From-Gateway %q, want %q", hc.host+hc.path, a.header.Get("X-Seen-From-Gateway"), hc.seen)
 				case a.header.Get("X-Resp") != hc.resp:
-					return fmt.Sprintf("%s: the client got X-Resp %q, want %q", hc.path, a.header.Get("X-Resp"), hc.resp)
+					return fmt.Sprintf("%s: the client got X-Resp %q, want %q", hc.host+hc.path, a.header.Get("X-Resp"), hc.resp)
 				// What is set for the backend is not sent back.
 				case a.header.Get("X-From-Gateway") != "":
-					return fmt.Sprintf("%s: the client got the request header back: X-From-Gateway %q", hc.path, a.header.Get("X-From-Gateway"))
+					return fmt.Sprintf("%s: the client got the request header back: X-From-Gateway %q", hc.host+hc.path, a.header.Get("X-From-Gateway"))
 				}
 			}
 			return ""
 		})
 
-		eventually(t, afterASync, "a wildcard host serves its path prefixes", func() string {
-			// The exact path is left out, and its requests are the
-			// first rule's as if it were not there.
-			for path, backend := range map[string]string{"/": "shop", "/api/x": "api", "/only": "shop"} {
+		eventually(t, afterASync, "a wildcard host serves every kind of match", func() string {
+			for path, backend := range map[string]string{"/": "shop", "/api/x": "api", "/only": "api", "/only/more": "shop"} {
 				for _, name := range []string{"a.wild." + gatewayHost, "deep.er.wild." + gatewayHost} {
 					a, err := c.request("GET", "http", name, path)
 					switch {

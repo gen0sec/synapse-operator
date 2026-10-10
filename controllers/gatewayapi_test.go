@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -200,11 +201,10 @@ func wantListener(t *testing.T, st gatewayStatuses, listener, kind string, statu
 }
 
 // server returns where a request ends up, by the rules Synapse applies to
-// what was rendered for the host: a plain path that is the request's path,
-// then the expressions, then the longest plain path that is a prefix. The
-// expressions are evaluated here, by evalRouteExpr; more than one of them
-// being true for a request fails the test, because Synapse tries them in no
-// particular order.
+// what was rendered for the host: a plain path that is the request's path;
+// then the routes chosen by an expression, in the order of their keys, the
+// first whose expression holds; then the longest plain path that is a
+// prefix. The expressions are evaluated here, by evalRouteExpr.
 func server(t *testing.T, m *renderModel, host, method, path string) string {
 	t.Helper()
 	routes := m.hosts[host]
@@ -217,18 +217,10 @@ func server(t *testing.T, m *renderModel, host, method, path string) string {
 	if rc, ok := routes[path]; ok && rc.matchExpr == "" {
 		return first(rc)
 	}
-	var hits []string
-	for label, rc := range routes {
-		if rc.matchExpr != "" && evalRouteExpr(t, rc.matchExpr, method, path) {
-			hits = append(hits, label+" -> "+first(rc))
+	for _, label := range sortedKeys(routes) {
+		if rc := routes[label]; rc.matchExpr != "" && evalRouteExpr(t, rc.matchExpr, method, path) {
+			return first(rc)
 		}
-	}
-	switch len(hits) {
-	case 0:
-	case 1:
-		return strings.SplitN(hits[0], " -> ", 2)[1]
-	default:
-		t.Fatalf("%s %s on %s is claimed by more than one expression: %v", method, path, host, hits)
 	}
 	for p := path; ; {
 		i := strings.LastIndex(p, "/")
@@ -1302,32 +1294,44 @@ func TestGateway_AddingToAHeaderIsRefused(t *testing.T) {
 	}
 }
 
-// Synapse finds a route's headers by the request's path, among the plain
-// paths. Those of a route matched by an expression are never found, so on a
-// host that needs expressions a rule that sets headers cannot be carried
-// out. It is not served without them.
+// A rule's headers go with its route on a host of expressions as well: a
+// route chosen by an expression has headers of its own, as one chosen by a
+// path has.
 func TestGateway_HeadersOnAHostOfExpressions(t *testing.T) {
 	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
 	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil,
 		to("app", prefix("/")),
 		to("app2", exact("/exact")),
-		setHeaders(to("app3", prefix("/secure")), nil, []gwv1.HTTPHeader{{Name: "Strict-Transport-Security", Value: "max-age=1"}}),
+		setHeaders(to("app3", prefix("/secure")), []gwv1.HTTPHeader{{Name: "X-Secure", Value: "1"}}, []gwv1.HTTPHeader{{Name: "Strict-Transport-Security", Value: "max-age=1"}}),
 	)}
 	m, st := w.translate()
 	wantRoute(t, st, "shop", "Accepted", metav1.ConditionTrue, "Accepted")
-	c := routeCondition(t, st, "shop", "PartiallyInvalid")
-	if c == nil || !strings.Contains(c.Message, "rule 2, match 0 on shop.example.com: headers cannot be set") {
-		t.Fatalf("PartiallyInvalid = %+v, want it to name the rule and the host", c)
+	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
+		t.Fatalf("all of it can be served, yet: %s", c.Message)
 	}
-	for path, want := range map[string]string{"/": "10.0.0.1:80", "/exact": "10.0.0.2:80", "/secure": "", "/secure/x": "", "/securely": "10.0.0.1:80"} {
+	for path, want := range map[string]string{"/": "10.0.0.1:80", "/exact": "10.0.0.2:80", "/secure": "10.0.0.3:80", "/secure/x": "10.0.0.3:80", "/securely": "10.0.0.1:80"} {
 		if got := server(t, m, "shop.example.com", "GET", path); got != want {
 			t.Errorf("GET %s goes to %q, want %q", path, got, want)
 		}
 	}
-	for label, rc := range m.hosts["shop.example.com"] {
-		if len(rc.reqHeaders)+len(rc.respHeaders) > 0 {
-			t.Errorf("%s carries headers Synapse will never apply", label)
+	// In the file a proxy reads: on the route that has them, and on no
+	// other.
+	m.sameAsV1 = true
+	routes := parseV2(t, renderUpstreamsV2(m)).Hosts["shop.example.com"].Paths
+	if len(routes) != 3 {
+		t.Fatalf("%d routes, want 3", len(routes))
+	}
+	for key, route := range routes {
+		if route.MatchExpr == "" {
+			t.Errorf("route %q of a host with an exact match is a plain path", key)
+		}
+		var req, resp []string
+		if route.Upstream == "10.0.0.3:80" {
+			req, resp = []string{"X-Secure: 1"}, []string{"Strict-Transport-Security: max-age=1"}
+		}
+		if !slices.Equal(route.Headers.Request, req) || !slices.Equal(route.Headers.Response, resp) {
+			t.Errorf("route %q to %s has headers %+v", key, route.Upstream, route.Headers)
 		}
 	}
 }
@@ -1384,10 +1388,12 @@ func TestGateway_ARuleThatCannotBeCarriedOutKeepsItsRequests(t *testing.T) {
 	}
 }
 
-// Each expression names the ones ranked above it that a request could match
-// as well, and no others: every one it names is evaluated for every request,
-// and written once more into the file.
-func TestGateway_AnExpressionExcludesOnlyWhatOverlapsIt(t *testing.T) {
+// Synapse tries a host's expressions in the order of their keys, and the
+// first that holds has the request. The keys are numbered in the order the
+// matches win in, so no expression has to say what it is not; the one thing
+// that is said is a rule that cannot be carried out, by the matches below
+// it that would otherwise take its requests.
+func TestGateway_ExpressionsAreKeyedInTheOrderTheyWin(t *testing.T) {
 	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
 	rules := []gwv1.HTTPRouteRule{to("app", prefix("/")), to("app2", prefix("/x")), to("app3", prefix("/x/deep")), to("app4", onMethod("POST", prefix("/y")))}
@@ -1397,35 +1403,33 @@ func TestGateway_AnExpressionExcludesOnlyWhatOverlapsIt(t *testing.T) {
 	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, rules...)}
 	m, _ := w.translate()
 
-	total := 0
-	var root, x, deep string
-	for _, rc := range m.hosts["shop.example.com"] {
-		total += len(rc.matchExpr)
-		switch own, _, _ := strings.Cut(rc.matchExpr, " and not "); own {
-		case `(http.request.path matches "^/")`:
-			root = rc.matchExpr
-		case `((http.request.path eq "/x" or http.request.path matches "^/x/"))`:
-			x = rc.matchExpr
-		case `((http.request.path eq "/x/deep" or http.request.path matches "^/x/deep/"))`:
-			deep = rc.matchExpr
+	routes := m.hosts["shop.example.com"]
+	if len(routes) != 154 {
+		t.Fatalf("%d routes, want 154", len(routes))
+	}
+	labels := sortedKeys(routes)
+	longest := 0
+	for i, label := range labels {
+		rc := routes[label]
+		longest = max(longest, len(rc.matchExpr))
+		// As text, which is how Synapse compares them: `gateway:10` would
+		// come before `gateway:9`.
+		if want := fmt.Sprintf("gateway:%05d", i); label != want {
+			t.Fatalf("the route at %d is keyed %q, want %q", i, label, want)
+		}
+		if strings.Contains(rc.matchExpr, "not") {
+			t.Errorf("%s says what it is not, with nothing refused: %s", label, rc.matchExpr)
 		}
 	}
-	if root == "" || x == "" || deep == "" {
-		t.Fatalf("expressions not found: root %q, /x %q, /x/deep %q", root, x, deep)
+	// Exact paths, then the longer prefixes, then the root.
+	if first, last := routes[labels[0]].matchExpr, routes[labels[153]].matchExpr; !strings.Contains(first, `eq "/item/`) || last != `http.request.path matches "^/"` {
+		t.Errorf("the first expression is %s and the last %s", first, last)
 	}
-	if strings.Contains(deep, "and not") {
-		t.Errorf("/x/deep has nothing above it that it meets, yet excludes: %s", deep)
-	}
-	if !strings.Contains(x, `"/x/deep"`) || strings.Contains(x, "/item/") || strings.Contains(x, `"/y"`) {
-		t.Errorf("/x excludes what is under it and nothing else: %s", x)
-	}
-	if !strings.Contains(root, `"/item/149"`) || !strings.Contains(root, `"/y"`) || !strings.Contains(root, `"/x"`) {
-		t.Errorf("/ is met by everything, and excludes it all: %.200s", root)
-	}
-	// 154 matches. Each naming all of those above it came to over a megabyte,
-	// which is more than a ConfigMap holds.
-	if total > 64<<10 {
-		t.Errorf("the host's expressions are %d bytes", total)
+	// No expression grows with the matches ranked above it. Naming the 150
+	// exact paths it lies under took the one for `/` to 6 kB, all of it
+	// evaluated for every request that got that far.
+	if longest > 100 {
+		t.Errorf("the longest of the host's expressions is %d bytes", longest)
 	}
 	for path, want := range map[string]string{"/": "10.0.0.1:80", "/x": "10.0.0.2:80", "/x/deep/er": "10.0.0.3:80", "/item/007": "10.0.0.2:80", "/item/7": "10.0.0.1:80"} {
 		if got := server(t, m, "shop.example.com", "GET", path); got != want {
@@ -1434,6 +1438,31 @@ func TestGateway_AnExpressionExcludesOnlyWhatOverlapsIt(t *testing.T) {
 	}
 	if got := server(t, m, "shop.example.com", "POST", "/y/z"); got != "10.0.0.4:80" {
 		t.Errorf("POST /y/z goes to %q", got)
+	}
+
+	// A rule that cannot be carried out, between two that can.
+	refused := to("app3", prefix("/x/held"))
+	refused.Timeouts = &gwv1.HTTPRouteTimeouts{}
+	w = newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", nil, to("app", prefix("/")), to("app2", prefix("/x")), to("app4", prefix("/y")), to("app4", exact("/x/held/open")), refused)}
+	m, _ = w.translate()
+	for _, rc := range m.hosts["shop.example.com"] {
+		switch excludes := strings.HasSuffix(rc.matchExpr, `) and not (((http.request.path eq "/x/held" or http.request.path matches "^/x/held/")))`); rc.servers[0].addr {
+		case "10.0.0.1:80", "10.0.0.2:80": // `/` and `/x`: a request for /x/held matches them too
+			if !excludes {
+				t.Errorf("a match the refused rule lies under does not leave its requests alone: %s", rc.matchExpr)
+			}
+		default: // `/y` does not meet it, and the exact path is ranked above it
+			if strings.Contains(rc.matchExpr, "not") {
+				t.Errorf("a match that has nothing to do with the refused rule excludes: %s", rc.matchExpr)
+			}
+		}
+	}
+	for path, want := range map[string]string{"/x/held": "", "/x/held/more": "", "/x/held/open": "10.0.0.4:80", "/x/other": "10.0.0.2:80", "/y": "10.0.0.4:80", "/": "10.0.0.1:80"} {
+		if got := server(t, m, "shop.example.com", "GET", path); got != want {
+			t.Errorf("GET %s goes to %q, want %q", path, got, want)
+		}
 	}
 }
 
@@ -1475,35 +1504,27 @@ func TestGatewayMatch_Overlaps(t *testing.T) {
 	}
 }
 
-// Synapse up to 0.8.7 does not try the expressions of a wildcard host: a
-// request for a name under it finds the host's plain paths and nothing
-// else. Written as expressions, every route of the host would answer 404.
-func TestGateway_AWildcardHostIsPlainPaths(t *testing.T) {
+// A wildcard host takes every kind of match, like any other.
+func TestGateway_AWildcardHostTakesEveryKindOfMatch(t *testing.T) {
 	w := newGwWorld()
 	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "*.example.com"))}
-	refused := to("app4", prefix("/old"))
-	refused.Timeouts = &gwv1.HTTPRouteTimeouts{}
 	w.in.routes = []gwv1.HTTPRoute{
 		httpRoute("web", nil, to("app", prefix("/")), to("app2", prefix("/api"))),
-		httpRoute("extra", nil, to("app3", exact("/health")), to("app3", onMethod("POST", prefix("/upload"))), to("app3", regex("/v[0-9]+")), refused),
+		httpRoute("extra", nil, to("app3", exact("/only")), to("app4", onMethod("POST", prefix("/upload"))), to("app3", regex("/v[0-9]+"))),
 	}
 	m, st := w.translate()
-	wantRoute(t, st, "web", "Accepted", metav1.ConditionTrue, "Accepted")
-	wantRoute(t, st, "extra", "Accepted", metav1.ConditionFalse, "UnsupportedValue")
-	c := routeCondition(t, st, "extra", "Accepted")
-	for _, part := range []string{"rule 0, match 0 on *.example.com: only a path prefix", "rule 1, match 0 on *.example.com", "rule 2, match 0 on *.example.com", "rule 3: timeouts"} {
-		if !strings.Contains(c.Message, part) {
-			t.Errorf("the message does not say %q: %s", part, c.Message)
+	for _, route := range []string{"web", "extra"} {
+		wantRoute(t, st, route, "Accepted", metav1.ConditionTrue, "Accepted")
+		if c := routeCondition(t, st, route, "PartiallyInvalid"); c != nil {
+			t.Errorf("route %s can be served whole, yet: %s", route, c.Message)
 		}
 	}
-	for label, rc := range m.hosts["*.example.com"] {
-		if rc.matchExpr != "" {
-			t.Errorf("%s is an expression, which Synapse does not try on a wildcard host: %s", label, rc.matchExpr)
-		}
-	}
-	for path, want := range map[string]string{"/": "10.0.0.1:80", "/api/x": "10.0.0.2:80", "/health": "10.0.0.1:80", "/v2": "10.0.0.1:80"} {
-		if got := server(t, m, "*.example.com", "GET", path); got != want {
-			t.Errorf("GET %s goes to %q, want %q", path, got, want)
+	for _, c := range []struct{ method, path, want string }{
+		{"GET", "/", "10.0.0.1:80"}, {"GET", "/api/x", "10.0.0.2:80"}, {"GET", "/only", "10.0.0.3:80"}, {"GET", "/only/more", "10.0.0.1:80"},
+		{"POST", "/upload/x", "10.0.0.4:80"}, {"GET", "/upload/x", "10.0.0.1:80"}, {"GET", "/v2", "10.0.0.3:80"},
+	} {
+		if got := server(t, m, "*.example.com", c.method, c.path); got != c.want {
+			t.Errorf("%s %s goes to %q, want %q", c.method, c.path, got, c.want)
 		}
 	}
 }

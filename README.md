@@ -277,8 +277,6 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
 
 **Limits that come from how Synapse routes:**
 
-- **Headers can be set on a host of path prefixes only.** A host where every match is a `PathPrefix` for any method is written as plain paths, and any other host as expressions. Synapse finds a route's headers by the request's path among the plain paths. On a host written as expressions a rule that sets headers cannot be carried out, and is not served without them.
-- **A wildcard host serves path prefixes only.** Synapse up to 0.8.7 does not evaluate expressions for a wildcard host. An exact path, a method or a regular expression on `*.example.com` is left out.
 - **Regular expressions are ASCII, and bounded.** Synapse's regex engine runs without Unicode: a character class may not hold a character outside ASCII, and a letter outside ASCII has no other case. An expression may be 1024 bytes with its classes written out as ranges. A `RegularExpression` match ranks between `Exact` and `PathPrefix`.
 - **A route belongs to a host, not to a listener.** One attached to a single listener of a Gateway is served on every listener of the proxy, the plain-HTTP ones included.
 - **A route that names no host needs a listener that names one.** Synapse has no host that stands for all others. On a listener without a hostname such a route is not served, and says so.
