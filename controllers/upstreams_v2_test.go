@@ -343,7 +343,6 @@ func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 	for _, host := range []string{"plain.example.com", "expr.example.com", "new.example.com"} {
 		m.addSolver(host, token, "solver.ns.svc:8089")
 	}
-	m.acme = "solver.ns.svc:8089"
 	rendered := renderUpstreamsV2(m)
 	doc := parseV2(t, rendered)
 	if len(doc.Internal) != 0 {
@@ -370,14 +369,62 @@ func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 		t.Error("a solver made its host one that is routed")
 	}
 
-	// The older modes write what they wrote.
+	// The older modes' v2 file, which is written beside a passthrough host,
+	// has the same solver routes, and the solver says plain HTTP although
+	// that file does not say it of any other route.
 	m.sameAsV1 = false
-	doc = parseV2(t, renderUpstreamsV2(m))
-	if len(doc.Internal) != 1 || doc.Internal[0].Upstream != "solver.ns.svc:8089" {
-		t.Errorf("the older modes' internal paths are %+v", doc.Internal)
+	rendered = renderUpstreamsV2(m)
+	doc = parseV2(t, rendered)
+	if len(doc.Internal) != 0 {
+		t.Errorf("the older modes' file has a list of internal paths:\n%s", rendered)
 	}
-	if _, ok := doc.Hosts["plain.example.com"].Paths[token]; ok {
-		t.Error("the older modes' file has the solver as a route")
+	for host, others := range map[string]int{"plain.example.com": 1, "expr.example.com": 1, "new.example.com": 0} {
+		paths := doc.Hosts[host].Paths
+		route, ok := paths[token]
+		switch {
+		case !ok || route.Upstream != "solver.ns.svc:8089" || route.MatchExpr != "":
+			t.Errorf("older modes, %s: the solver's route is %+v\n%s", host, route, rendered)
+		case route.SSLEnabled == nil || *route.SSLEnabled:
+			t.Errorf("older modes, %s: the solver is not said to be reached in plain HTTP", host)
+		case len(paths) != others+1:
+			t.Errorf("older modes, %s has %d routes, want %d", host, len(paths), others+1)
+		}
+	}
+	if r := doc.Hosts["plain.example.com"].Paths["/"]; r.SSLEnabled != nil {
+		t.Errorf("another route of the older modes' file now says ssl_enabled: %v", *r.SSLEnabled)
+	}
+}
+
+// A passthrough Ingress and a solver for its host, in the older modes: the
+// challenge cannot be answered, and the Ingress of the solver is told.
+func TestRender_TheOlderModesSaySolverUnreachable(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	raw := routedIngress("raw", ptr("synapse"), "raw.example.com")
+	raw.Annotations = map[string]string{"synapse.gen0sec.com/ssl-passthrough": "true"}
+	solver := routedIngress("cm-acme-http-solver-0", ptr("synapse"), "raw.example.com")
+	solver.Spec.Rules[0].HTTP.Paths[0].Path = "/.well-known/acme-challenge/tok"
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(raw, solver).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out,
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	told := 0
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.HasPrefix(event, corev1.EventTypeWarning+" SolverUnreachable ") {
+			told++
+		}
+	}
+	if told != 1 {
+		t.Errorf("%d solvers were told they cannot be reached, want 1", told)
+	}
+	rendered, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc := parseV2(t, string(rendered)); len(doc.Hosts["raw.example.com"].Paths) != 0 {
+		t.Errorf("the passthrough host has paths:\n%s", rendered)
 	}
 }
 
