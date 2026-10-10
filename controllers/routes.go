@@ -88,6 +88,10 @@ type routeCfg struct {
 	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// noHeaders has a v1 file say that the route has no header lists,
+	// where saying nothing takes those of the nearest path above it. A v2
+	// route's headers are its own without that.
+	noHeaders bool
 	// Headers the route adds a value to, as "Name: value" lines, and
 	// names of headers it removes. Only the v2 schema has these; the v1
 	// writer leaves them out.
@@ -314,7 +318,8 @@ func (m *renderModel) solverHosts(hostKeys []string, solved map[string]map[strin
 // too, and the first of them.
 //
 // A solver is reached in plain HTTP, which is said so, whichever schema it
-// is written in.
+// is written in; and with no headers of its host's, which a v1 file has to
+// be told.
 func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[string]*routeCfg {
 	out := map[string]*routeCfg{}
 	expressions := slices.ContainsFunc(sortedKeys(paths), func(p string) bool { return paths[p].matchExpr != "" })
@@ -323,7 +328,7 @@ func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[s
 			continue
 		}
 		plain := false
-		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain}
+		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain, noHeaders: true}
 		if p == acmeChallengePrefix && expressions {
 			rc.matchExpr = fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
 				wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/"))
@@ -972,8 +977,8 @@ func writeHeaderLists(b *strings.Builder, rc *routeCfg) {
 			fmt.Fprintf(b, "        %s: []\n", key)
 		}
 	}
-	write("request_headers", rc.reqHeaders, false)
-	write("response_headers", rc.respHeaders, len(rc.reqHeaders) > 0)
+	write("request_headers", rc.reqHeaders, rc.noHeaders)
+	write("response_headers", rc.respHeaders, rc.noHeaders || len(rc.reqHeaders) > 0)
 }
 
 // plainPathKey is the key a plain path is stored under: without a trailing
