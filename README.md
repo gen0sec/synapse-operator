@@ -261,7 +261,7 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
 | Listeners | `HTTP` and `HTTPS` (terminated), on a port the `SynapseProxy` listens on with that protocol |
 | Who may attach | `allowedRoutes` by namespace (`Same`, `All`, `Selector`); a parent's `sectionName` and `port` |
 | Hosts | exact names and wildcards; a route that names no host takes its listener's |
-| Matches | `PathPrefix`, `Exact` and `RegularExpression` paths, and `method`, in the precedence the API gives them |
+| Matches | `PathPrefix`, `Exact` and `RegularExpression` paths, `method`, headers (`Exact` and `RegularExpression`) and query parameters (`Exact`), in the precedence the API gives them |
 | Backends | Services, with weights; one in another namespace needs a `ReferenceGrant` |
 | Certificates | a listener's `certificateRefs`; one in another namespace needs a `ReferenceGrant` |
 | Filters | setting request and response headers |
@@ -273,10 +273,12 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
   - a redirect, URL-rewrite or mirror filter, a filter on a backend, or a header filter that removes a header or adds to one. Synapse replaces a header's value, which is what `set` asks for;
   - timeouts, retries or session persistence;
   - a backend that cannot be used: one that does not exist, is not a Service, or is in another namespace without a `ReferenceGrant`. One such backend among several is enough. Synapse cannot fail a share of the requests, and the other backends were not asked to take them. The route says which in `ResolvedRefs`.
-- **A match the proxy cannot evaluate is left out,** and what it would have matched is served as if the match were not there, by the route's other matches and by other routes. This is a match on a header or on a query parameter, and a regular expression that cannot be used.
+- **A match the proxy cannot evaluate is left out,** and what it would have matched is served as if the match were not there, by the route's other matches and by other routes. This is a query parameter matched by a regular expression, a query parameter whose name or value would be percent-encoded in a URL, and a regular expression that cannot be used.
 
 **Limits that come from how Synapse routes:**
 
+- **A header's value is matched whole, and as it is.** `Exact` is the value byte for byte, case included. A header sent on several lines matches when one of them fits; one line with commas in it is one value.
+- **A query parameter is matched as the client wrote it.** `beta=1` matches that parameter wherever it stands in the query string, and not `beta=10`. It does not match `beta=%31`, which says the same in another spelling; a name or a value that has to be percent-encoded is not served for that reason. A parameter given more than once matches when one of its values does.
 - **Regular expressions are ASCII, and bounded.** Synapse's regex engine runs without Unicode: a character class may not hold a character outside ASCII, and a letter outside ASCII has no other case. An expression may be 1024 bytes with its classes written out as ranges. A `RegularExpression` match ranks between `Exact` and `PathPrefix`.
 - **A route belongs to a host, not to a listener.** One attached to a single listener of a Gateway is served on every listener of the proxy, the plain-HTTP ones included.
 - **A route that names no host needs a listener that names one.** Synapse has no host that stands for all others. On a listener without a hostname such a route is not served, and says so.
