@@ -496,6 +496,15 @@ func TestSynapseProxy(t *testing.T) {
 		solver.Spec.Rules[0].HTTP.Paths[0].Path = challenge
 		solver.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
 
+		// And one for a name that a wildcard host serves. The proxy serves
+		// a request as one host, the one of its name before any wildcard:
+		// the solver must not be a host of its own, or the rest of the
+		// name's requests would be its and not the wildcard's.
+		const wildHost, underWild = "*.wild.e2e.test", "name.wild.e2e.test"
+		wildSolver := ingress("cm-acme-http-solver-wild", className, underWild, "api")
+		wildSolver.Spec.Rules[0].HTTP.Paths[0].Path = challenge
+		wildSolver.Spec.Rules[0].HTTP.Paths[0].PathType = ptrTo(networkingv1.PathTypeImplementationSpecific)
+
 		// The class hands its Ingresses to a proxy that does not exist yet.
 		group, scope, ns := synapsev1alpha1.GroupVersion.Group, networkingv1.IngressClassParametersReferenceScopeNamespace, proxyNamespace
 		c.create(t,
@@ -510,6 +519,8 @@ func TestSynapseProxy(t *testing.T) {
 			},
 			ingress("shop", className, shopHost, "shop"),
 			solver,
+			ingress("wild", className, wildHost, "shop"),
+			wildSolver,
 		)
 
 		c.create(t, &synapsev1alpha1.SynapseProxy{
@@ -549,6 +560,12 @@ func TestSynapseProxy(t *testing.T) {
 		}
 		if a, err := c.request(http.MethodGet, "http", shopHost, challenge); err != nil || a.status != http.StatusOK || a.backend != "api" {
 			t.Errorf("the challenge is answered %d by %q (%v), want 200 by the solver", a.status, a.backend, err)
+		}
+		if a, err := c.request(http.MethodGet, "http", underWild, challenge); err != nil || a.status != http.StatusOK || a.backend != "api" {
+			t.Errorf("the challenge under a wildcard host is answered %d by %q (%v), want 200 by the solver", a.status, a.backend, err)
+		}
+		if problem := c.routed("http", underWild, "shop"); problem != "" {
+			t.Errorf("a name with a solver is no longer served by its wildcard host: %s", problem)
 		}
 		a, err := c.get("http", shopHost)
 		if err != nil {

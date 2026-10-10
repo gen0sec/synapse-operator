@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"regexp"
 	"regexp/syntax"
 	"slices"
 	"sort"
@@ -196,10 +197,80 @@ func (m *renderModel) addSolver(host, path, addr string) {
 	if m.solvers[host] == nil {
 		m.solvers[host] = map[string]string{}
 	}
+	// As a plain path is keyed: Synapse walks up the request's path and
+	// never arrives at a key that ends in a slash.
+	path = plainPathKey(path)
 	if _, ok := m.solvers[host][path]; !ok {
 		m.solvers[host][path] = addr
 	}
 }
+
+// solverHost is the host that serves requests for name, which is where a
+// solver for name has to be a path: Synapse serves a request as one host
+// and looks no further. That is the host of that name; or else the wildcard
+// host with the longest suffix that covers it; or else none yet, and name
+// is written for the solver. ok is false when the host is a passthrough
+// host, which is handed on as it comes and has no paths.
+func (m *renderModel) solverHost(name string) (host string, ok bool) {
+	if _, passed := m.passthroughHosts[name]; passed {
+		return name, false
+	}
+	if _, routed := m.hosts[name]; routed {
+		return name, true
+	}
+	covers := func(h string) bool {
+		suffix, wild := strings.CutPrefix(h, "*")
+		return wild && len(suffix) > len(host)-1 && len(name) > len(suffix) &&
+			strings.EqualFold(name[len(name)-len(suffix):], suffix)
+	}
+	ok = true
+	for h := range m.hosts {
+		if covers(h) {
+			host, ok = h, true
+		}
+	}
+	for h := range m.passthroughHosts {
+		if covers(h) {
+			host, ok = h, false
+		}
+	}
+	if host == "" {
+		return name, true
+	}
+	return host, ok
+}
+
+// solverRoutes are the solvers' paths by the host each is written under,
+// for those that can be served. Of two solvers for one path on one host,
+// the one of the first name is kept.
+func (m *renderModel) solverRoutes() map[string]map[string]string {
+	names := make([]string, 0, len(m.solvers))
+	for name := range m.solvers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := map[string]map[string]string{}
+	for _, name := range names {
+		host, ok := m.solverHost(name)
+		if !ok {
+			continue
+		}
+		if out[host] == nil {
+			out[host] = map[string]string{}
+		}
+		for p, addr := range m.solvers[name] {
+			if _, taken := out[host][p]; !taken {
+				out[host][p] = addr
+			}
+		}
+	}
+	return out
+}
+
+// solverDirKey is the key of the route for a solver of the whole challenge
+// directory on a host that has expression routes. Synapse tries those in
+// the order of their keys, and this one is before `expr:` and `gateway:`.
+const solverDirKey = "acme:challenge"
 
 // hostKeyProblem says why Synapse would not take name as a host of a v2
 // file, which it then refuses as a whole; "" when it would.
@@ -909,13 +980,14 @@ func renderUpstreamsV2(m *renderModel) string {
 	for h := range m.passthroughHosts {
 		hostKeys = append(hostKeys, h)
 	}
+	var solverRoutes map[string]map[string]string
 	if m.sameAsV1 {
-		// A host that has a solver and nothing else is written for it.
-		for h := range m.solvers {
+		// A name that has a solver, and no host that serves it, is
+		// written for the solver.
+		solverRoutes = m.solverRoutes()
+		for h := range solverRoutes {
 			if _, routed := m.hosts[h]; !routed {
-				if _, passed := m.passthroughHosts[h]; !passed {
-					hostKeys = append(hostKeys, h)
-				}
+				hostKeys = append(hostKeys, h)
 			}
 		}
 	}
@@ -952,16 +1024,26 @@ func renderUpstreamsV2(m *renderModel) string {
 		// the challenge, which Synapse tries before the host's
 		// expressions and, among plain paths, is the longest. A route the
 		// host has for that very path keeps it.
+		//
+		// A solver for the whole challenge directory is a prefix, which
+		// Synapse tries after the host's expressions. On a host that has
+		// any, it is an expression too, and the first of them.
 		solvers := map[string]*routeCfg{}
-		if m.sameAsV1 {
-			for p, addr := range m.solvers[h] {
-				if _, routed := paths[p]; !routed {
-					solvers[p] = &routeCfg{servers: []backend{{addr: addr}}}
-					pathKeys = append(pathKeys, p)
-				}
+		expressions := slices.ContainsFunc(pathKeys, func(p string) bool { return paths[p].matchExpr != "" })
+		for p, addr := range solverRoutes[h] {
+			if _, routed := paths[p]; routed {
+				continue
 			}
-			sort.Strings(pathKeys)
+			rc := &routeCfg{servers: []backend{{addr: addr}}}
+			if p == acmeChallengePrefix && expressions {
+				rc.matchExpr = fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
+					wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/"))
+				p = solverDirKey
+			}
+			solvers[p] = rc
+			pathKeys = append(pathKeys, p)
 		}
+		sort.Strings(pathKeys)
 		b.WriteString("    paths:\n")
 		for _, p := range pathKeys {
 			rc := paths[p]
