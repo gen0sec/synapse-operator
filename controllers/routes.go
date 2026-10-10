@@ -87,6 +87,11 @@ type routeCfg struct {
 	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// Headers the route adds a value to, as "Name: value" lines, and
+	// names of headers it removes. Only the v2 schema has these; the v1
+	// writer leaves them out.
+	reqAdd, respAdd       []string
+	reqRemove, respRemove []string
 	// redirect, when set, makes this route a 3xx short-circuit. Status is
 	// 301 (permanent) or 302 (temporal) by default; *-code annotations
 	// override. Mutually exclusive with rewriting/forwarding at the proxy:
@@ -1008,4 +1013,52 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg, sameAsV1 bool) {
 			}
 		}
 	}
+	writeTransformsV2(b, rc)
+}
+
+// writeTransformsV2 writes the headers a route adds a value to and the ones
+// it removes: one transform rule for requests and one for responses. Within
+// a rule Synapse removes first and adds after. `headers:`, which sets, runs
+// before both.
+func writeTransformsV2(b *strings.Builder, rc *routeCfg) {
+	rule := func(key string, remove, add []string) {
+		if len(remove) == 0 && len(add) == 0 {
+			return
+		}
+		fmt.Fprintf(b, "          %s:\n", key)
+		lead := "            - "
+		if len(remove) > 0 {
+			b.WriteString(lead + "remove:\n")
+			lead = "              "
+			for _, name := range remove {
+				fmt.Fprintf(b, "                - %q\n", name)
+			}
+		}
+		if len(add) > 0 {
+			b.WriteString(lead + "add:\n")
+			// A header's values, in the order they were given, under
+			// its name; the names in the order they first appear.
+			var names []string
+			values := map[string][]string{}
+			for _, line := range add {
+				name, value, _ := strings.Cut(line, ": ")
+				if _, seen := values[name]; !seen {
+					names = append(names, name)
+				}
+				values[name] = append(values[name], value)
+			}
+			for _, name := range names {
+				fmt.Fprintf(b, "                %q:\n", name)
+				for _, value := range values[name] {
+					fmt.Fprintf(b, "                  - %q\n", value)
+				}
+			}
+		}
+	}
+	if len(rc.reqRemove)+len(rc.reqAdd)+len(rc.respRemove)+len(rc.respAdd) == 0 {
+		return
+	}
+	b.WriteString("        transforms:\n")
+	rule("request_headers", rc.reqRemove, rc.reqAdd)
+	rule("response_headers", rc.respRemove, rc.respAdd)
 }

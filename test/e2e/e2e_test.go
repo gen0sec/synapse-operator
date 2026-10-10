@@ -743,6 +743,33 @@ func TestSynapseProxy(t *testing.T) {
 				},
 			},
 		}
+		// Headers added to and removed, each way, and a rule beside it
+		// that changes none. The last rule asks for a header Synapse does
+		// not let a rule change.
+		changes := &gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-header-changes"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: parent},
+				Hostnames:       []gwv1.Hostname{"changes." + host},
+				Rules: []gwv1.HTTPRouteRule{
+					{Matches: match(gwv1.PathMatchPathPrefix, "/", ""), BackendRefs: to("shop"), Filters: []gwv1.HTTPRouteFilter{
+						{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &gwv1.HTTPHeaderFilter{
+							Add:    []gwv1.HTTPHeader{{Name: "X-Added", Value: "a"}},
+							Remove: []string{"X-Debug"},
+						}},
+						{Type: gwv1.HTTPRouteFilterResponseHeaderModifier, ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{
+							// One the backend sets itself, and one it does not.
+							Add:    []gwv1.HTTPHeader{{Name: "X-Seen-Added", Value: "and"}, {Name: "X-Tag", Value: "one"}},
+							Remove: []string{"X-Seen-From-Gateway"},
+						}},
+					}},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/bare", ""), BackendRefs: to("api")},
+					{Matches: match(gwv1.PathMatchPathPrefix, "/kept", ""), BackendRefs: to("api"), Filters: []gwv1.HTTPRouteFilter{
+						{Type: gwv1.HTTPRouteFilterRequestHeaderModifier, RequestHeaderModifier: &gwv1.HTTPHeaderFilter{Remove: []string{"Upgrade"}}},
+					}},
+				},
+			},
+		}
 		// Every name under a wildcard, with every kind of match.
 		wildcard := &gwv1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{Namespace: appsNamespace, Name: "gw-wildcard"},
@@ -798,7 +825,7 @@ func TestSynapseProxy(t *testing.T) {
 				Type:       corev1.SecretTypeTLS,
 				Data:       map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM},
 			},
-			gw, route, canary, unsupported, headers, headersByExpression, wildcard,
+			gw, route, canary, unsupported, headers, headersByExpression, changes, wildcard,
 		)
 
 		accepted := func(rt *gwv1.HTTPRoute) (*metav1.Condition, string) {
@@ -827,7 +854,7 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the route that matches a query parameter by a regular expression is %+v, want False/UnsupportedValue", cond)
 			}
 			// What is left out of a route that is served is said too.
-			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", canary: "", wildcard: "", headers: "", headersByExpression: ""} {
+			for rt, part := range map[*gwv1.HTTPRoute]string{route: "URLRewrite", canary: "", wildcard: "", headers: "", headersByExpression: "", changes: "Upgrade"} {
 				switch cond, reason := accepted(rt); {
 				case reason != "":
 					return reason
@@ -847,11 +874,11 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
 			case len(gw.Status.Addresses) == 0:
 				return "the Gateway has no address"
-			// All six routes attach to the listener for every host, the
+			// All seven routes attach to the listener for every host, the
 			// one that cannot be programmed too: attaching is about who
 			// may, not about what the route then asks for. Only the first
 			// is for the host the other listener serves.
-			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 6 || gw.Status.Listeners[1].AttachedRoutes != 1:
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 7 || gw.Status.Listeners[1].AttachedRoutes != 1:
 				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
 			}
 			return ""
@@ -974,6 +1001,53 @@ func TestSynapseProxy(t *testing.T) {
 				case a.header.Get("X-From-Gateway") != "":
 					return fmt.Sprintf("%s: the client got the request header back: X-From-Gateway %q", hc.host+hc.path, a.header.Get("X-From-Gateway"))
 				}
+			}
+			return ""
+		})
+
+		eventually(t, afterASync, "headers are added to and removed, on a rule's requests and on no others", func() string {
+			// What the client sends itself: a value of the header the rule
+			// adds to, and the header the rule removes.
+			sent := http.Header{"X-Added": {"c"}, "X-Debug": {"1"}}
+			changed, err := c.requestWith(http.MethodGet, "http", "changes."+gatewayHost, "/cart", sent)
+			if err != nil {
+				return err.Error()
+			}
+			bare, err := c.requestWith(http.MethodGet, "http", "changes."+gatewayHost, "/bare/x", sent)
+			if err != nil {
+				return err.Error()
+			}
+			_, sentBack := changed.header["X-Seen-From-Gateway"]
+			_, bareSentBack := bare.header["X-Seen-From-Gateway"]
+			names := func(a answer) string { return "," + a.header.Get("X-Seen-Headers") + "," }
+			switch {
+			case changed.status != http.StatusOK || changed.backend != "shop":
+				return fmt.Sprintf("/cart answered %d from %q", changed.status, changed.backend)
+			case bare.status != http.StatusOK || bare.backend != "api":
+				return fmt.Sprintf("/bare/x answered %d from %q", bare.status, bare.backend)
+			// Added beside the client's own value, not in its place: the
+			// backend says what it was sent, and the response has that
+			// header added to in its turn.
+			case !slices.Equal(changed.header.Values("X-Seen-Added"), []string{"c|a", "and"}):
+				return fmt.Sprintf("/cart: the backend was sent X-Added and the client got X-Seen-Added %q, want c|a and then and", changed.header.Values("X-Seen-Added"))
+			case strings.Contains(names(changed), ",x-debug,"):
+				return "/cart: the backend was sent X-Debug, which the rule removes: " + names(changed)
+			case !slices.Equal(changed.header.Values("X-Tag"), []string{"one"}):
+				return fmt.Sprintf("/cart: the client got X-Tag %q, want one", changed.header.Values("X-Tag"))
+			case sentBack:
+				return "/cart: the client got X-Seen-From-Gateway, which the rule removes"
+			// And none of it on the rule beside it.
+			case !slices.Equal(bare.header.Values("X-Seen-Added"), []string{"c"}):
+				return fmt.Sprintf("/bare/x: the backend was sent X-Added and the client got X-Seen-Added %q, want c", bare.header.Values("X-Seen-Added"))
+			case !strings.Contains(names(bare), ",x-debug,"):
+				return "/bare/x: the backend was not sent X-Debug: " + names(bare)
+			case len(bare.header.Values("X-Tag")) != 0 || !bareSentBack:
+				return fmt.Sprintf("/bare/x: the client got X-Tag %q, and X-Seen-From-Gateway: %v", bare.header.Values("X-Tag"), bareSentBack)
+			}
+			// A rule that names a header Synapse keeps is not carried out,
+			// and takes none of the others down with it.
+			if a, err := c.request(http.MethodGet, "http", "changes."+gatewayHost, "/kept/x"); err != nil || a.status != http.StatusNotFound {
+				return fmt.Sprintf("/kept/x, of a rule that cannot be carried out, answers %d from %q (%v), want 404", a.status, a.backend, err)
 			}
 			return ""
 		})

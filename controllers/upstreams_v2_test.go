@@ -67,6 +67,15 @@ type v2Route struct {
 		Request  []string `json:"request"`
 		Response []string `json:"response"`
 	} `json:"headers"`
+	Transforms struct {
+		RequestHeaders  []v2HeaderRule `json:"request_headers"`
+		ResponseHeaders []v2HeaderRule `json:"response_headers"`
+	} `json:"transforms"`
+}
+
+type v2HeaderRule struct {
+	Remove []string            `json:"remove"`
+	Add    map[string][]string `json:"add"`
 }
 
 // parseV2 reads a rendered v2 file strictly: a key Synapse's schema does not
@@ -311,5 +320,54 @@ func TestRender_TheOlderModesV2FileIsAsItWas(t *testing.T) {
 	}
 	if got := doc.Proxy.Fingerprints.Forward; got != nil {
 		t.Errorf("the file says fingerprints.forward: %v", *got)
+	}
+}
+
+// Headers a route sets are its `headers:`; ones it adds to or removes are
+// transform rules, which is where Synapse has those.
+func TestRenderUpstreamsV2_HeaderRules(t *testing.T) {
+	m := newRenderModel()
+	m.addRoute("h.example.com", "/", []backend{{addr: "10.0.0.1:80"}}, annSettings{}, []string{"X-Set: 1"}, []string{"X-Frame-Options: DENY"})
+	rc := m.hosts["h.example.com"]["/"]
+	rc.reqRemove = []string{"X-Debug"}
+	rc.reqAdd = []string{"X-Trace: a", "X-Trace: b: c", "X-Other: z"}
+	rc.respRemove = []string{"Server", "X-Powered-By"}
+	rc.respAdd = []string{"Set-Cookie: flag=1; Path=/"}
+	rendered := renderUpstreamsV2(m)
+	route := parseV2(t, rendered).Hosts["h.example.com"].Paths["/"]
+
+	if got := route.Headers.Request; len(got) != 1 || got[0] != "X-Set: 1" {
+		t.Errorf("request headers set are %q", got)
+	}
+	if got := route.Headers.Response; len(got) != 1 || got[0] != "X-Frame-Options: DENY" {
+		t.Errorf("response headers set are %q", got)
+	}
+	req, resp := route.Transforms.RequestHeaders, route.Transforms.ResponseHeaders
+	if len(req) != 1 || len(resp) != 1 {
+		t.Fatalf("transform rules are %+v and %+v, want one each\n%s", req, resp, rendered)
+	}
+	if got := req[0].Remove; len(got) != 1 || got[0] != "X-Debug" {
+		t.Errorf("request headers removed are %q", got)
+	}
+	// Values of one name are added in the order they were given, and a
+	// value may have a colon in it.
+	if got := req[0].Add["X-Trace"]; len(got) != 2 || got[0] != "a" || got[1] != "b: c" {
+		t.Errorf("X-Trace is added as %q", got)
+	}
+	if got := req[0].Add["X-Other"]; len(got) != 1 || got[0] != "z" {
+		t.Errorf("X-Other is added as %q", got)
+	}
+	if got := resp[0].Remove; len(got) != 2 {
+		t.Errorf("response headers removed are %q", got)
+	}
+	if got := resp[0].Add["Set-Cookie"]; len(got) != 1 || got[0] != "flag=1; Path=/" {
+		t.Errorf("Set-Cookie is added as %q", got)
+	}
+
+	// A route that neither adds nor removes has no transforms at all.
+	m = newRenderModel()
+	m.addRoute("h.example.com", "/", []backend{{addr: "10.0.0.1:80"}}, annSettings{}, nil, nil)
+	if rendered := renderUpstreamsV2(m); strings.Contains(rendered, "transforms") {
+		t.Errorf("transforms for a route that has none:\n%s", rendered)
 	}
 }
