@@ -189,17 +189,12 @@ func buildProxyDeployment(p *synapsev1alpha1.SynapseProxy, configSecret string) 
 		Spec: appsv1.DeploymentSpec{
 			Replicas: spec.Replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: proxySelector(p)},
-			// A new pod must be serving before an old one goes.
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxUnavailable: kptr.To(intstr.FromInt32(0)),
-					MaxSurge:       kptr.To(intstr.FromInt32(1)),
-				},
-			},
+			Strategy: proxyStrategy(spec),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: proxyLabels(p)},
 				Spec: corev1.PodSpec{
+					HostNetwork:                  spec.HostNetwork,
+					DNSPolicy:                    proxyDNSPolicy(spec),
 					ServiceAccountName:           p.Name,
 					AutomountServiceAccountToken: kptr.To(false),
 					// A Service named `internal-services` would otherwise
@@ -235,4 +230,31 @@ func buildProxyDeployment(p *synapsev1alpha1.SynapseProxy, configSecret string) 
 			},
 		},
 	}
+}
+
+// proxyStrategy is how a rollout replaces the pods. A new pod must be serving
+// before an old one goes, which needs room for one more. On the host network
+// there is none: a new pod cannot start on a node whose ports the old pod
+// holds, so the pods are replaced in place, one at a time.
+func proxyStrategy(spec *synapsev1alpha1.SynapseProxySpec) appsv1.DeploymentStrategy {
+	rolling := &appsv1.RollingUpdateDeployment{
+		MaxUnavailable: kptr.To(intstr.FromInt32(0)),
+		MaxSurge:       kptr.To(intstr.FromInt32(1)),
+	}
+	if spec.HostNetwork {
+		rolling = &appsv1.RollingUpdateDeployment{
+			MaxUnavailable: kptr.To(intstr.FromInt32(1)),
+			MaxSurge:       kptr.To(intstr.FromInt32(0)),
+		}
+	}
+	return appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: rolling}
+}
+
+// proxyDNSPolicy keeps cluster DNS working for a pod on the host network,
+// which would otherwise resolve through the node.
+func proxyDNSPolicy(spec *synapsev1alpha1.SynapseProxySpec) corev1.DNSPolicy {
+	if spec.HostNetwork {
+		return corev1.DNSClusterFirstWithHostNet
+	}
+	return ""
 }

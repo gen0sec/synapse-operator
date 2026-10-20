@@ -994,6 +994,23 @@ spec:
                   the operator itself sets is refused, not overridden.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              hostNetwork:
+                description: |-
+                  HostNetwork runs the proxy pods in the network namespace of their node,
+                  so each listener binds that node's own port. It is for the edge that
+                  takes traffic on the node's public address, as a DaemonSet with
+                  hostNetwork did: traffic that reaches a node's address goes to a real
+                  socket on the host, not through the cluster's host-port rules.
+
+                  A node can run one pod per listener port, and a pod is not started on a
+                  node where a listener's port is taken (by another proxy, say). A rollout
+                  replaces pods in place, one at a time, because a new pod cannot start
+                  beside the old one on the same node. Synapse's internal services bind
+                  the node's loopback, so a node runs one such proxy at a time; give a
+                  second its own port in spec.config (proxy.internal_services.port).
+                  The Service stays in front of the pods for traffic from inside the cluster
+                  and has to be of type ClusterIP.
+                type: boolean
               image:
                 description: |-
                   Image is the Synapse container image, tag or digest included. It has
@@ -1292,6 +1309,11 @@ spec:
             - image
             - listeners
             type: object
+            x-kubernetes-validations:
+            - message: 'hostNetwork needs a Service of type ClusterIP: the pods are
+                reached on the node''s own ports'
+              rule: '!has(self.hostNetwork) || !self.hostNetwork || !has(self.service)
+                || !has(self.service.type) || self.service.type == ''ClusterIP'''
           status:
             description: SynapseProxyStatus is the observed state of a SynapseProxy.
             properties:
