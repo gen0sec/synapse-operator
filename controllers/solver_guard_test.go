@@ -77,7 +77,7 @@ upstreams:
       "expr:/v\\d+/items":
         servers:
           - "items:80"
-        match_expr: "http.request.path matches \"^/v\\d+/items\""
+        match_expr: "http.request.path matches \"^(?:/v\\d+/items)\""
         ssl_enabled: false
   "old.example.com":
     paths:
@@ -136,7 +136,7 @@ hosts:
             - "X-Extra: e"
       "expr:/v\\d+/items":
         upstream: "items:80"
-        match_expr: "http.request.path matches \"^/v\\d+/items\""
+        match_expr: "http.request.path matches \"^(?:/v\\d+/items)\""
   "old.example.com":
     tls:
       terminate: {}
