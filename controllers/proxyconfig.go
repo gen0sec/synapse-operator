@@ -93,6 +93,7 @@ var ownedConfigKeys = []ownedConfigKey{
 	{"proxy.internal_services.enabled", "the health probes depend on the internal services"},
 	{"proxy.tls_grade", "use spec.tls.grade"},
 	{"proxy.trusted_proxies", "use spec.trustedProxies"},
+	{"proxy.protocol", "use spec.proxyProtocol"},
 	{"logging.level", "use spec.logging.level"},
 	{"platform.api_key", "use spec.platform.apiKeySecretRef"},
 	// Aliases Synapse accepts for the two sections above. Beside the
@@ -198,6 +199,12 @@ func RenderProxyConfig(in ProxyConfigInput) (ProxyConfigOutput, field.ErrorList)
 	}
 	if len(spec.TrustedProxies) > 0 {
 		setConfig(cfg, "proxy.trusted_proxies", spec.TrustedProxies)
+	}
+	if pp := spec.ProxyProtocol; pp != nil {
+		setConfig(cfg, "proxy.protocol.enabled", pp.Enabled)
+		if pp.Enabled && pp.TimeoutMs != nil {
+			setConfig(cfg, "proxy.protocol.timeout_ms", int64(*pp.TimeoutMs))
+		}
 	}
 	if spec.Logging != nil && spec.Logging.Level != "" {
 		setConfig(cfg, "logging.level", spec.Logging.Level)
