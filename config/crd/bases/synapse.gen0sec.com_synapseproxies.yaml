@@ -1105,6 +1105,30 @@ spec:
                     - name
                     type: object
                 type: object
+              proxyProtocol:
+                description: |-
+                  ProxyProtocol makes the proxy read a PROXY protocol header (v1 or v2) at
+                  the start of every connection, before the TLS handshake. Turn it on when
+                  a layer 4 load balancer in front of the proxy sends one, so the proxy
+                  sees the client's address and not the balancer's. The header is not
+                  optional once this is on: a connection without it is dropped.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled makes the proxy require a PROXY protocol header on every
+                      connection.
+                    type: boolean
+                  timeoutMs:
+                    description: |-
+                      TimeoutMs is how long the proxy waits for the header, in milliseconds.
+                      Empty leaves Synapse's default.
+                    format: int32
+                    maximum: 60000
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                type: object
               replicas:
                 default: 1
                 description: Replicas is the number of proxy pods.

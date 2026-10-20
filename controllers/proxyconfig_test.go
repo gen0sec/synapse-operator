@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -255,6 +256,40 @@ func TestRenderProxyConfig_TypedFields(t *testing.T) {
 		}
 	})
 
+	t.Run("proxyProtocol is rendered", func(t *testing.T) {
+		timeout := int32(2500)
+		tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.ProxyProtocol = &synapsev1alpha1.ProxyProtocolSpec{Enabled: true, TimeoutMs: &timeout}
+		})})
+		wantAt(t, tree, "proxy.protocol.enabled", true)
+		got, _ := at(tree, "proxy.protocol.timeout_ms")
+		if fmt.Sprint(got) != "2500" {
+			t.Errorf("proxy.protocol.timeout_ms = %v", got)
+		}
+	})
+
+	t.Run("proxyProtocol without a timeout leaves Synapse's default", func(t *testing.T) {
+		tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.ProxyProtocol = &synapsev1alpha1.ProxyProtocolSpec{Enabled: true}
+		})})
+		wantAt(t, tree, "proxy.protocol.enabled", true)
+		wantAbsent(t, tree, "proxy.protocol.timeout_ms")
+	})
+
+	t.Run("proxyProtocol switched off says so and takes no timeout", func(t *testing.T) {
+		timeout := int32(2500)
+		tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.ProxyProtocol = &synapsev1alpha1.ProxyProtocolSpec{Enabled: false, TimeoutMs: &timeout}
+		})})
+		wantAt(t, tree, "proxy.protocol.enabled", false)
+		wantAbsent(t, tree, "proxy.protocol.timeout_ms")
+	})
+
+	t.Run("no proxyProtocol renders no proxy.protocol", func(t *testing.T) {
+		tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig()})
+		wantAbsent(t, tree, "proxy.protocol")
+	})
+
 	// The key is only ever taken from the referenced Secret.
 	t.Run("no API key without a reference", func(t *testing.T) {
 		tree := renderedTree(t, ProxyConfigInput{APIKey: "stray", Proxy: proxyForConfig()})
@@ -348,6 +383,7 @@ func TestRenderProxyConfig_RefusesKeysItOwns(t *testing.T) {
 		"proxy.internal_services.enabled": `false`,
 		"proxy.tls_grade":                 `"unsafe"`,
 		"proxy.trusted_proxies":           `["0.0.0.0/0"]`,
+		"proxy.protocol":                  `{"enabled": true}`,
 		"logging.level":                   `"trace"`,
 		"platform.api_key":                `"plaintext"`,
 		"pingora":                         `{}`,

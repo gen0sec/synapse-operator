@@ -118,6 +118,15 @@ type SynapseProxySpec struct {
 	// +kubebuilder:validation:items:MinLength=1
 	TrustedProxies []string `json:"trustedProxies,omitempty"`
 
+	// ProxyProtocol makes the proxy read a PROXY protocol header (v1 or v2) at
+	// the start of every connection, before the TLS handshake. Turn it on when
+	// a layer 4 load balancer in front of the proxy sends one, so the proxy
+	// sees the client's address and not the balancer's. The header is not
+	// optional once this is on: a connection without it is dropped.
+	//
+	// +optional
+	ProxyProtocol *ProxyProtocolSpec `json:"proxyProtocol,omitempty"`
+
 	// Logging configures the proxy's own logs.
 	//
 	// +optional
@@ -189,6 +198,21 @@ type TLSSpec struct {
 	// +optional
 	// +kubebuilder:validation:Enum=high;medium
 	Grade string `json:"grade,omitempty"`
+}
+
+// ProxyProtocolSpec configures the PROXY protocol on the proxy's listeners.
+type ProxyProtocolSpec struct {
+	// Enabled makes the proxy require a PROXY protocol header on every
+	// connection.
+	Enabled bool `json:"enabled"`
+
+	// TimeoutMs is how long the proxy waits for the header, in milliseconds.
+	// Empty leaves Synapse's default.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=60000
+	TimeoutMs *int32 `json:"timeoutMs,omitempty"`
 }
 
 // LoggingSpec configures the proxy's own logs.
