@@ -409,3 +409,43 @@ func TestProxyObjects_DoNotMatchLegacySelectors(t *testing.T) {
 		}
 	}
 }
+
+func TestProxyDeployment_HostNetwork(t *testing.T) {
+	t.Run("off by default: the pod network, and room to surge", func(t *testing.T) {
+		d := buildProxyDeployment(edgeProxy(), "edge-config-0123456789")
+		pod := d.Spec.Template.Spec
+		if pod.HostNetwork || pod.DNSPolicy != "" {
+			t.Errorf("hostNetwork = %v, dnsPolicy = %q", pod.HostNetwork, pod.DNSPolicy)
+		}
+		ru := d.Spec.Strategy.RollingUpdate
+		if ru == nil || ru.MaxUnavailable.IntValue() != 0 || ru.MaxSurge.IntValue() != 1 {
+			t.Errorf("strategy = %+v", d.Spec.Strategy)
+		}
+	})
+
+	t.Run("on: the node's network, cluster DNS, replaced in place", func(t *testing.T) {
+		d := buildProxyDeployment(edgeProxy(func(s *synapsev1alpha1.SynapseProxySpec) { s.HostNetwork = true }), "edge-config-0123456789")
+		pod := d.Spec.Template.Spec
+		if !pod.HostNetwork {
+			t.Error("the pod is not on the host network")
+		}
+		if pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+			t.Errorf("dnsPolicy = %q, want ClusterFirstWithHostNet", pod.DNSPolicy)
+		}
+		// A new pod cannot start beside the old one on a node: its ports are
+		// taken. Surging would leave it Pending until the old one is gone.
+		ru := d.Spec.Strategy.RollingUpdate
+		if ru == nil || ru.MaxSurge.IntValue() != 0 || ru.MaxUnavailable.IntValue() != 1 {
+			t.Errorf("strategy = %+v, want maxSurge 0 and maxUnavailable 1", d.Spec.Strategy)
+		}
+		// The scheduler keeps two pods off one node by their container ports,
+		// which on the host network are the node's ports.
+		var ports []int32
+		for _, p := range proxyContainer(t, d).Ports {
+			ports = append(ports, p.ContainerPort)
+		}
+		if !slices.Contains(ports, 80) || !slices.Contains(ports, 443) {
+			t.Errorf("container ports = %v, want 80 and 443 declared", ports)
+		}
+	})
+}

@@ -171,6 +171,18 @@ func TestSynapseProxy_Rejects(t *testing.T) {
 		{"a listener port above 65535",
 			func(p *v1alpha1.SynapseProxy) { p.Spec.Listeners[0].Port = 65536 },
 			"spec.listeners[0].port"},
+		{"hostNetwork with a NodePort Service",
+			func(p *v1alpha1.SynapseProxy) {
+				p.Spec.HostNetwork = true
+				p.Spec.Service = &v1alpha1.ProxyServiceSpec{Type: corev1.ServiceTypeNodePort}
+			},
+			"hostNetwork needs a Service of type ClusterIP"},
+		{"hostNetwork with a LoadBalancer Service",
+			func(p *v1alpha1.SynapseProxy) {
+				p.Spec.HostNetwork = true
+				p.Spec.Service = &v1alpha1.ProxyServiceSpec{Type: corev1.ServiceTypeLoadBalancer}
+			},
+			"hostNetwork needs a Service of type ClusterIP"},
 		{"an upper-case listener name",
 			func(p *v1alpha1.SynapseProxy) { p.Spec.Listeners[0].Name = "HTTP" },
 			"spec.listeners[0].name"},

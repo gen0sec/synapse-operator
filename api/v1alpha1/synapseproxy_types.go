@@ -45,6 +45,8 @@ type SynapseProxyList struct {
 }
 
 // SynapseProxySpec is the desired state of a SynapseProxy.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.hostNetwork) || !self.hostNetwork || !has(self.service) || !has(self.service.type) || self.service.type == 'ClusterIP'",message="hostNetwork needs a Service of type ClusterIP: the pods are reached on the node's own ports"
 type SynapseProxySpec struct {
 	// Image is the Synapse container image, tag or digest included. It has
 	// to be Synapse 0.8.5 or newer: older releases do not read the listeners
@@ -90,6 +92,24 @@ type SynapseProxySpec struct {
 	//
 	// +optional
 	Service *ProxyServiceSpec `json:"service,omitempty"`
+
+	// HostNetwork runs the proxy pods in the network namespace of their node,
+	// so each listener binds that node's own port. It is for the edge that
+	// takes traffic on the node's public address, as a DaemonSet with
+	// hostNetwork did: traffic that reaches a node's address goes to a real
+	// socket on the host, not through the cluster's host-port rules.
+	//
+	// A node can run one pod per listener port, and a pod is not started on a
+	// node where a listener's port is taken (by another proxy, say). A rollout
+	// replaces pods in place, one at a time, because a new pod cannot start
+	// beside the old one on the same node. Synapse's internal services bind
+	// the node's loopback, so a node runs one such proxy at a time; give a
+	// second its own port in spec.config (proxy.internal_services.port).
+	// The Service stays in front of the pods for traffic from inside the cluster
+	// and has to be of type ClusterIP.
+	//
+	// +optional
+	HostNetwork bool `json:"hostNetwork,omitempty"`
 
 	// Listeners are the endpoints the proxy binds. Order matters: an
 	// HTTP-to-HTTPS redirect targets the first TLS listener. At least one
