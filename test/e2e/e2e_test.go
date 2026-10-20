@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -11,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -350,6 +352,86 @@ func (c *cluster) routed(scheme, host, backend string) string {
 		return err.Error()
 	case a.status != http.StatusOK || a.backend != backend:
 		return fmt.Sprintf("%s://%s answered %d from backend %q, want 200 from %q", scheme, host, a.status, a.backend, backend)
+	}
+	return ""
+}
+
+// proxyV2 is a PROXY protocol v2 header for a client at 203.0.113.9:40000
+// reaching the balancer's address on port, as a layer 4 load balancer sends it
+// as the first bytes of a connection.
+func proxyV2(port uint16) []byte {
+	h := []byte("\r\n\r\n\x00\r\nQUIT\n")
+	// Version 2, command PROXY; TCP over IPv4; 12 bytes of addresses follow.
+	h = append(h, 0x21, 0x11, 0x00, 0x0c)
+	h = append(h, 203, 0, 113, 9, 192, 0, 2, 1)
+	h = binary.BigEndian.AppendUint16(h, 40000)
+	return binary.BigEndian.AppendUint16(h, port)
+}
+
+// getBehindBalancer sends one request as a layer 4 load balancer would: the
+// bytes of header first, when there are any, then the request, over TLS for
+// https. The header comes before the TLS handshake.
+func (c *cluster) getBehindBalancer(scheme, host string, header []byte) (answer, error) {
+	addr := c.httpAddr
+	if scheme == "https" {
+		addr = c.httpsAddr
+	}
+	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(c.ctx, "tcp", addr)
+	if err != nil {
+		return answer{}, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if header != nil {
+		if _, err := conn.Write(header); err != nil {
+			return answer{}, err
+		}
+	}
+	var stream net.Conn = conn
+	var served []byte
+	if scheme == "https" {
+		secured := tls.Client(conn, &tls.Config{ServerName: host, InsecureSkipVerify: true})
+		if err := secured.Handshake(); err != nil {
+			return answer{}, err
+		}
+		if peers := secured.ConnectionState().PeerCertificates; len(peers) > 0 {
+			served = peers[0].Raw
+		}
+		stream = secured
+	}
+	if _, err := io.WriteString(stream, "GET / HTTP/1.1\r\nHost: "+host+"\r\nConnection: close\r\n\r\n"); err != nil {
+		return answer{}, err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	if err != nil {
+		return answer{}, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return answer{status: resp.StatusCode, backend: resp.Header.Get("X-Backend"), header: resp.Header, served: served}, nil
+}
+
+// rolledOut reports "" when the pods that mounted oldConfig are gone and the
+// proxy is ready with what it runs now.
+func (c *cluster) rolledOut(oldConfig string, oldPods []types.UID) string {
+	if reason := c.ready(); reason != "" {
+		return reason
+	}
+	d, err := c.getDeployment()
+	if err != nil {
+		return err.Error()
+	}
+	if now := configSecret(d); now == oldConfig {
+		return "the pods still mount " + now
+	}
+	all, err := c.listPods(true)
+	if err != nil {
+		return err.Error()
+	}
+	for _, uid := range all {
+		if slices.Contains(oldPods, uid) {
+			return "a pod with the old configuration has not stopped yet"
+		}
 	}
 	return ""
 }
@@ -1126,6 +1208,65 @@ func TestSynapseProxy(t *testing.T) {
 					case a.status != http.StatusOK || a.backend != backend:
 						return fmt.Sprintf("%s%s answered %d from %q, want 200 from %q", name, path, a.status, a.backend, backend)
 					}
+				}
+			}
+			return ""
+		})
+	})
+
+	step("a connection from a layer 4 balancer is served once the PROXY protocol is on", func(t *testing.T) {
+		const shop = "shop"
+		served := func(scheme string, header []byte) string {
+			a, err := c.getBehindBalancer(scheme, shopHost, header)
+			switch {
+			case err != nil:
+				return err.Error()
+			case a.status != http.StatusOK || a.backend != shop:
+				return fmt.Sprintf("%s answered %d from backend %q, want 200 from %q", scheme, a.status, a.backend, shop)
+			case scheme == "https" && len(a.served) == 0:
+				return "no certificate was presented"
+			}
+			return ""
+		}
+		withHeader := func() string {
+			for scheme, port := range map[string]uint16{"http": 80, "https": 443} {
+				if reason := served(scheme, proxyV2(port)); reason != "" {
+					return reason
+				}
+			}
+			return ""
+		}
+
+		// Off, as it is by default, the header is not the start of a request.
+		for scheme, port := range map[string]uint16{"http": 80, "https": 443} {
+			if reason := served(scheme, proxyV2(port)); reason == "" {
+				t.Errorf("%s: a connection that begins with a PROXY header was served by a proxy that does not expect one", scheme)
+			}
+		}
+
+		before := c.deployment(t)
+		oldConfig, oldPods := configSecret(before), c.pods(t)
+		c.edit(t, func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.ProxyProtocol = &synapsev1alpha1.ProxyProtocolSpec{Enabled: true, TimeoutMs: ptrTo(int32(2000))}
+		})
+		eventually(t, afterASync, "a connection with a PROXY header is served", func() string {
+			if reason := c.rolledOut(oldConfig, oldPods); reason != "" {
+				return reason
+			}
+			return withHeader()
+		})
+
+		// And off again, so that what follows is a proxy as it was.
+		before = c.deployment(t)
+		oldConfig, oldPods = configSecret(before), c.pods(t)
+		c.edit(t, func(s *synapsev1alpha1.SynapseProxySpec) { s.ProxyProtocol = nil })
+		eventually(t, afterASync, "a connection without a PROXY header is served again", func() string {
+			if reason := c.rolledOut(oldConfig, oldPods); reason != "" {
+				return reason
+			}
+			for _, scheme := range []string{"http", "https"} {
+				if reason := c.routed(scheme, shopHost, shop); reason != "" {
+					return reason
 				}
 			}
 			return ""

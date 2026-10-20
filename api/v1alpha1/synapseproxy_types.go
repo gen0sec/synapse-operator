@@ -121,8 +121,9 @@ type SynapseProxySpec struct {
 	// ProxyProtocol makes the proxy read a PROXY protocol header (v1 or v2) at
 	// the start of every connection, before the TLS handshake. Turn it on when
 	// a layer 4 load balancer in front of the proxy sends one, so the proxy
-	// sees the client's address and not the balancer's. The header is not
-	// optional once this is on: a connection without it is dropped.
+	// sees the client's address and not the balancer's. What the proxy does
+	// with a connection that has no header is Synapse's behavior, not
+	// something this field promises.
 	//
 	// +optional
 	ProxyProtocol *ProxyProtocolSpec `json:"proxyProtocol,omitempty"`
@@ -202,7 +203,7 @@ type TLSSpec struct {
 
 // ProxyProtocolSpec configures the PROXY protocol on the proxy's listeners.
 type ProxyProtocolSpec struct {
-	// Enabled makes the proxy require a PROXY protocol header on every
+	// Enabled makes the proxy read a PROXY protocol header at the start of a
 	// connection.
 	Enabled bool `json:"enabled"`
 
