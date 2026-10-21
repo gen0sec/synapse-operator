@@ -29,8 +29,10 @@ func listenerClaims(gw *gwv1.Gateway) []hostClaim {
 // parentRefs to gw. They are claimed for the Gateway's namespace, so that
 // routes of several namespaces on one Gateway do not refuse each other, and
 // aged by the later of the route and the Gateway: a route cannot be older
-// in a namespace than the Gateway that lets it in.
-func routeClaims(rt *gwv1.HTTPRoute, gw *gwv1.Gateway) []hostClaim {
+// in a namespace than the Gateway that lets it in. Only a listener that
+// admits the route's namespace, as admits says, is claimed through: a route
+// that is not let in holds nothing.
+func routeClaims(rt *gwv1.HTTPRoute, gw *gwv1.Gateway, admits func(l *gwv1.Listener, sameNamespace bool) bool) []hostClaim {
 	created := gw.CreationTimestamp.Time
 	if rt.CreationTimestamp.Time.After(created) {
 		created = rt.CreationTimestamp.Time
@@ -44,6 +46,9 @@ func routeClaims(rt *gwv1.HTTPRoute, gw *gwv1.Gateway) []hostClaim {
 		for i := range gw.Spec.Listeners {
 			l := &gw.Spec.Listeners[i]
 			if (ref.SectionName != nil && *ref.SectionName != l.Name) || (ref.Port != nil && *ref.Port != l.Port) {
+				continue
+			}
+			if !admits(l, rt.Namespace == namespaceOf(ref, rt)) {
 				continue
 			}
 			listener := ""
@@ -81,7 +86,8 @@ func (in gatewayInputs) claims() []hostClaim {
 		}
 		claims = append(claims, listenerClaims(gw)...)
 		for j := range in.routes {
-			claims = append(claims, routeClaims(&in.routes[j], gw)...)
+			rt := &in.routes[j]
+			claims = append(claims, routeClaims(rt, gw, func(l *gwv1.Listener, same bool) bool { return in.allows(l, rt.Namespace, same) })...)
 		}
 	}
 	return claims

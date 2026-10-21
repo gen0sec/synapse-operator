@@ -8,6 +8,27 @@ import (
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+func admitAll(*gwv1.Listener, bool) bool { return true }
+
+// A route claims only through a listener that lets its namespace attach.
+func TestGatewayClaims_ARouteTheListenerDoesNotAdmitClaimsNothing(t *testing.T) {
+	w := newGwWorld()
+	l := httpListener("http", 80, "")
+	l.AllowedRoutes = &gwv1.AllowedRoutes{Namespaces: &gwv1.RouteNamespaces{From: ptr(gwv1.NamespacesFromSame)}}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", l)}
+	stranger := httpRoute("squat", []string{"shop.example.com"}, to("app"))
+	w.in.routes = []gwv1.HTTPRoute{stranger}
+	if got := w.in.claims(); len(got) != 0 {
+		t.Errorf("claims = %v, want none from a namespace the listener does not admit", got)
+	}
+	own := httpRoute("own", []string{"shop.example.com"}, to("app"))
+	own.Namespace = "edge"
+	w.in.routes = []gwv1.HTTPRoute{own}
+	if got := w.in.claims(); len(got) != 1 {
+		t.Errorf("claims = %v, want one from the Gateway's own namespace", got)
+	}
+}
+
 func TestGatewayClaims_AListenerIsAgedByItsGateway(t *testing.T) {
 	gw := gateway("edge", "web", httpListener("a", 80, "a.example.com"), httpListener("b", 80, ""), httpListener("c", 80, "*.example.org"))
 	gw.CreationTimestamp = metav1.NewTime(t0)
@@ -35,7 +56,7 @@ func TestGatewayClaims_ARouteClaimsAsTheGatewayAgedByTheLaterOfTheTwo(t *testing
 		{t0.Add(time.Hour), t0, t0.Add(time.Hour)},
 	} {
 		gw.CreationTimestamp, rt.CreationTimestamp = metav1.NewTime(c.gateway), metav1.NewTime(c.route)
-		got := routeClaims(&rt, &gw)
+		got := routeClaims(&rt, &gw, admitAll)
 		if len(got) != 1 {
 			t.Fatalf("claims = %v, want one", got)
 		}
@@ -54,14 +75,14 @@ func TestGatewayClaims_OneClaimPerParentRefToTheGateway(t *testing.T) {
 		{Namespace: ptr(gwv1.Namespace("edge")), Name: "elsewhere"},
 		{Namespace: ptr(gwv1.Namespace("edge")), Name: "web", Kind: ptr(gwv1.Kind("Service"))},
 	}
-	if got := routeClaims(&rt, &gw); len(got) != 2 {
+	if got := routeClaims(&rt, &gw, admitAll); len(got) != 2 {
 		t.Errorf("claims = %v, want one for each of the two parentRefs to the Gateway", got)
 	}
 	// A listener's host narrows what the route claims.
 	gw = gateway("edge", "web", httpListener("http", 80, "*.example.org"))
 	rt.Spec.ParentRefs = rt.Spec.ParentRefs[:1]
 	rt.Spec.ParentRefs[0].SectionName = nil
-	if got := routeClaims(&rt, &gw); len(got) != 0 {
+	if got := routeClaims(&rt, &gw, admitAll); len(got) != 0 {
 		t.Errorf("claims = %v, want none for a host no listener serves", got)
 	}
 }

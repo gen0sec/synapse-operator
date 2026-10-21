@@ -172,3 +172,20 @@ func TestGatewayOwnership_AnIngressOfTheGatewaysNamespaceStillBeatsItsRoutes(t *
 	}
 	wantRoute(t, st, "shop", "Accepted", metav1.ConditionFalse, "HostnameConflict")
 }
+
+// A route the Gateway does not admit cannot hold a host for the Gateway's
+// namespace against a later Ingress.
+func TestGatewayOwnership_ARouteNobodyAdmittedDoesNotSquatAHost(t *testing.T) {
+	w := newGwWorld()
+	l := httpListener("http", 80, "")
+	l.AllowedRoutes = &gwv1.AllowedRoutes{Namespaces: &gwv1.RouteNamespaces{From: ptr(gwv1.NamespacesFromSame)}}
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", l)}
+	w.gatewayCreated(t0)
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("squat", []string{"shop.example.com"}, to("app"))}
+	ing := ingressIn("late", "shop", "shop.example.com", "/")
+	ing.CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
+	r := &IngressReconciler{IngressClassName: "synapse", HostOwnership: true, ExtraClaims: w.in.claims}
+	if out := renderToFile(t, r, ing); !strings.Contains(out, "late.svc") {
+		t.Errorf("a route that was not admitted holds the host against the Ingress:\n%s", out)
+	}
+}
