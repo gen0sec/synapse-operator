@@ -27,6 +27,13 @@ const (
 	hostClaimsHeader = "# Written by synapse-operator. Do not edit. <namespace> <host> <first seen> [<absent since>]"
 )
 
+// expired says a line has been kept long enough: its claim was seen absent,
+// and the grace since is over. A claim made again after that is a new one,
+// whether or not a render saw the gap.
+func (e claimEntry) expired(now time.Time) bool {
+	return !e.absentSince.IsZero() && !e.absentSince.Add(hostClaimGrace).After(now)
+}
+
 type claimKey struct{ ns, host string }
 
 type claimEntry struct {
@@ -123,13 +130,13 @@ func (l *hostClaims) body() string {
 	return b.String()
 }
 
-// now is the time a claim new to the ledger is aged at: the clock, but never
-// before the newest line, so that a clock that steps back cannot make a new
-// claim older than one the ledger already holds.
+// now is the time a claim new to the ledger is aged at: the clock, but always
+// after the newest line, so that a clock that steps back can neither make a
+// new claim older than one the ledger already holds nor tie with it.
 func (l *hostClaims) now(clock time.Time) time.Time {
 	for _, e := range l.entries {
-		if e.firstSeen.After(clock) {
-			clock = e.firstSeen
+		if next := e.firstSeen.Add(time.Nanosecond); next.After(clock) {
+			clock = next
 		}
 	}
 	return clock
@@ -153,6 +160,9 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 		k := claimKey{ns: c.ns, host: host}
 		present[k] = true
 		e, ok := l.entries[k]
+		if ok && e.expired(now) {
+			ok = false
+		}
 		if !ok {
 			e.firstSeen = now
 			if !l.exists && !c.created.IsZero() {
@@ -170,7 +180,7 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 		case e.absentSince.IsZero():
 			e.absentSince = now
 			l.entries[k] = e
-		case e.absentSince.Add(hostClaimGrace).Before(now):
+		case e.expired(now):
 			delete(l.entries, k)
 		}
 	}

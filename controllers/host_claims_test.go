@@ -101,11 +101,11 @@ func TestHostClaims_AnAbsentClaimIsMarkedThenRemovedAfterTheGrace(t *testing.T) 
 	if changed, _ := l.record(nil, t1); !changed || !l.entries[k].absentSince.Equal(t1) {
 		t.Fatalf("not marked absent: %+v", l.entries[k])
 	}
-	if changed, _ := l.record(nil, t1.Add(hostClaimGrace)); changed {
-		t.Error("removed at exactly the grace")
+	if changed, _ := l.record(nil, t1.Add(hostClaimGrace-time.Nanosecond)); changed {
+		t.Error("removed before the grace")
 	}
 	if _, ok := l.entries[k]; !ok {
-		t.Fatal("removed at exactly the grace")
+		t.Fatal("removed before the grace")
 	}
 	// The mark is made once.
 	if !l.entries[k].absentSince.Equal(t1) {
@@ -135,7 +135,7 @@ func TestHostClaims_NowIsClampedToTheNewestEntry(t *testing.T) {
 	l, _ := parseHostClaims(
 		"a h "+t0.Add(time.Hour).Format(time.RFC3339Nano)+"\n"+
 			"b h "+t0.Format(time.RFC3339Nano)+"\n", true)
-	if got := l.now(t0); !got.Equal(t0.Add(time.Hour)) {
+	if got := l.now(t0); !got.Equal(t0.Add(time.Hour + time.Nanosecond)) {
 		t.Errorf("a clock before the newest entry gave %v", got)
 	}
 	if got := l.now(t0.Add(3 * time.Hour)); !got.Equal(t0.Add(3 * time.Hour)) {
@@ -237,5 +237,14 @@ func TestHostClaims_ADuplicateKeyKeepsTheOldestAndIsCounted(t *testing.T) {
 	want := time.Date(2025, 1, 1, 9, 0, 0, 0, time.UTC)
 	if got := l.entries[claimKey{"a", "h.example.com"}].firstSeen; !got.Equal(want) {
 		t.Errorf("firstSeen = %v, want the oldest %v", got, want)
+	}
+}
+
+func TestHostClaims_ANewClaimIsNeverAsOldAsTheNewestLine(t *testing.T) {
+	future := t0.Add(5 * time.Hour)
+	l, _ := parseHostClaims(claimLine(claimKey{"a", "h.example.com"}, claimEntry{firstSeen: future})+"\n", true)
+	l.record([]hostClaim{{ns: "a", host: "h.example.com"}, {ns: "b", host: "g.example.com"}}, l.now(t0))
+	if got := l.entries[claimKey{"b", "g.example.com"}].firstSeen; !got.After(future) {
+		t.Errorf("a claim from a later render is aged %v, not after %v", got, future)
 	}
 }

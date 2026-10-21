@@ -506,3 +506,32 @@ func TestOwnership_AnAliasCannotForgeALedgerLine(t *testing.T) {
 		t.Error("the invalid host was not said")
 	}
 }
+
+func TestOwnership_AClaimThatReturnsAfterTheGraceWithNoRenderBetweenIsNew(t *testing.T) {
+	zzz := ownerIngress("zzz", "shop", ownedHost, "/z", t0)
+	g := newLedgerRig(t, zzz.DeepCopy(), ownerIngress("aaa", "later", ownedHost, "/a", t0.Add(time.Hour)))
+	g.mustReconcile()
+	g.delete(zzz)
+	g.now = g.now.Add(10 * time.Minute)
+	g.mustReconcile()
+	g.now = g.now.Add(3 * time.Hour)
+	g.create(zzz.DeepCopy())
+	g.mustReconcile()
+	if out := g.routes(); !strings.Contains(out, "/a") || strings.Contains(out, "/z") {
+		t.Errorf("a claim gone for three hours took its old age back:\n%s", out)
+	}
+}
+
+func TestOwnership_ALedgerWithLinesAndNoClaimsMarksThemAbsent(t *testing.T) {
+	ing := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	g := newLedgerRig(t, ing.DeepCopy())
+	g.mustReconcile()
+	g.delete(ing)
+	g.now = g.now.Add(10 * time.Minute)
+	g.mustReconcile()
+	cm, _ := g.ledger()
+	if want := "zzz " + ownedHost; !strings.Contains(cm.Data["claims"], want) ||
+		!strings.Contains(cm.Data["claims"], g.now.UTC().Format(time.RFC3339Nano)) {
+		t.Errorf("the line was not marked absent now:\n%s", cm.Data["claims"])
+	}
+}
