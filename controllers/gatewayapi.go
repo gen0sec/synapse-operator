@@ -271,12 +271,14 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 			if !ok || gateways[gwKey] == nil {
 				continue
 			}
-			attach := in.attach(rt, ref, listeners[gwKey], func(host string) string {
+			attach := in.attach(rt, ref, listeners[gwKey], func(host, listener string) string {
 				switch {
 				case taken[host]:
 					return conflictIngress
 				case !m.owners.allows(host, gwKey.Namespace):
 					return conflictNamespace
+				case rt.Namespace != gwKey.Namespace && m.owners.namesMoreSpecifically(gwKey.Namespace, host, listener):
+					return conflictNamed
 				}
 				return ""
 			})
@@ -598,13 +600,14 @@ type attachment struct {
 const (
 	conflictIngress   = "already routed by an Ingress"
 	conflictNamespace = "held by another namespace"
+	conflictNamed     = "named more specifically in the Gateway's namespace"
 )
 
 // attach works out which listeners of a Gateway a route attaches to through
 // one parentRef, counts it on each, and returns the hosts it gets from them.
-// conflict says why a host may not be taken, or returns "". Such a host is
-// left out.
-func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all []*gwListener, conflict func(host string) string) attachment {
+// conflict says why a host, reached through a listener of that hostname, may
+// not be taken, or returns "". Such a host is left out.
+func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all []*gwListener, conflict func(host, listener string) string) attachment {
 	var named, allowed []*gwListener
 	for _, l := range all {
 		if ref.SectionName != nil && *ref.SectionName != l.spec.Name {
@@ -647,7 +650,7 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 		}
 		var kept []string
 		for _, h := range hosts {
-			if why := conflict(h); why != "" {
+			if why := conflict(h, l.hostname); why != "" {
 				left[why] = append(left[why], h)
 				continue
 			}
@@ -660,7 +663,7 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 			a.hosts[h] = true
 		}
 	}
-	for _, why := range []string{conflictIngress, conflictNamespace} {
+	for _, why := range []string{conflictIngress, conflictNamespace, conflictNamed} {
 		if hosts := left[why]; len(hosts) > 0 {
 			slices.Sort(hosts)
 			a.conflicts = append(a.conflicts, why+": "+strings.Join(slices.Compact(hosts), ", "))

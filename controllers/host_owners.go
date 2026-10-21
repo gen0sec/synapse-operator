@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	networkingv1 "k8s.io/api/networking/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // A host belongs to the namespace whose object claimed it first, within one
@@ -36,6 +38,11 @@ type hostOwners struct {
 	byKey map[string]string
 	// spelled is the host of the claim that won each key, as it was written.
 	spelled map[string]string
+	// named are, per namespace, the hosts its own objects name: those of
+	// its Ingresses, listeners and routes. A route of another namespace that
+	// a Gateway admits claims as the Gateway's namespace, and is no object
+	// of it.
+	named map[string]map[string]bool
 }
 
 // resolveHostOwners takes the claims oldest first, by creation time, then
@@ -57,11 +64,17 @@ func resolveHostOwners(claims []hostClaim) *hostOwners {
 		}
 		return fmt.Sprintf("%T", a.who) < fmt.Sprintf("%T", b.who)
 	})
-	o := &hostOwners{byKey: map[string]string{}, spelled: map[string]string{}}
+	o := &hostOwners{byKey: map[string]string{}, spelled: map[string]string{}, named: map[string]map[string]bool{}}
 	for _, c := range sorted {
 		key := hostKey(c.host)
 		if key == "" {
 			continue
+		}
+		if rt, ok := c.who.(*gwv1.HTTPRoute); !ok || rt.Namespace == c.ns {
+			if o.named[c.ns] == nil {
+				o.named[c.ns] = map[string]bool{}
+			}
+			o.named[c.ns][key] = true
 		}
 		if _, held := o.holder(key); !held {
 			o.byKey[key] = c.ns
@@ -93,6 +106,30 @@ func (o *hostOwners) owner(host string) (string, bool) {
 func (o *hostOwners) allows(host, ns string) bool {
 	owner, held := o.holder(host)
 	return !held || owner == ns
+}
+
+// namesMoreSpecifically reports whether ns, through its own objects, names
+// host more narrowly than the listener hostname through which a route
+// reaches it: the host itself, or a narrower wildcard that covers it.
+func (o *hostOwners) namesMoreSpecifically(ns, host, listener string) bool {
+	if o == nil {
+		return false
+	}
+	key := sameOrCovering(hostKey(host), o.named[ns])
+	return key != "" && hostSpecificity(key) > hostSpecificity(hostKey(listener))
+}
+
+// hostSpecificity orders hosts by how few names they cover: no host and `*`
+// cover every name, a wildcard the more the shorter its suffix, a name one.
+func hostSpecificity(key string) int {
+	suffix, wild := strings.CutPrefix(key, "*")
+	switch {
+	case key == "" || wild && suffix == "":
+		return 0
+	case wild:
+		return len(suffix)
+	}
+	return math.MaxInt
 }
 
 // ingressClaims are the hosts an Ingress names: those of its rules, its

@@ -189,3 +189,135 @@ func TestGatewayOwnership_ARouteNobodyAdmittedDoesNotSquatAHost(t *testing.T) {
 		t.Errorf("a route that was not admitted holds the host against the Ingress:\n%s", out)
 	}
 }
+
+// ownListener is a listener that only the Gateway's own namespace may use.
+func ownListener(name string, port int32, host string) gwv1.Listener {
+	l := httpListener(name, port, host)
+	l.AllowedRoutes = &gwv1.AllowedRoutes{Namespaces: &gwv1.RouteNamespaces{From: ptr(gwv1.NamespacesFromSame)}}
+	return l
+}
+
+// A namespace that names a host more specifically than a listener does keeps
+// foreign routes off it, whichever Gateway it names it on.
+func TestGatewayOwnership_AForeignRouteCannotReachAHostTheGatewaysNamespaceNamesMoreSpecifically(t *testing.T) {
+	siblings := func() *gwWorld {
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{
+			gateway("edge", "internal", ownListener("admin", 8080, "admin.example.com")),
+			gateway("edge", "web", httpListener("http", 80, "")),
+		}
+		w.gatewayCreated(t0)
+		return w
+	}
+
+	t.Run("sibling Gateway listener", func(t *testing.T) {
+		w := siblings()
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("admin", []string{"admin.example.com"}, to("app", prefix("/admin")))}
+		w.own()
+		m, st := w.translate()
+		wantRoute(t, st, "admin", "Accepted", metav1.ConditionFalse, "HostnameConflict")
+		if got := server(t, m, "admin.example.com", "GET", "/admin"); got != "" {
+			t.Errorf("/admin of a foreign route is served by %q", got)
+		}
+	})
+
+	t.Run("in part", func(t *testing.T) {
+		w := siblings()
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("mixed", []string{"admin.example.com", "www.example.com"}, to("app"))}
+		w.own()
+		m, st := w.translate()
+		wantRoute(t, st, "mixed", "Accepted", metav1.ConditionTrue, "Accepted")
+		wantRoute(t, st, "mixed", "PartiallyInvalid", metav1.ConditionTrue, "UnsupportedValue")
+		if _, ok := m.hosts["admin.example.com"]; ok {
+			t.Errorf("the host is routed: %v", sortedKeys(m.hosts))
+		}
+		if got := server(t, m, "www.example.com", "GET", "/"); got != "10.0.0.1:80" {
+			t.Errorf("the free host goes to %q", got)
+		}
+	})
+
+	t.Run("a route of the Gateway's namespace", func(t *testing.T) {
+		w := siblings()
+		rt := httpRoute("admin", []string{"admin.example.com"}, to("app", prefix("/admin")))
+		rt.Namespace = "edge"
+		w.service("edge", "app", "10.0.2.1")
+		w.in.routes = []gwv1.HTTPRoute{rt}
+		w.own()
+		m, st := w.translate()
+		if parents := st.routes[types.NamespacedName{Namespace: "edge", Name: "admin"}]; len(parents) != 1 || parents[0].Conditions[0].Status != metav1.ConditionTrue {
+			t.Errorf("the route of the Gateway's namespace is not accepted: %+v", parents)
+		}
+		if got := server(t, m, "admin.example.com", "GET", "/admin"); got != "10.0.2.1:80" {
+			t.Errorf("/admin goes to %q", got)
+		}
+	})
+
+	t.Run("a host nobody there names more specifically", func(t *testing.T) {
+		w := siblings()
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("blog", []string{"blog.example.com"}, to("app"))}
+		w.own()
+		m, st := w.translate()
+		wantRoute(t, st, "blog", "Accepted", metav1.ConditionTrue, "Accepted")
+		if got := server(t, m, "blog.example.com", "GET", "/"); got != "10.0.0.1:80" {
+			t.Errorf("blog goes to %q", got)
+		}
+	})
+
+	t.Run("through a wildcard listener", func(t *testing.T) {
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{
+			gateway("edge", "internal", ownListener("admin", 8080, "admin.example.com")),
+			gateway("edge", "web", httpListener("http", 80, "*.example.com")),
+		}
+		w.gatewayCreated(t0)
+		w.in.routes = []gwv1.HTTPRoute{
+			httpRoute("admin", []string{"admin.example.com"}, to("app")),
+			httpRoute("other", []string{"other.example.com"}, to("app")),
+		}
+		w.own()
+		m, st := w.translate()
+		wantRoute(t, st, "admin", "Accepted", metav1.ConditionFalse, "HostnameConflict")
+		wantRoute(t, st, "other", "Accepted", metav1.ConditionTrue, "Accepted")
+		if _, ok := m.hosts["admin.example.com"]; ok {
+			t.Errorf("admin is routed: %v", sortedKeys(m.hosts))
+		}
+		if got := server(t, m, "other.example.com", "GET", "/"); got != "10.0.0.1:80" {
+			t.Errorf("other goes to %q", got)
+		}
+	})
+
+	t.Run("a narrower wildcard of the namespace", func(t *testing.T) {
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{
+			gateway("edge", "internal", ownListener("int", 8080, "*.corp.example.com")),
+			gateway("edge", "web", httpListener("http", 80, "*.example.com")),
+		}
+		w.gatewayCreated(t0)
+		w.in.routes = []gwv1.HTTPRoute{
+			httpRoute("corp", []string{"wiki.corp.example.com"}, to("app")),
+			httpRoute("other", []string{"other.example.com"}, to("app")),
+		}
+		w.own()
+		_, st := w.translate()
+		wantRoute(t, st, "corp", "Accepted", metav1.ConditionFalse, "HostnameConflict")
+		wantRoute(t, st, "other", "Accepted", metav1.ConditionTrue, "Accepted")
+	})
+
+	t.Run("a foreign route is not the namespace's own object", func(t *testing.T) {
+		// edge has no object of its own naming admin: the claim there is the
+		// foreign route's, made as edge. A second foreign route may share it.
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+		w.gatewayCreated(t0)
+		other := httpRoute("b", []string{"admin.example.com"}, to("app2"))
+		other.Namespace = "other"
+		w.service("other", "app2", "10.0.1.2")
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("a", []string{"admin.example.com"}, to("app")), other}
+		w.own()
+		_, st := w.translate()
+		wantRoute(t, st, "a", "Accepted", metav1.ConditionTrue, "Accepted")
+		if parents := st.routes[types.NamespacedName{Namespace: "other", Name: "b"}]; len(parents) != 1 || parents[0].Conditions[0].Status != metav1.ConditionTrue {
+			t.Errorf("the second foreign route is not accepted: %+v", parents)
+		}
+	})
+}
