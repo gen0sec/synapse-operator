@@ -128,7 +128,7 @@ The operator runs as **one** of three controllers per process, selected by `--in
 >
 > What stops working: `server-alias: "*"` and a mid-name wildcard such as `www.*.example.com` are no longer a catch-all or a pattern; they are left out with `InvalidServerAlias`. A `use-regex` path (or a Gateway `RegularExpression` path) the operator refuses is left out with `UnsupportedMatch`: one Go cannot parse; one with a character class holding a character outside ASCII; one with a case-insensitive character outside ASCII; one with a character above 0x7f written by its number, or a character outside ASCII that cannot be printed; and one longer than 1024 bytes once written out. A path without header annotations no longer takes the headers of the path above it; set them on each Ingress. `--config-sync --ensure-files` creates a v2 placeholder (Synapse 0.7.0 or newer).
 >
-> Every `use-regex` path and every Gateway `RegularExpression` path is written in Go's canonical form. For the few expressions the two engines read differently, such as `\<` (a literal character in Go, a word boundary in Synapse), the meaning follows Go's reading.
+> Every `use-regex` path and every Gateway `RegularExpression` path is written in Go's canonical form. For the few expressions the two engines read differently, such as `\<` (a literal character in Go, a word boundary in Synapse), the meaning follows Go's reading. One exception: under `(?i)`, Go matches `s` and `k` to `ſ` (U+017F) and the Kelvin sign (U+212A) as well; Synapse matches ASCII letters only.
 >
 > What stays: every annotation means what it meant: plain HTTP unless `backend-protocol` asks for TLS, a probe unless `healthcheck: "false"`, 120 s to send, no fingerprints forwarded.
 >

@@ -598,6 +598,9 @@ func asciiRegex(parsed *syntax.Regexp, written, source string) error {
 		}
 		return found, letter
 	}
+	if hidden(source) {
+		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	}
 	if found, letter := folded(parsed); letter {
 		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
 	} else if found {
@@ -632,6 +635,68 @@ func asciiRegex(parsed *syntax.Regexp, written, source string) error {
 		i += size
 	}
 	return nil
+}
+
+// foldMarker stands in for a letter that Go's parser would write as an ASCII
+// one. It is in the private use area, so it has no case of its own.
+const foldMarker = '\ue000'
+
+// hidden reports whether source holds a case-folded literal of U+017F (long s)
+// or U+212A (Kelvin sign). The parser writes a folded literal as the lowest
+// rune of its fold orbit, so `(?i)ſ` comes back as `(?i:S)` and the written
+// form no longer shows the letter. The source is parsed again with the
+// letter, typed or written by its number, replaced by a rune that has no
+// case; a folded literal that holds it is one that was hidden. A class is
+// left to the scan of the written form, which still finds the letter in it.
+func hidden(source string) bool {
+	var b strings.Builder
+	changed, quoted := false, false
+	for i := 0; i < len(source); {
+		rest := source[i:]
+		r, size := utf8.DecodeRuneInString(rest)
+		switch {
+		case quoted && strings.HasPrefix(rest, `\E`):
+			quoted, size = false, 2
+		case quoted:
+		case strings.HasPrefix(rest, `\Q`):
+			quoted, size = true, 2
+		case strings.HasPrefix(rest, `\x{`):
+			if end := strings.IndexByte(rest, '}'); end > 0 {
+				size = end + 1
+				if n, err := strconv.ParseUint(rest[3:end], 16, 32); err == nil && (n == 0x17f || n == 0x212a) {
+					r = foldMarker
+				}
+			}
+		case r == '\\':
+			_, n := utf8.DecodeRuneInString(rest[1:])
+			size += n
+		}
+		if r == 0x17f || r == 0x212a {
+			r = foldMarker
+		}
+		if r == foldMarker {
+			changed = true
+			b.WriteRune(foldMarker)
+		} else {
+			b.WriteString(rest[:size])
+		}
+		i += size
+	}
+	if !changed {
+		return false
+	}
+	parsed, err := syntax.Parse(b.String(), syntax.Perl)
+	if err != nil {
+		return false
+	}
+	var walk func(re *syntax.Regexp) bool
+	walk = func(re *syntax.Regexp) bool {
+		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 && slices.Contains(re.Rune, foldMarker) {
+			return true
+		}
+		return slices.ContainsFunc(re.Sub, walk)
+	}
+	return walk(parsed)
 }
 
 // addRegexRoute records a regex path route: it is matched by `match_expr`
