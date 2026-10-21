@@ -312,3 +312,62 @@ func TestOwnership_APartlyRefusedIngressKeepsItsOtherHosts(t *testing.T) {
 		t.Errorf("host conflict counter went up by %v, want 1", d)
 	}
 }
+
+// A passthrough host of the owner is already written, and gets no second
+// entry: a repeated key makes Synapse refuse the file.
+func TestOwnership_AnOwnersPassthroughHostUnderAForeignWildcardIsWrittenOnce(t *testing.T) {
+	owner := annotated(ownerIngress("zzz", "raw", ownedHost, "/", t0), "ssl-passthrough", "true")
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, wild)
+	if n := strings.Count(out, `"`+ownedHost+`":`); n != 1 {
+		t.Errorf("%s is written %d times, want once:\n%s", ownedHost, n, out)
+	}
+	if !parseV2(t, out).Hosts[ownedHost].TLS.Passthrough {
+		t.Errorf("%s is not a passthrough host:\n%s", ownedHost, out)
+	}
+}
+
+// The entry is written under the spelling the claim used, and carries the
+// certificate bound under the spelling of the TLS host.
+func TestOwnership_AHeldEntryInAnotherSpellingKeepsTheCertificate(t *testing.T) {
+	owner := broken(ownerIngress("zzz", "shop", "other.zzz.test", "/", t0))
+	annotated(owner, "server-alias", "OWNED.example.com")
+	owner.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{ownedHost}, SecretName: "zzz-tls"}}
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, wild, tlsSecret("zzz", "zzz-tls", "CRT-zzz", "KEY-zzz"))
+	h, ok := parseV2(t, out).Hosts["OWNED.example.com"]
+	if !ok || h.TLS.Terminate == nil || h.TLS.Terminate.Cert != ownedHost {
+		t.Errorf("OWNED.example.com = %+v (present %v), want the certificate %s:\n%s", h, ok, ownedHost, out)
+	}
+}
+
+// A wildcard of the owner's own namespace that another wildcard of that
+// namespace covers is the owner's too.
+func TestOwnership_AWildcardOfTheOwnersNamespaceIsNotForeign(t *testing.T) {
+	out, _, _ := renderOwned(t,
+		broken(ownerIngress("bbb", "x", "x.a.example.com", "/", t0)),
+		ownerIngress("bbb", "w1", "*.example.com", "/w1", t0.Add(time.Minute)),
+		ownerIngress("bbb", "w2", "*.a.example.com", "/w2", t0.Add(2*time.Minute)))
+	wantHosts(t, out, []string{"*.example.com", "*.a.example.com"}, []string{"x.a.example.com"})
+}
+
+// A held name's solver sits under the name's own entry, so it is answered,
+// and nobody is told it is not.
+func TestOwnership_ASolverOfAHeldNameUnderAForeignPassthroughWildcardIsAnswered(t *testing.T) {
+	solver := ownerIngress("zzz", "cm-acme-http-solver-1", ownedHost, "/.well-known/acme-challenge/tok", t0)
+	wild := annotated(ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour)), "ssl-passthrough", "true")
+	out, _, ev := renderOwned(t, solver, wild)
+	if got := eventsOf(ev, "SolverUnreachable"); len(got) != 0 {
+		t.Errorf("events = %q, want none", got)
+	}
+	if _, ok := parseV2(t, out).Hosts[ownedHost].Paths["/.well-known/acme-challenge/tok"]; !ok {
+		t.Errorf("the solver is not under %s:\n%s", ownedHost, out)
+	}
+}
+
+// broken makes the backend of ing unresolvable, so that its host has no
+// routes.
+func broken(ing *networkingv1.Ingress) *networkingv1.Ingress {
+	ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	return ing
+}

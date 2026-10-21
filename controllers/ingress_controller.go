@@ -476,6 +476,8 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 	}
 
+	m.holdOwnedHosts(logger)
+
 	// A solver that the file has no place for, now that every host is
 	// known.
 	for _, s := range m.solverSources {
@@ -486,8 +488,6 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
 		}
 	}
-
-	m.holdOwnedHosts(logger)
 
 	// Project referenced TLS Secrets. Central mode (CertsOutSecret set)
 	// writes them into a Secret the separate proxy pod mounts; sidecar

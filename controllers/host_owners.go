@@ -154,7 +154,10 @@ func (m *renderModel) holdOwnedHosts(logger logr.Logger) {
 			continue
 		}
 		w := sameOrCovering(key, written)
-		if w == "" || m.owners.byKey[hostKey(w)] == ns {
+		if w == "" {
+			continue
+		}
+		if owner, _ := m.owners.holder(w); owner == ns {
 			continue
 		}
 		spelling := m.owners.spelled[key]
