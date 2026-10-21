@@ -159,6 +159,10 @@ type IngressReconciler struct {
 	// rather than the process-wide ones.
 	OwnerRef *metav1.OwnerReference
 
+	// certWriteFailed is set by a render in which a certificate could not
+	// be written. Reconcile reads it to retry.
+	certWriteFailed atomic.Bool
+
 	ready      atomic.Bool
 	reloadOnce sync.Once
 	signaler   *ReloadSignaler
@@ -184,6 +188,9 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		logger.Info("rendered synapse upstreams",
 			"ingresses", n, "hosts", h, "path", r.UpstreamsOutPath)
 	}
+	if r.certWriteFailed.Load() {
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -204,6 +211,7 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
 	mRenderTotal.Inc()
+	r.certWriteFailed.Store(false)
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
 		mRenderErrTotal.Inc()
@@ -278,14 +286,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			}
 			if len(hosts) == 0 {
 				stem, _ := certStem("", ing.Namespace, t.SecretName)
-				m.addCert("", stem, ing.Namespace, t.SecretName)
+				m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				continue
 			}
 			for _, h := range hosts {
 				if stem, bound := certStem(h, ing.Namespace, t.SecretName); bound {
-					m.addCert(h, stem, ing.Namespace, t.SecretName)
+					m.addCert(h, stem, ing.Namespace, t.SecretName, ing)
 				} else {
-					m.addCert("", stem, ing.Namespace, t.SecretName)
+					m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				}
 			}
 		}

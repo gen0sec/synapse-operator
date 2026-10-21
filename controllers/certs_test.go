@@ -31,9 +31,9 @@ func TestCertStem(t *testing.T) {
 
 func TestAddCert_FirstWriterWins(t *testing.T) {
 	m := newRenderModel()
-	m.addCert("h.example.com", "h.example.com", "ns", "sec1")
-	m.addCert("h.example.com", "h.example.com", "ns", "sec2") // dup host+stem
-	m.addCert("", "ns-w", "ns", "wild")                       // no host binding
+	m.addCert("h.example.com", "h.example.com", "ns", "sec1", nil)
+	m.addCert("h.example.com", "h.example.com", "ns", "sec2", nil) // dup host+stem
+	m.addCert("", "ns-w", "ns", "wild", nil)                       // no host binding
 	if cp := m.certProjections["h.example.com"]; cp.name != "sec1" {
 		t.Fatalf("first writer per stem must win: %+v", cp)
 	}
@@ -47,7 +47,7 @@ func TestAddCert_FirstWriterWins(t *testing.T) {
 		t.Fatalf("host=\"\" must not create a hostCert entry: %v", m.hostCert)
 	}
 	// invalid inputs are ignored.
-	m.addCert("x", "", "ns", "s")
+	m.addCert("x", "", "ns", "s", nil)
 	if _, ok := m.hostCert["x"]; ok {
 		t.Fatal("empty stem must be ignored")
 	}
@@ -129,7 +129,7 @@ func TestProjectCerts(t *testing.T) {
 		IsLeader: func() bool { return false }} // projection is NOT leader-gated
 
 	m := newRenderModel()
-	m.addCert("a.example.com", "a.example.com", "default", "g0s-tls")
+	m.addCert("a.example.com", "a.example.com", "default", "g0s-tls", nil)
 	ch, n, err := r.projectCerts(context.Background(), m)
 	if err != nil || !ch || n != 1 {
 		t.Fatalf("project: ch=%v n=%d err=%v", ch, n, err)
@@ -164,7 +164,7 @@ func TestProjectCerts(t *testing.T) {
 
 	// Missing Secret ⇒ skipped (no hard error, no file).
 	m2 := newRenderModel()
-	m2.addCert("z.example.com", "z.example.com", "default", "nope")
+	m2.addCert("z.example.com", "z.example.com", "default", "nope", nil)
 	if ch, n, err := r.projectCerts(context.Background(), m2); err != nil || ch || n != 0 {
 		t.Fatalf("missing Secret must be skipped softly: ch=%v n=%d err=%v", ch, n, err)
 	}
@@ -175,7 +175,7 @@ func TestProjectCerts(t *testing.T) {
 	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(bad).Build()
 	r2 := &IngressReconciler{Client: c2, CertsOutDir: t.TempDir()}
 	m3 := newRenderModel()
-	m3.addCert("b.example.com", "b.example.com", "default", "bad")
+	m3.addCert("b.example.com", "b.example.com", "default", "bad", nil)
 	if _, n, _ := r2.projectCerts(context.Background(), m3); n != 0 {
 		t.Fatalf("non-TLS Secret must be skipped, n=%d", n)
 	}
@@ -196,7 +196,7 @@ func TestProjectCertsToSecret(t *testing.T) {
 	r := &IngressReconciler{Client: c, CertsOutSecret: out}
 
 	m := newRenderModel()
-	m.addCert("a.example.com", "a.example.com", "default", "g0s-tls")
+	m.addCert("a.example.com", "a.example.com", "default", "g0s-tls", nil)
 	ch, n, err := r.projectCertsToSecret(context.Background(), m)
 	if err != nil || !ch || n != 1 {
 		t.Fatalf("project: ch=%v n=%d err=%v", ch, n, err)
@@ -239,7 +239,7 @@ func TestProjectCertsToSecret(t *testing.T) {
 	}
 	// Missing source Secret ⇒ skipped softly (no error, no change).
 	m2 := newRenderModel()
-	m2.addCert("z.example.com", "z.example.com", "default", "nope")
+	m2.addCert("z.example.com", "z.example.com", "default", "nope", nil)
 	if ch, n, err := r.projectCertsToSecret(context.Background(), m2); err != nil || ch || n != 0 {
 		t.Fatalf("missing Secret must be skipped softly: ch=%v n=%d err=%v", ch, n, err)
 	}

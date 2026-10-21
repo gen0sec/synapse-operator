@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,15 +66,14 @@ func sanitizeStem(s string) string {
 // prunes operator-managed cert files no longer referenced. Returns
 // (changed, projected, err). CertsOutDir == "" disables multi-cert
 // (legacy single static-mount behavior). A missing / non-TLS Secret
-// is skipped (logged + metric) without failing the whole render.
+// is skipped (logged + metric) without failing the whole render, and so
+// is a certificate that cannot be written: it is left out, any half of it
+// is pruned, and the render is flagged for a retry (certWriteFailed).
 func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (bool, int, error) {
 	if r.CertsOutDir == "" {
 		return false, 0, nil
 	}
 	logger := ctrl.LoggerFrom(ctx).WithName("certs")
-	if err := os.MkdirAll(r.CertsOutDir, 0o755); err != nil {
-		return false, 0, fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err)
-	}
 
 	// Deterministic order so logs/behavior are reproducible.
 	stems := make([]string, 0, len(m.certProjections))
@@ -81,6 +81,14 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 		stems = append(stems, s)
 	}
 	sort.Strings(stems)
+
+	if err := os.MkdirAll(r.CertsOutDir, 0o755); err != nil {
+		for _, stem := range stems {
+			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err))
+		}
+		mCerts.Set(0)
+		return false, 0, nil
+	}
 
 	changed := false
 	want := map[string]struct{}{} // stems successfully projected
@@ -106,11 +114,13 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 		// write is the last step that makes the pair loadable.
 		kch, err := writeFileIfChanged(filepath.Join(r.CertsOutDir, stem+".key"), key, 0o600)
 		if err != nil {
-			return changed, len(want), fmt.Errorf("write %s.key: %w", stem, err)
+			r.certNotWritten(logger, cp, fmt.Errorf("write %s.key: %w", stem, err))
+			continue
 		}
 		cch, err := writeFileIfChanged(filepath.Join(r.CertsOutDir, stem+".crt"), crt, 0o644)
 		if err != nil {
-			return changed, len(want), fmt.Errorf("write %s.crt: %w", stem, err)
+			r.certNotWritten(logger, cp, fmt.Errorf("write %s.crt: %w", stem, err))
+			continue
 		}
 		if kch || cch {
 			changed = true
@@ -125,6 +135,18 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 	}
 	mCerts.Set(float64(len(want)))
 	return changed, len(want), nil
+}
+
+// certNotWritten records a certificate that could not be written to
+// CertsOutDir. The stem stays out of the wanted set, so the prune removes
+// whatever half of the pair was written.
+func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection, err error) {
+	logger.Error(err, "TLS cert not written; skipping (host will fall back to default)",
+		"secret", cp.ns+"/"+cp.name, "stem", cp.stem)
+	mCertErrors.Inc()
+	r.certWriteFailed.Store(true)
+	r.emit(cp.from, corev1.EventTypeWarning, "CertificateNotWritten",
+		"certificate %s from Secret %s/%s could not be written: %v", cp.stem, cp.ns, cp.name, err)
 }
 
 // maxCertsSecretBytes is how much certificate material goes into the output

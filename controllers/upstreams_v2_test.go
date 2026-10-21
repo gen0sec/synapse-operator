@@ -107,7 +107,7 @@ func TestRenderUpstreamsV2_AHostWithoutACertificate(t *testing.T) {
 	servers := []backend{{addr: "10.0.0.1:80"}}
 	m.addRoute("plain.example.com", "/", servers, annSettings{}, nil, nil)
 	m.addRoute("tls.example.com", "/", servers, annSettings{}, nil, nil)
-	m.addCert("tls.example.com", "tls-stem", "ns", "tls")
+	m.addCert("tls.example.com", "tls-stem", "ns", "tls", nil)
 	rendered := renderUpstreamsV2(m)
 	doc := parseV2(t, rendered)
 
