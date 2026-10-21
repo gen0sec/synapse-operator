@@ -113,6 +113,16 @@ func claimLine(k claimKey, e claimEntry) string {
 	return s
 }
 
+// absentSuffixMax is the longest " <absentSince>" a line can grow by.
+const absentSuffixMax = 1 + len("2006-01-02T15:04:05.999999999Z")
+
+// reservedLen is what a line counts towards the cap: its length with the
+// longest absentSince it could carry, plus the newline. A line that goes absent
+// then never adds to the counted size, so only a new line is refused for room.
+func reservedLen(k claimKey, e claimEntry) int {
+	return len(k.ns) + 1 + len(k.host) + 1 + len(e.firstSeen.UTC().Format(time.RFC3339Nano)) + absentSuffixMax + 1
+}
+
 func sortedClaimKeys(entries map[claimKey]claimEntry) []claimKey {
 	keys := make([]claimKey, 0, len(entries))
 	for k := range entries {
@@ -257,7 +267,8 @@ func (l *hostClaims) applyQuota() {
 	}
 }
 
-// capSize drops lines until the body fits, in three tiers. First the lines
+// capSize drops lines until the body fits, counting every line at the width it
+// has once absent, in three tiers. First the lines
 // new in this render, then the lines of claims no longer made, then the
 // established ones; a line that was there before the render is never dropped
 // while one that is new remains, so a flood of new claims cannot take a host
@@ -268,7 +279,7 @@ func (l *hostClaims) applyQuota() {
 func (l *hostClaims) capSize(isNew map[claimKey]bool) int {
 	size := len(hostClaimsHeader) + 1
 	for k, e := range l.entries {
-		size += len(claimLine(k, e)) + 1
+		size += reservedLen(k, e)
 	}
 	if size <= maxHostClaimsBytes {
 		return 0
@@ -293,7 +304,7 @@ func (l *hostClaims) capSize(isNew map[claimKey]bool) int {
 		for ns, keys := range groups {
 			l.dropOrder(keys)
 			for _, k := range keys {
-				bytes[ns] += len(claimLine(k, l.entries[k])) + 1
+				bytes[ns] += reservedLen(k, l.entries[k])
 			}
 		}
 		for size > maxHostClaimsBytes {
@@ -311,7 +322,7 @@ func (l *hostClaims) capSize(isNew map[claimKey]bool) int {
 			}
 			k := groups[pick][0]
 			groups[pick] = groups[pick][1:]
-			n := len(claimLine(k, l.entries[k])) + 1
+			n := reservedLen(k, l.entries[k])
 			bytes[pick] -= n
 			size -= n
 			delete(l.entries, k)

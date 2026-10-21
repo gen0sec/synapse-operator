@@ -407,11 +407,14 @@ func TestHostClaims_ATieInBytesDropsFromTheLastNamespaceByName(t *testing.T) {
 		}
 	}
 	// Short filler, until the body is over the cap by less than one line.
-	size := bodySize(l)
+	size := len(hostClaimsHeader) + 1
+	for k, e := range l.entries {
+		size += reservedLen(k, e)
+	}
 	for i := 0; size <= maxHostClaimsBytes; i++ {
 		k := claimKey{"f", fmt.Sprintf("f%06d.example.com", i)}
 		l.entries[k] = claimEntry{firstSeen: t0}
-		size += len(claimLine(k, l.entries[k])) + 1
+		size += reservedLen(k, l.entries[k])
 	}
 	if got := l.capSize(isNew); got != 1 {
 		t.Fatalf("dropped %d lines, want 1", got)
@@ -449,5 +452,111 @@ func TestHostClaims_AReadOnlyAgeTreatsAnExpiredLineAsNew(t *testing.T) {
 	out := l.age([]hostClaim{claimOf("a", "h.example.com", t0)}, now)
 	if !out[0].created.Equal(now) {
 		t.Errorf("a claim returned after the grace is aged %v, not %v", out[0].created, now)
+	}
+}
+
+func tinyClaims(ns string, n int, created time.Time) []hostClaim {
+	var claims []hostClaim
+	for i := 0; i < n; i++ {
+		claims = append(claims, claimOf(ns, fmt.Sprintf("t%04d.example.com", i), created))
+	}
+	return claims
+}
+
+// claimsHeld is a claim for every line the ledger holds, except those of skip.
+func claimsHeld(l *hostClaims, skip string) []hostClaim {
+	var claims []hostClaim
+	for _, k := range sortedClaimKeys(l.entries) {
+		if k.ns != skip {
+			claims = append(claims, claimOf(k.ns, k.host, t0))
+		}
+	}
+	return claims
+}
+
+// nearCap is a ledger of established lines that a flood of new tiny claims has
+// trimmed, with the victim's and x1's line for shop. pad is chosen so that the
+// body is left within absentSuffixMax of maxHostClaimsBytes, counted as the cap
+// counts.
+// born has nanoseconds, so that a first-seen time is as long as one can be.
+var born = t0.Add(123456789)
+
+func nearCap(t *testing.T, pad int) *hostClaims {
+	t.Helper()
+	l, _ := parseHostClaims("", false)
+	var claims []hostClaim
+	for _, ns := range []string{"x2", "x3", "x4"} {
+		claims = append(claims, manyClaims(ns, 1024, born, pad)...)
+	}
+	claims = append(claims, claimOf("victim", "shop.example.com", born), claimOf("x1", "shop.example.com", born.Add(time.Hour)))
+	claims = append(claims, tinyClaims("t", 1000, born.Add(2*time.Hour))...)
+	l.record(claims, t0.Add(3*time.Hour))
+	l.record(claimsHeld(l, ""), t0.Add(4*time.Hour))
+	for _, ns := range []string{"victim", "x1"} {
+		if _, ok := l.entries[claimKey{ns, "shop.example.com"}]; !ok {
+			t.Fatalf("setup: the line of %s for shop is gone; the scenario needs retuning", ns)
+		}
+	}
+	return l
+}
+
+// countedSlack is how many bytes the cap has left, counting every line as long
+// as it can get.
+func countedSlack(l *hostClaims) int {
+	size := len(hostClaimsHeader) + 1
+	for k, e := range l.entries {
+		size += reservedLen(k, e)
+	}
+	return maxHostClaimsBytes - size
+}
+
+// tightPads are the pads for which nearCap leaves less room than one line
+// going absent grows by, so that counting only the real width would overflow.
+func tightPads(t *testing.T) []int {
+	t.Helper()
+	var pads []int
+	for pad := 190; pad <= 230; pad++ {
+		if s := countedSlack(nearCap(t, pad)); s >= 0 && s < absentSuffixMax {
+			pads = append(pads, pad)
+		}
+	}
+	if len(pads) < 2 {
+		t.Fatalf("setup: only pads %v leave the ledger within %d bytes of the cap; the scenario needs retuning", pads, absentSuffixMax)
+	}
+	return pads
+}
+
+func TestHostClaims_AClaimGoingAbsentNeverCostsAnotherNamespaceItsLine(t *testing.T) {
+	for _, pad := range tightPads(t) {
+		l := nearCap(t, pad)
+		held := len(l.entries)
+		changed, dropped := l.record(claimsHeld(l, "victim"), t0.Add(5*time.Hour+123456789))
+		if !changed || dropped != 0 || len(l.entries) != held {
+			t.Errorf("pad %d: the victim going absent dropped %d lines (%d of %d left)", pad, dropped, len(l.entries), held)
+		}
+		if e, ok := l.entries[claimKey{"victim", "shop.example.com"}]; !ok || e.absentSince.IsZero() {
+			t.Fatalf("pad %d: the victim's line is not held as absent", pad)
+		}
+		l.record(append(claimsHeld(l, "victim"), claimOf("victim", "shop.example.com", born)), t0.Add(5*time.Hour+10*time.Minute))
+		l.record(append(claimsHeld(l, "x1"), claimOf("x1", "shop.example.com", born.Add(time.Hour))), t0.Add(6*time.Hour))
+		if got := firstSeenOf(t, l, "victim", "shop.example.com"); !got.Equal(born) {
+			t.Errorf("pad %d: the victim's shop is aged %v", pad, got)
+		}
+	}
+}
+
+func TestHostClaims_TheBodyNeverExceedsTheCapWhateverGoesAbsent(t *testing.T) {
+	for _, pad := range tightPads(t) {
+		l := nearCap(t, pad)
+		for i, skip := range []string{"victim", "t", "x2", "x3", "x4", "x1"} {
+			l.record(claimsHeld(l, skip), t0.Add(time.Duration(5+i)*time.Minute+5*time.Hour+123456789))
+			if n := bodySize(l); n > maxHostClaimsBytes {
+				t.Errorf("pad %d: after %s went absent the body is %d bytes", pad, skip, n)
+			}
+		}
+		l.record(nil, t0.Add(6*time.Hour+123456789))
+		if n := bodySize(l); n > maxHostClaimsBytes {
+			t.Errorf("pad %d: after every claim went absent the body is %d bytes", pad, n)
+		}
 	}
 }
