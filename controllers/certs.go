@@ -64,7 +64,9 @@ func certStem(host, ns, secret string) (stem string, hostBound bool) {
 // For fullchain, cert and chain, cert_logical_name takes the parent
 // directory's name instead. "default" is what the proxy's default_certificate
 // (proxyconfig_defaults.yaml) picks by, so a host of that name would become
-// the certificate for every name no other certificate matches.
+// the certificate for every name no other certificate matches. That holds for
+// the operator's default config only: proxy.default_certificate is not an
+// owned key, so spec.config or the --ingress-mode config can name another.
 var reservedCertStems = map[string]bool{"fullchain": true, "cert": true, "chain": true, "default": true}
 
 // maxCertStem is the longest stem whose <stem>.crt is a valid Secret key and
