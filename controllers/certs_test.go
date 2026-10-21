@@ -382,3 +382,128 @@ func TestRenderGateways_CollectsListenerCerts(t *testing.T) {
 		t.Fatalf("listener cert not projected: %q", b)
 	}
 }
+
+// Synapse names a certificate by its file stem, except that for the stems
+// fullchain, cert and chain it takes the name of the directory above. A host
+// of that name would be registered under the certs directory's name instead.
+// "default" is the name the proxy's default_certificate picks by.
+func TestCertStem_ReservedNamesAreNotHostStems(t *testing.T) {
+	for _, h := range []string{"cert", "chain", "fullchain", "default"} {
+		if s, b := certStem(h, "ns", "sec"); s != "ns_sec" || !b {
+			t.Errorf("host %q: stem %q bound %v, want ns_sec bound", h, s, b)
+		}
+	}
+	if s, b := certStem("cert.example.com", "ns", "sec"); s != "cert.example.com" || !b {
+		t.Errorf("cert.example.com is not reserved: %q %v", s, b)
+	}
+}
+
+func longHost(last byte) string {
+	l := strings.Repeat("a", 63)
+	return l + "." + l + "." + l + "." + strings.Repeat("a", 60) + string(last)
+}
+
+func TestCertStem_FitsAKeyAndAFileName(t *testing.T) {
+	const max = 249 // 253 less ".crt"
+	h1, h2 := longHost('b'), longHost('c')
+	if len(h1) != 253 {
+		t.Fatalf("test host is %d chars", len(h1))
+	}
+	s1, b1 := certStem(h1, "ns", "sec")
+	s2, _ := certStem(h2, "ns", "sec")
+	if len(s1) != max || !b1 {
+		t.Errorf("253-char host: stem of %d chars, bound %v, want %d", len(s1), b1, max)
+	}
+	if s1 == s2 {
+		t.Errorf("hosts that differ in their last char share the stem %q", s1)
+	}
+	if s, _ := certStem(h1, "ns", "sec"); s != s1 {
+		t.Errorf("the stem is not stable: %q vs %q", s, s1)
+	}
+	exact := strings.Repeat("a", max)
+	if s, _ := certStem(exact, "ns", "sec"); s != exact {
+		t.Errorf("a stem of %d chars must stay as it is", max)
+	}
+	if s, _ := certStem(exact+"a", "ns", "sec"); len(s) != max || s == exact {
+		t.Errorf("a stem of %d chars must be shortened: %d chars", max+1, len(s))
+	}
+	s3, b3 := certStem("", strings.Repeat("n", 63), strings.Repeat("s", 253))
+	if len(s3) != max || b3 {
+		t.Errorf("long ns and Secret: stem of %d chars, bound %v", len(s3), b3)
+	}
+}
+
+func TestProjectCerts_LongHostDoesNotFailTheRender(t *testing.T) {
+	dir := t.TempDir()
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(tlsSecret("default", "g0s-tls", "CRT", "KEY")).Build()
+	r := &IngressReconciler{Client: c, CertsOutDir: dir}
+	host := longHost('b')
+	stem, _ := certStem(host, "default", "g0s-tls")
+	m := newRenderModel()
+	m.addCert(host, stem, "default", "g0s-tls")
+	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
+		t.Fatalf("project: n=%d err=%v", n, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, stem+".crt")); string(b) != "CRT" {
+		t.Fatalf("crt=%q", b)
+	}
+}
+
+func TestProjectCertsToSecret_LongHostIsStored(t *testing.T) {
+	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(tlsSecret("default", "g0s-tls", "CRT", "KEY")).Build()
+	r := &IngressReconciler{Client: c, CertsOutSecret: out}
+	host := longHost('b')
+	stem, _ := certStem(host, "default", "g0s-tls")
+	m := newRenderModel()
+	m.addCert(host, stem, "default", "g0s-tls")
+	if _, n, err := r.projectCertsToSecret(context.Background(), m); err != nil || n != 1 {
+		t.Fatalf("project: n=%d err=%v", n, err)
+	}
+	var got corev1.Secret
+	if err := c.Get(context.Background(), out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data[stem+".crt"]) != "CRT" || string(got.Data[stem+".key"]) != "KEY" {
+		t.Fatalf("the long host's certificate is not stored: %d keys", len(got.Data))
+	}
+}
+
+func TestRender_ReservedHostGetsItsOwnCertificate(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	sec := tlsSecret("default", "g0s-tls", "C", "K")
+	ing := &networkingv1.Ingress{}
+	ing.Name, ing.Namespace = "g0s", "default"
+	ing.Spec.IngressClassName = ptr("synapse")
+	ing.Spec.TLS = []networkingv1.IngressTLS{{SecretName: "g0s-tls", Hosts: []string{"cert", "default"}}}
+	rule := func(host string) networkingv1.IngressRule {
+		return networkingv1.IngressRule{
+			Host: host,
+			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/", Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: "whoami", Port: networkingv1.ServiceBackendPort{Number: 80}}}}}}}}
+	}
+	ing.Spec.Rules = []networkingv1.IngressRule{rule("cert"), rule("default")}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing, sec).Build()
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out,
+		CertsOutDir: dir, ClusterDomain: "cluster.local"}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cert.crt")); err == nil {
+		t.Error("cert.crt would be registered under the directory's name")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "default_g0s-tls.crt")); string(b) != "C" {
+		t.Errorf("default_g0s-tls.crt=%q", b)
+	}
+	s, _ := os.ReadFile(out)
+	if strings.Count(string(s), "certificate: \"default_g0s-tls\"") != 2 {
+		t.Errorf("the certificate: lines do not name the file:\n%s", s)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "default.crt")); err == nil {
+		t.Error("default.crt would be the proxy's default certificate")
+	}
+}

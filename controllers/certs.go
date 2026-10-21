@@ -3,6 +3,8 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,9 +49,36 @@ const ingressCertsManagedLabel = "synapse.gen0sec.com/ingress-certs"
 // (host == "" ⇒ caller must not set a per-host upstreams binding).
 func certStem(host, ns, secret string) (stem string, hostBound bool) {
 	if host != "" && !strings.HasPrefix(host, "*.") {
-		return sanitizeStem(host), true
+		hostBound = true
+		stem = sanitizeStem(host)
+		if reservedCertStems[stem] {
+			stem = sanitizeStem(ns + "_" + secret)
+		}
+	} else {
+		stem = sanitizeStem(ns + "_" + secret)
 	}
-	return sanitizeStem(ns + "_" + secret), false
+	return fitStem(stem), hostBound
+}
+
+// reservedCertStems are the file stems Synapse does not take at face value.
+// For fullchain, cert and chain, cert_logical_name takes the parent
+// directory's name instead. "default" is what the proxy's default_certificate
+// (proxyconfig_defaults.yaml) picks by, so a host of that name would become
+// the certificate for every name no other certificate matches.
+var reservedCertStems = map[string]bool{"fullchain": true, "cert": true, "chain": true, "default": true}
+
+// maxCertStem is the longest stem whose <stem>.crt is a valid Secret key and
+// file name.
+const maxCertStem = validation.DNS1123SubdomainMaxLength - len(".crt")
+
+// fitStem shortens a stem longer than maxCertStem to its head and a hash of
+// the whole. A collision of the 64-bit hash is not handled.
+func fitStem(stem string) string {
+	if len(stem) <= maxCertStem {
+		return stem
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return stem[:maxCertStem-17] + "_" + hex.EncodeToString(sum[:])[:16]
 }
 
 func sanitizeStem(s string) string {

@@ -80,8 +80,10 @@ func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T)
 	if string(certs.Data["shop.example.com.crt"]) != "CRT-shop" || string(certs.Data["shop.example.com.key"]) != "KEY-shop" {
 		t.Errorf("the other certificate was not projected; keys %v", keysOf(certs.Data))
 	}
-	if len(certs.Data) != 2 {
-		t.Errorf("certs Secret holds %d keys, want the two of the certificate that fits", len(certs.Data))
+	// A long host's stem is shortened to fit a key, so its certificate is stored too.
+	longStem, _ := certStem(longHost, ns, "long-tls")
+	if string(certs.Data[longStem+".crt"]) != "CRT-long" || len(certs.Data) != 4 {
+		t.Errorf("certs Secret holds %d keys (%v), want both certificates", len(certs.Data), keysOf(certs.Data))
 	}
 }
 
