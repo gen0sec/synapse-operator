@@ -60,6 +60,31 @@ func eventually(t *testing.T, what string, check func() string) {
 	}
 }
 
+// quiet polls read until it has given the same answer on 3 reads in a row,
+// 200 ms apart, and fails the test if that has not happened within 30 s. It
+// is how a test waits for controllers to finish writing before it takes a
+// snapshot to compare against: a fixed sleep only holds on an idle machine.
+func quiet(t *testing.T, what string, read func() string) {
+	t.Helper()
+	const (
+		reads    = 3
+		interval = 200 * time.Millisecond
+	)
+	deadline := time.Now().Add(30 * time.Second)
+	last, same := read(), 1
+	for same < reads {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: still changing after 30s, last read %q", what, last)
+		}
+		time.Sleep(interval)
+		if now := read(); now == last {
+			same++
+		} else {
+			last, same = now, 1
+		}
+	}
+}
+
 // change reads obj, applies mutate to it and writes it back; changeStatus
 // does the same for its status. Both do it again when the object was written
 // in between. A controller that is running writes to the objects a test
