@@ -159,10 +159,6 @@ type IngressReconciler struct {
 	// rather than the process-wide ones.
 	OwnerRef *metav1.OwnerReference
 
-	// certWriteFailed is set by a render in which a certificate could not
-	// be written. Reconcile reads it to retry.
-	certWriteFailed atomic.Bool
-
 	ready      atomic.Bool
 	reloadOnce sync.Once
 	signaler   *ReloadSignaler
@@ -180,7 +176,8 @@ func (r *IngressReconciler) usesConfigMapOutput() bool {
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
-	changed, n, h, err := r.render(ctx)
+	var certsFailed int
+	changed, n, h, err := r.renderCounting(ctx, &certsFailed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -188,7 +185,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		logger.Info("rendered synapse upstreams",
 			"ingresses", n, "hosts", h, "path", r.UpstreamsOutPath)
 	}
-	if r.certWriteFailed.Load() {
+	if certsFailed > 0 {
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, nil
@@ -210,8 +207,14 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
+	return r.renderCounting(ctx, new(int))
+}
+
+// renderCounting is render that also reports in *certsFailed how many
+// certificates it could not write. The caller owns the count, so renders that
+// run at the same time cannot hide each other's failures.
+func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int) (bool, int, int, error) {
 	mRenderTotal.Inc()
-	r.certWriteFailed.Store(false)
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
 		mRenderErrTotal.Inc()
@@ -457,9 +460,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			mRenderErrTotal.Inc()
 			return false, matched, len(m.hosts), fmt.Errorf("project certs to secret: %w", cerr)
 		}
-	} else if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
+	} else if _, _, failed, cerr := r.writeCerts(ctx, m); cerr != nil {
 		mRenderErrTotal.Inc()
 		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
+	} else {
+		*certsFailed = failed
 	}
 
 	hosts, routes := 0, 0
