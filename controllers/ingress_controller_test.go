@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1154,6 +1155,39 @@ func TestParseAnnotations_Redirect(t *testing.T) {
 	})
 	if n.redirectStatus == nil || *n.redirectStatus != 301 || n.redirectLocation != "/x" {
 		t.Fatalf("nginx-compat fallback: %+v / %q", n.redirectStatus, n.redirectLocation)
+	}
+}
+
+// Synapse reads a redirect status as a u16 and refuses the whole file over
+// a value it cannot hold, so only the codes it serves are kept.
+func TestParseAnnotations_RedirectCodeRange(t *testing.T) {
+	for _, kind := range []struct {
+		key  string
+		want uint64
+	}{{"permanent-redirect", 301}, {"temporal-redirect", 302}} {
+		for _, prefix := range []string{annPrefix, nginxPrefix} {
+			for _, bad := range []string{"70000", "65536", "200", "404", "0", "-1", "abc"} {
+				a := parseAnnotations(map[string]string{
+					prefix + kind.key:           "/to",
+					prefix + kind.key + "-code": bad,
+				})
+				if a.redirectStatus == nil || *a.redirectStatus != kind.want {
+					t.Errorf("%s%s-code %q: status %v, want the default %d", prefix, kind.key, bad, a.redirectStatus, kind.want)
+				}
+				if a.redirectCodeRefused != bad {
+					t.Errorf("%s%s-code %q: refused value %q", prefix, kind.key, bad, a.redirectCodeRefused)
+				}
+			}
+			for _, good := range []uint64{301, 302, 303, 307, 308} {
+				a := parseAnnotations(map[string]string{
+					prefix + kind.key:           "/to",
+					prefix + kind.key + "-code": strconv.FormatUint(good, 10),
+				})
+				if a.redirectStatus == nil || *a.redirectStatus != good || a.redirectCodeRefused != "" {
+					t.Errorf("%s%s-code %d: status %v, refused %q", prefix, kind.key, good, a.redirectStatus, a.redirectCodeRefused)
+				}
+			}
+		}
 	}
 }
 

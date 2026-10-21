@@ -262,6 +262,12 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				"server-alias %s cannot be used as a host: %s; this alias is ignored", alias, problem)
 			return true
 		})
+		if a.redirectCodeRefused != "" {
+			logger.Info("redirect code ignored: not one Synapse serves",
+				"code", a.redirectCodeRefused, "ingress", ing.Namespace+"/"+ing.Name)
+			r.emit(ing, corev1.EventTypeWarning, "InvalidRedirectCode",
+				"redirect code %q is not one of 301, 302, 303, 307, 308; the redirect uses its default", a.redirectCodeRefused)
+		}
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
