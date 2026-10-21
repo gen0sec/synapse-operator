@@ -119,7 +119,7 @@ func (o *hostOwners) allows(host, ns string) bool {
 func ingressClaims(ing *networkingv1.Ingress, a annSettings) []hostClaim {
 	var claims []hostClaim
 	add := func(host string) {
-		if host == "" || hostKeyProblem(host) != "" || !validClaimHost(host) {
+		if host == "" || hostProblem(host) != "" {
 			return
 		}
 		claims = append(claims, hostClaim{host: host, ns: ing.Namespace, created: ing.CreationTimestamp.Time, who: ing})

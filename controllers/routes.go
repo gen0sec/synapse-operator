@@ -384,6 +384,26 @@ func hostKeyProblem(name string) string {
 	return ""
 }
 
+// hostCharProblem says a name has characters a host name cannot have; ""
+// when it has none. A v1 file without host ownership takes `*` as the host
+// of every name that has no other, so it stops here.
+func hostCharProblem(name string) string {
+	if !validClaimHost(name) {
+		return "it has characters a host name cannot have"
+	}
+	return ""
+}
+
+// hostProblem says why a name cannot be a host the operator writes in a v2
+// file or under host ownership: either Synapse would not take it
+// (hostKeyProblem) or it fails hostCharProblem; "" when it can.
+func hostProblem(name string) string {
+	if p := hostKeyProblem(name); p != "" {
+		return p
+	}
+	return hostCharProblem(name)
+}
+
 // addCert records a host→Secret TLS binding: it schedules the Secret
 // for projection as <stem>.crt/<stem>.key and (when host != "")
 // binds the host to that cert name in upstreams.yaml. First-writer-

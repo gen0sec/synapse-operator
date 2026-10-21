@@ -313,13 +313,16 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		ing, a := o.ing, o.a
 		refused := map[string]bool{}
 		allowed := func(host string) bool { return r.hostAllowed(logger, m, ing, host, refused) }
-		// An alias Synapse would not take as a host of a proxy's file is
-		// left out here: in a v2 file it is an error, and the file is
-		// every route there is. The older modes write it as it came: in a
-		// v1 file `*` is the host of every name that has no other.
+		// An alias that is no host name is left out here. In a v2 file or
+		// under host ownership that is what hostKeyProblem says too; a v1
+		// file without ownership keeps `*`, the host of every name that
+		// has no other, and refuses only what would be a bogus host key.
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
-			problem := hostKeyProblem(alias)
-			if !r.UpstreamsV2 || alias == "" || problem == "" {
+			problem := hostProblem(alias)
+			if !r.UpstreamsV2 && !r.HostOwnership {
+				problem = hostCharProblem(alias)
+			}
+			if alias == "" || problem == "" {
 				return false
 			}
 			logger.Info("server-alias ignored: not a host name Synapse takes",
