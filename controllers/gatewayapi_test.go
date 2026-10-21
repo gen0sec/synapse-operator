@@ -1091,7 +1091,7 @@ func TestCanonicalRegex_FoldedToASCIIIsStillNonASCII(t *testing.T) {
 		t.Errorf("canonicalRegex((?i)[ſ]) error = %v; want the class refusal it has always had", err)
 	}
 	for _, re := range []string{
-		"(?i)/s", "(?i)/k", "(?i)/S", `(?i)/\x{73}`, "/\u017f", "(?i)a(?-i)\u017f", `(?i)/\57`, `(?i)\0577`, `(?i)/\x{2f}`, `(?i)/\\577`, "(?i)/s(?-i)\u017f", `(?i)\\x{17f}`, `(?i)\Q\x{17f}\E`,
+		"(?i)/s", "(?i)/k", "(?i)/S", `(?i)/\x{73}`, "/\u017f", "(?i)a(?-i)\u017f", `(?i)/\57`, `(?i)\0577`, `(?i)/\x{2f}`, `(?i)/\\577`, "(?i)/s(?-i)\u017f", `(?i)\\x{17f}`, `(?i)\Q\x{17f}\E`, "\u017f\u017f|\u212ax", "\u017fx|\u212a\u017f",
 	} {
 		if _, err := canonicalRegex(re); err != nil {
 			t.Errorf("canonicalRegex(%q) = %v; want it accepted", re, err)
