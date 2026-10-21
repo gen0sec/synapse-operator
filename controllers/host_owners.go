@@ -41,7 +41,8 @@ type hostOwners struct {
 	// named are, per namespace, the hosts its own objects name: those of
 	// its Ingresses, listeners and routes. A route of another namespace that
 	// a Gateway admits claims as the Gateway's namespace, and is no object
-	// of it.
+	// of it. A name is recorded whether or not its claim won, so that it
+	// fails closed.
 	named map[string]map[string]bool
 }
 
@@ -180,13 +181,22 @@ func (m *renderModel) holdOwnedHosts(logger logr.Logger) {
 	for h := range written {
 		writtenKeys[hostKey(h)] = struct{}{}
 	}
-	keys := make([]string, 0, len(m.owners.byKey))
+	seen := map[string]bool{}
 	for key := range m.owners.byKey {
+		seen[key] = true
+	}
+	for _, names := range m.owners.named {
+		for key := range names {
+			seen[key] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		ns := m.owners.byKey[key]
+		ns, _ := m.owners.holder(key)
 		if _, ok := writtenKeys[key]; ok {
 			continue
 		}
@@ -194,10 +204,16 @@ func (m *renderModel) holdOwnedHosts(logger logr.Logger) {
 		if w == "" {
 			continue
 		}
-		if owner, _ := m.owners.holder(w); owner == ns {
+		owner, _ := m.owners.holder(w)
+		// The wildcard's own namespace holds a name it also names, when
+		// only routes of other namespaces brought the wildcard in.
+		if owner == ns && !(m.foreignWild[hostKey(w)] && m.owners.named[owner][key]) {
 			continue
 		}
 		spelling := m.owners.spelled[key]
+		if spelling == "" {
+			spelling = key
+		}
 		m.hosts[spelling] = map[string]*routeCfg{}
 		for h, stem := range m.hostCert {
 			if hostKey(h) == key {
