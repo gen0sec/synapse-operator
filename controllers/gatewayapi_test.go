@@ -1079,7 +1079,8 @@ func TestCanonicalRegex_FoldedToASCIIIsStillNonASCII(t *testing.T) {
 	const letter = "a letter outside ASCII cannot be matched without regard to case"
 	for _, re := range []string{
 		"(?i)/\u017f", "(?i)/\u212a", "(?i)/a\u017fb", "(?i:\u017f)",
-		`(?i)/\x{17f}`, `(?i)/\x{212A}`, `(?i)/a\x{017f}b`, "(?i)\\Q\u017f\\E", "(?i)/a\u017f+",
+		`(?i)/\x{17f}`, `(?i)/\x{212A}`, `(?i)/a\x{017f}b`, `(?i)/\577`, `(?i)/a\577b`, `(?i)/\x{0212a}`,
+		"(?i)\u017f[^\\x{80}-\\x{17e}\u017f-\\x{1000}\\x{1001}-\\x{10ffff}]", "(?i)s|\u017f", "(?i)\u017f|s", "(?i)(?:\u017f|s)", "(?i)\\Q\u017f\\E", "(?i)/a\u017f+",
 	} {
 		_, err := canonicalRegex(re)
 		if err == nil || err.Error() != letter {
@@ -1090,7 +1091,7 @@ func TestCanonicalRegex_FoldedToASCIIIsStillNonASCII(t *testing.T) {
 		t.Errorf("canonicalRegex((?i)[ſ]) error = %v; want the class refusal it has always had", err)
 	}
 	for _, re := range []string{
-		"(?i)/s", "(?i)/k", "(?i)/S", `(?i)/\x{73}`, "/\u017f", "(?i)/s(?-i)\u017f", `(?i)\\x{17f}`, `(?i)\Q\x{17f}\E`,
+		"(?i)/s", "(?i)/k", "(?i)/S", `(?i)/\x{73}`, "/\u017f", "(?i)a(?-i)\u017f", `(?i)/\57`, `(?i)\0577`, `(?i)/\x{2f}`, `(?i)/\\577`, "(?i)/s(?-i)\u017f", `(?i)\\x{17f}`, `(?i)\Q\x{17f}\E`,
 	} {
 		if _, err := canonicalRegex(re); err != nil {
 			t.Errorf("canonicalRegex(%q) = %v; want it accepted", re, err)
