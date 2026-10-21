@@ -157,7 +157,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// claim is aged afresh by the next render, so this is retried.
 		if r.Recorder != nil {
 			r.Recorder.Eventf(&proxy, corev1.EventTypeWarning, "HostClaimLedgerNotWritten",
-				"the host claim ledger %s could not be written; hosts are still given to the namespace that held them", proxyHostClaimsName(&proxy).Name)
+				"the host claim ledger %s could not be written; hosts are still given to the namespace that held them, and new claims are aged afresh until the write succeeds", proxyHostClaimsName(&proxy).Name)
 		}
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
