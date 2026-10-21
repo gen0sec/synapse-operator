@@ -124,29 +124,20 @@ func TestRenderUpstreamsV2_AHostWithoutACertificate(t *testing.T) {
 
 // With nothing to route the file is still a v2 file, and one Synapse loads.
 func TestRenderUpstreamsV2_WithNothingInIt(t *testing.T) {
-	for _, sameAsV1 := range []bool{false, true} {
-		m := newRenderModel()
-		m.sameAsV1 = sameAsV1
-		if doc := parseV2(t, renderUpstreamsV2(m)); len(doc.Hosts) != 0 {
-			t.Errorf("hosts are %v", doc.Hosts)
-		}
+	if doc := parseV2(t, renderUpstreamsV2(newRenderModel())); len(doc.Hosts) != 0 {
+		t.Errorf("hosts are %v", doc.Hosts)
 	}
 }
 
 // v2Routes renders the routes build puts into a model and returns those of
 // the host h.example.com, with the file they are in.
-func v2Routes(t *testing.T, sameAsV1 bool, build func(m *renderModel)) (map[string]v2Route, v2File) {
+func v2Routes(t *testing.T, build func(m *renderModel)) (map[string]v2Route, v2File) {
 	t.Helper()
 	m := newRenderModel()
-	m.sameAsV1 = sameAsV1
 	build(m)
 	doc := parseV2(t, renderUpstreamsV2(m))
 	return doc.Hosts["h.example.com"].Paths, doc
 }
-
-// A SynapseProxy's routes were written as a v1 file. As a v2 file they say
-// what Synapse made of that one, where the two schemas do not mean the same
-// by saying nothing.
 
 // How a backend is reached: plain HTTP unless the route asks for TLS. Left
 // unsaid in a v2 file, Synapse goes by the port, and a Service on 443 that
@@ -158,24 +149,19 @@ func TestRenderUpstreamsV2_TLSToBackendsIsSaid(t *testing.T) {
 		m.addRoute("h.example.com", "/tls", servers, annSettings{ssl: ptr(true)}, nil, nil)
 		m.addExprRoute("h.example.com", "gateway:00000", `http.request.method eq "POST"`, servers, nil, nil)
 	}
-	routes, _ := v2Routes(t, true, build)
+	routes, _ := v2Routes(t, build)
 	for key, want := range map[string]bool{"/": false, "/tls": true, "gateway:00000": false} {
 		if got := routes[key].SSLEnabled; got == nil || *got != want {
 			t.Errorf("route %q: ssl_enabled is %v, want %v", key, got, want)
 		}
 	}
-	// The older modes leave it to Synapse, as they did.
-	routes, _ = v2Routes(t, false, build)
-	if got := routes["/"].SSLEnabled; got != nil {
-		t.Errorf("without it being asked for, ssl_enabled is %v", *got)
-	}
 }
 
-// Whether a route's backends are probed. In a v1 file a route is probed
-// unless it says `healthcheck: false`, and saying `true` changes nothing.
-// In a v2 file a route without a `health_check:` block is probed in the
-// same way, and `type: none` is the way to say it is not.
-func TestRenderUpstreamsV2_ProbesAreWhatTheV1FileAskedFor(t *testing.T) {
+// Whether a route's backends are probed. A route is probed unless it says
+// `healthcheck: false`, and saying `true` changes nothing. A route without a
+// `health_check:` block is probed with the global settings, and `type: none`
+// is the way to say it is not.
+func TestRenderUpstreamsV2_ProbesAreWhatTheAnnotationAsked(t *testing.T) {
 	servers := []backend{{addr: "10.0.0.1:8080"}}
 	build := func(m *renderModel) {
 		m.addRoute("h.example.com", "/", servers, annSettings{}, nil, nil)
@@ -185,7 +171,7 @@ func TestRenderUpstreamsV2_ProbesAreWhatTheV1FileAskedFor(t *testing.T) {
 		m.addRegexRoute("h.example.com", "/v[0-9]+", servers, annSettings{healthcheck: ptr(true)}, nil, nil)
 		m.addRegexRoute("h.example.com", "/w[0-9]+", servers, annSettings{healthcheck: ptr(false)}, nil, nil)
 	}
-	routes, _ := v2Routes(t, true, build)
+	routes, _ := v2Routes(t, build)
 	if len(routes) != 6 {
 		t.Fatalf("%d routes, want 6", len(routes))
 	}
@@ -206,48 +192,31 @@ func TestRenderUpstreamsV2_ProbesAreWhatTheV1FileAskedFor(t *testing.T) {
 			}
 		case strings.HasPrefix(key, "/unprobed"):
 			if kind != "none" {
-				t.Errorf("route %q is not probed in the v1 file, and here its health check is %q", key, kind)
+				t.Errorf("route %q is not probed, and its health check is %q", key, kind)
 			}
 			// A backend that is never probed is reached by its port,
-			// whatever the route says of TLS, in a v1 file too. A v2 file
-			// that says otherwise beside `type: none` is refused.
+			// whatever the route says of TLS. A v2 file that says
+			// otherwise beside `type: none` is refused.
 			if route.SSLEnabled != nil {
 				t.Errorf("route %q says ssl_enabled: %v beside a health check of type none", key, *route.SSLEnabled)
 			}
 		default:
 			if kind != "" {
-				t.Errorf("route %q is probed with the global settings in the v1 file, and here by %q", key, kind)
+				t.Errorf("route %q is probed with the global settings, and here by %q", key, kind)
 			}
-		}
-	}
-
-	// The older modes write what they wrote.
-	routes, _ = v2Routes(t, false, build)
-	if hc := routes["/probed"].HealthCheck; hc == nil || hc.Type != "tcp" {
-		t.Errorf("the older modes' health check for a probed route is %+v", hc)
-	}
-	if hc := routes["/unprobed"].HealthCheck; hc != nil {
-		t.Errorf("the older modes' health check for a route that is not probed is %+v", hc)
-	}
-	// Except on a route chosen by an expression, where Synapse takes a
-	// health check for an error.
-	for key, route := range routes {
-		if route.MatchExpr != "" && route.HealthCheck != nil {
-			t.Errorf("the older modes' expression route %q has a health check: %+v", key, route.HealthCheck)
 		}
 	}
 }
 
 // How long a backend may take to send. A route that sets no read timeout
-// has 120 seconds in a v1 file, and would have 60 in a v2 file that sets
-// none either.
-func TestRenderUpstreamsV2_TheReadTimeoutIsTheV1Files(t *testing.T) {
+// has 120 seconds, where a v2 file that sets none gives it 60.
+func TestRenderUpstreamsV2_TheDefaultReadTimeoutIs120(t *testing.T) {
 	servers := []backend{{addr: "10.0.0.1:8080"}}
 	build := func(m *renderModel) {
 		m.addRoute("h.example.com", "/", servers, annSettings{}, nil, nil)
 		m.addRoute("h.example.com", "/slow", servers, annSettings{readTimeout: ptr(uint64(600)), connectTimeout: ptr(uint64(3))}, nil, nil)
 	}
-	routes, doc := v2Routes(t, true, build)
+	routes, doc := v2Routes(t, build)
 	if got := doc.Timeouts.Read; got == nil || *got != 120 {
 		t.Errorf("the file's read timeout is %v, want 120", got)
 	}
@@ -262,39 +231,27 @@ func TestRenderUpstreamsV2_TheReadTimeoutIsTheV1Files(t *testing.T) {
 	if slow.Read == nil || *slow.Read != 600 || slow.Connect == nil || *slow.Connect != 3 {
 		t.Errorf("a route's own timeouts are %+v", slow)
 	}
-
-	_, doc = v2Routes(t, false, build)
-	if doc.Timeouts != (v2Timeouts{}) {
-		t.Errorf("the older modes' file sets timeouts: %+v", doc.Timeouts)
-	}
 }
 
 // What a backend is told about the client. A v2 file has the client's
 // fingerprints sent to the backend in request headers unless it says not
-// to, and a v1 file does not send them.
+// to.
 func TestRenderUpstreamsV2_FingerprintsAreNotSentToBackends(t *testing.T) {
 	for _, sticky := range []bool{false, true} {
-		_, doc := v2Routes(t, true, func(m *renderModel) { m.sticky = sticky })
+		_, doc := v2Routes(t, func(m *renderModel) { m.sticky = sticky })
 		if got := doc.Proxy.Fingerprints.Forward; got == nil || *got {
 			t.Errorf("sticky %v: fingerprints.forward is %v, want it said, false", sticky, got)
 		}
 		if doc.Proxy.StickySessions.Enabled != sticky {
 			t.Errorf("sticky sessions are %v, want %v", doc.Proxy.StickySessions.Enabled, sticky)
 		}
-		// The older modes write what they wrote.
-		_, doc = v2Routes(t, false, func(m *renderModel) { m.sticky = sticky })
-		if got := doc.Proxy.Fingerprints.Forward; got != nil {
-			t.Errorf("the older modes say fingerprints.forward: %v", *got)
-		}
-		if doc.Proxy.StickySessions.Enabled != sticky {
-			t.Errorf("the older modes' sticky sessions are %v, want %v", doc.Proxy.StickySessions.Enabled, sticky)
-		}
 	}
 }
 
-// The older modes write a v2 file that says what their v1 file said, beside
-// a passthrough host as without one.
-func TestRender_TheOlderModesV2FileSaysWhatTheV1FileSaid(t *testing.T) {
+// The older modes write a v2 file that says plain HTTP, the 120 second
+// read timeout and no fingerprints to backends, beside a passthrough host as
+// without one.
+func TestRender_TheOlderModesFileSaysPlainHTTPAndNoFingerprints(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "u.yaml")
 	plain := routedIngress("plain", ptr("synapse"), "plain.example.com")
 	raw := routedIngress("raw", ptr("synapse"), "raw.example.com")
@@ -335,7 +292,6 @@ func TestRender_TheOlderModesV2FileSaysWhatTheV1FileSaid(t *testing.T) {
 func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 	const token = "/.well-known/acme-challenge/tok"
 	m := newRenderModel()
-	m.sameAsV1 = true
 	servers := []backend{{addr: "10.0.0.1:80"}}
 	m.addRoute("plain.example.com", "/", servers, annSettings{}, nil, nil)
 	m.addExprRoute("expr.example.com", "gateway:00000", `http.request.path matches "^/"`, servers, nil, nil)
@@ -366,31 +322,6 @@ func TestRenderUpstreamsV2_ASolverIsARouteOfItsHost(t *testing.T) {
 	// by what is in the model's hosts.
 	if _, taken := m.hosts["new.example.com"]; taken {
 		t.Error("a solver made its host one that is routed")
-	}
-
-	// The older modes' v2 file, which is written beside a passthrough host,
-	// has the same solver routes, and the solver says plain HTTP although
-	// that file does not say it of any other route.
-	m.sameAsV1 = false
-	rendered = renderUpstreamsV2(m)
-	doc = parseV2(t, rendered)
-	if len(doc.Internal) != 0 {
-		t.Errorf("the older modes' file has a list of internal paths:\n%s", rendered)
-	}
-	for host, others := range map[string]int{"plain.example.com": 1, "expr.example.com": 1, "new.example.com": 0} {
-		paths := doc.Hosts[host].Paths
-		route, ok := paths[token]
-		switch {
-		case !ok || route.Upstream != "solver.ns.svc:8089" || route.MatchExpr != "":
-			t.Errorf("older modes, %s: the solver's route is %+v\n%s", host, route, rendered)
-		case route.SSLEnabled == nil || *route.SSLEnabled:
-			t.Errorf("older modes, %s: the solver is not said to be reached in plain HTTP", host)
-		case len(paths) != others+1:
-			t.Errorf("older modes, %s has %d routes, want %d", host, len(paths), others+1)
-		}
-	}
-	if r := doc.Hosts["plain.example.com"].Paths["/"]; r.SSLEnabled != nil {
-		t.Errorf("another route of the older modes' file now says ssl_enabled: %v", *r.SSLEnabled)
 	}
 }
 
@@ -477,7 +408,6 @@ func v2Server(t *testing.T, doc v2File, name, path string) (host, upstream strin
 func TestRenderUpstreamsV2_ASolverDoesNotTakeItsNameFromAWildcardHost(t *testing.T) {
 	const token = "/.well-known/acme-challenge/tok"
 	m := newRenderModel()
-	m.sameAsV1 = true
 	m.addRoute("*.example.com", "/", []backend{{addr: "10.0.0.1:80"}}, annSettings{}, nil, nil)
 	m.addRoute("*.a.example.com", "/", []backend{{addr: "10.0.0.2:80"}}, annSettings{}, nil, nil)
 	m.addSolver("foo.example.com", token, "solver.ns.svc:8089")
@@ -522,7 +452,6 @@ func TestRenderUpstreamsV2_ASolverDoesNotTakeItsNameFromAWildcardHost(t *testing
 func TestRenderUpstreamsV2_ASolverForTheWholeDirectory(t *testing.T) {
 	const dir, token = "/.well-known/acme-challenge", "/.well-known/acme-challenge/tok"
 	m := newRenderModel()
-	m.sameAsV1 = true
 	servers := []backend{{addr: "10.0.0.1:80"}}
 	m.addRoute("plain.example.com", "/", servers, annSettings{}, nil, nil)
 	m.addRegexRoute("regex.example.com", "/.*", servers, annSettings{}, nil, nil)
@@ -680,7 +609,6 @@ func TestRoutes_ASolversHostHoweverItIsSpelled(t *testing.T) {
 func TestSolverHost_InTheOrderSynapseLooks(t *testing.T) {
 	servers := []backend{{addr: "10.0.0.1:80"}}
 	m := newRenderModel()
-	m.sameAsV1 = true
 	for _, host := range []string{"example.com", "Example.com", "eXample.com", "*.wild.test", "plain.test", "*.Two.test", "*.two.test", "App.wild.test"} {
 		m.addRoute(host, "/", servers, annSettings{}, nil, nil)
 	}
@@ -845,24 +773,6 @@ func TestRenderUpstreamsV2_HeaderRules(t *testing.T) {
 
 // A host that has no paths says `paths: {}`. A bare `paths:` is null, which
 // Synapse refuses, and the file with it.
-func TestRenderUpstreams_AHostWithoutRoutesSaysPathsEmpty(t *testing.T) {
-	m := newRenderModel()
-	m.hosts["held.example.com"] = map[string]*routeCfg{}
-	var doc struct {
-		Upstreams map[string]struct {
-			Paths map[string]any `json:"paths"`
-		} `json:"upstreams"`
-	}
-	out := renderUpstreams(m)
-	if err := yaml.UnmarshalStrict([]byte(out), &doc); err != nil {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	h, ok := doc.Upstreams["held.example.com"]
-	if !ok || h.Paths == nil || len(h.Paths) != 0 {
-		t.Errorf("held.example.com = %+v (present %v), want paths to be an empty map:\n%s", h, ok, out)
-	}
-}
-
 func TestRenderUpstreamsV2_AHostWithoutRoutesSaysPathsEmpty(t *testing.T) {
 	m := newRenderModel()
 	m.hosts["held.example.com"] = map[string]*routeCfg{}

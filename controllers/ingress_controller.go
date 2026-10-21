@@ -429,11 +429,11 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					continue
 				}
 				if p.PathType != nil && *p.PathType == networkingv1.PathTypeExact {
-					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse v1 matches longest-prefix)",
+					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse matches longest-prefix)",
 						"ingress", ing.Namespace+"/"+ing.Name, "host", host, "path", path)
 					mUnsupportedMatch.Inc()
 					r.emit(ing, corev1.EventTypeWarning, "UnsupportedMatch",
-						"Exact pathType on host %s path %s is approximated as a prefix (synapse v1 matches longest-prefix)", host, path)
+						"Exact pathType on host %s path %s is approximated as a prefix (synapse matches longest-prefix)", host, path)
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
 					// The solver keeps Service addressing rather than
@@ -517,7 +517,6 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	}
 	hosts += len(m.passthroughHosts)
 
-	m.sameAsV1 = true
 	yaml := renderUpstreamsV2(m)
 	var (
 		changed bool
@@ -654,11 +653,9 @@ func (r *IngressReconciler) leader() bool {
 	return r.IsLeader == nil || r.IsLeader()
 }
 
-// emit records a Kubernetes Event on obj (no-op when there is no
-// recorder, e.g. --render-once).
 // canonicalRegexPath returns the regex path as Synapse's engine will read it.
 // An expression it cannot compile is reported as UnsupportedMatch on obj and
-// not returned: one such expression makes Synapse refuse the whole v2 file.
+// not returned: one such expression makes Synapse refuse the whole file.
 // where is appended to the event text.
 func (r *IngressReconciler) canonicalRegexPath(logger logr.Logger, obj client.Object, path, where string) (string, bool) {
 	written, err := canonicalRegex(path)
@@ -673,6 +670,8 @@ func (r *IngressReconciler) canonicalRegexPath(logger logr.Logger, obj client.Ob
 	return written, true
 }
 
+// emit records a Kubernetes Event on obj (no-op when there is no
+// recorder, e.g. --render-once).
 func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
 	if r.Recorder == nil || obj == nil {
 		return

@@ -185,7 +185,6 @@ func (r *ConfigSyncReconciler) SyncAll(ctx context.Context) (int, error) {
 // the watcher installs and the first real sync takes over sub-second.
 func (r *ConfigSyncReconciler) EnsureFiles(names []string) error {
 	m := newRenderModel()
-	m.sameAsV1 = true
 	floor := renderUpstreamsV2(m)
 	for _, n := range names {
 		n = strings.TrimSpace(n)

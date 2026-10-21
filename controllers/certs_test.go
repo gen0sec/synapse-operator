@@ -57,15 +57,18 @@ func TestRenderUpstreams_PerHostCertificate(t *testing.T) {
 	m := newRenderModel()
 	m.addRoute("tls.example.com", "/", []backend{{addr: "b:80"}}, annSettings{}, nil, nil)
 	m.hostCert["tls.example.com"] = "tls.example.com"
-	out := renderUpstreams(m)
-	if !strings.Contains(out, "\"tls.example.com\":\n    certificate: \"tls.example.com\"\n    paths:\n") {
+	out := renderUpstreamsV2(m)
+	if !strings.Contains(out, "\"tls.example.com\":\n    tls:\n      terminate:\n        cert: \"tls.example.com\"\n    paths:\n") {
 		t.Fatalf("per-host certificate: must sit between host and paths:\n%s", out)
+	}
+	if term := parseV2(t, out).Hosts["tls.example.com"].TLS.Terminate; term == nil || term.Cert != "tls.example.com" {
+		t.Fatalf("host's certificate: %+v", term)
 	}
 	// No binding ⇒ no certificate line.
 	m2 := newRenderModel()
 	m2.addRoute("plain.example.com", "/", []backend{{addr: "b:80"}}, annSettings{}, nil, nil)
-	if strings.Contains(renderUpstreams(m2), "certificate:") {
-		t.Fatal("unbound host must not emit certificate:")
+	if strings.Contains(renderUpstreamsV2(m2), "cert:") {
+		t.Fatal("unbound host must not emit cert:")
 	}
 }
 

@@ -66,7 +66,7 @@ func TestRegexRouteRender(t *testing.T) {
 		t.Fatal("duplicate regex route must be rejected (first-writer-wins)")
 	}
 	wantExpr := `match_expr: "http.request.path matches \"^(?:^/api/runs/[^/]+/stream$)\""`
-	for _, out := range []string{renderUpstreams(m), renderUpstreamsV2(m)} {
+	for _, out := range []string{renderUpstreamsV2(m)} {
 		if !strings.Contains(out, wantExpr) {
 			t.Fatalf("rendered config missing match_expr:\nwant substring: %s\ngot:\n%s", wantExpr, out)
 		}
@@ -124,7 +124,7 @@ func TestRegexAnchoring(t *testing.T) {
 	m := newRenderModel()
 	m.addRegexRoute("h", "/api/runs/[^/]+/stream$", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
 	want := `match_expr: "http.request.path matches \"^(?:/api/runs/[^/]+/stream$)\""`
-	if out := renderUpstreams(m); !strings.Contains(out, want) {
+	if out := renderUpstreamsV2(m); !strings.Contains(out, want) {
 		t.Fatalf("unanchored path regex must be ^-anchored:\nwant %s\ngot:\n%s", want, out)
 	}
 }
