@@ -71,11 +71,10 @@ func certStem(host, ns, secret string) (stem string, hostBound bool) {
 
 // reservedCertStems are the file stems Synapse does not take at face value.
 // For fullchain, cert and chain, cert_logical_name takes the parent
-// directory's name instead. "default" is what the proxy's default_certificate
-// (proxyconfig_defaults.yaml) picks by, so a host of that name would become
-// the certificate for every name no other certificate matches. That holds for
-// the operator's default config only: proxy.default_certificate is not an
-// owned key, so spec.config or the --ingress-mode config can name another.
+// directory's name instead. "default" was the operator's default_certificate
+// before defaultCertStem, and a spec.config or --ingress-mode config may still
+// name it; a host of that name would then become the certificate for every
+// name no other certificate matches. defaultCertStem is the operator's own.
 var reservedCertStems = map[string]bool{"fullchain": true, "cert": true, "chain": true, "default": true, defaultCertStem: true}
 
 // defaultCertStem is the stem of the certificate the operator generates
