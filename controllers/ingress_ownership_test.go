@@ -267,3 +267,48 @@ func TestOwnership_ASolverOfAHeldNameLandsOnItsEntry(t *testing.T) {
 		t.Errorf("the solver is under the wildcard:\n%s", out)
 	}
 }
+
+// A newcomer that names a refused host in a rule and again through the
+// fallback of a spec.tls without hosts is told of it once.
+func TestOwnership_ARefusedHostNamedByARuleAndTheTLSFallbackIsSaidOnce(t *testing.T) {
+	before := counterValue(t, mHostConflicts)
+	intruder := ownerIngress("aaa", "intruder", ownedHost, "/intruder", t0.Add(time.Hour))
+	intruder.Spec.TLS = []networkingv1.IngressTLS{{SecretName: "aaa-tls"}}
+	_, _, events := ownerAndNewcomer(t, ownerIngress("zzz", "shop", ownedHost, "/", t0), intruder,
+		tlsSecret("aaa", "aaa-tls", "CRT-aaa", "KEY-aaa"))
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want one HostnameConflict", got)
+	}
+	if d := counterValue(t, mHostConflicts) - before; d != 1 {
+		t.Errorf("host conflict counter went up by %v, want 1", d)
+	}
+}
+
+// An Ingress that names one host it may not use and one it may keeps the
+// second.
+func TestOwnership_APartlyRefusedIngressKeepsItsOtherHosts(t *testing.T) {
+	before := counterValue(t, mHostConflicts)
+	mixed := ownerIngress("aaa", "mixed", ownedHost, "/", t0.Add(time.Hour))
+	free := mixed.Spec.Rules[0].DeepCopy()
+	free.Host = "aaa.example.com"
+	mixed.Spec.Rules = append(mixed.Spec.Rules, *free)
+	mixed.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{ownedHost, "aaa.example.com"}, SecretName: "aaa-tls"}}
+	out, certs, events := ownerAndNewcomer(t, ownerIngress("zzz", "shop", ownedHost, "/", t0), mixed,
+		tlsSecret("aaa", "aaa-tls", "CRT-aaa", "KEY-aaa"))
+	wantHosts(t, out, []string{"aaa.example.com", ownedHost}, nil)
+	if n := strings.Count(out, "aaa.svc"); n != 1 {
+		t.Errorf("the backend of aaa is written %d times, want once (for the free host):\n%s", n, out)
+	}
+	if _, ok := certs["aaa.example.com.crt"]; !ok {
+		t.Errorf("the free host has no certificate: %v", keysOf(certs))
+	}
+	if _, ok := certs[ownedHost+".crt"]; ok {
+		t.Errorf("a certificate for the refused host is projected: %v", keysOf(certs))
+	}
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 1 {
+		t.Errorf("conflict events = %q, want one", got)
+	}
+	if d := counterValue(t, mHostConflicts) - before; d != 1 {
+		t.Errorf("host conflict counter went up by %v, want 1", d)
+	}
+}
