@@ -431,3 +431,54 @@ func TestOwnership_TheLedgerIsLeftAloneWhileOwnershipIsOff(t *testing.T) {
 		t.Errorf("ledger = %q", body)
 	}
 }
+
+// countingReader counts the reads made through it.
+type countingReader struct {
+	client.Reader
+	gets atomic.Int32
+}
+
+func (c *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets.Add(1)
+	return c.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestOwnership_ARenderWithNothingToRecordCostsNoLiveRead(t *testing.T) {
+	g := newLedgerRig(t)
+	reads := &countingReader{Reader: g.r.Client}
+	g.r.Reader = reads
+	g.mustReconcile()
+	g.mustReconcile()
+	if n := reads.gets.Load(); n != 0 {
+		t.Errorf("a proxy with no claims and no ledger read the ledger live %d times", n)
+	}
+	if _, ok := g.ledger(); ok {
+		t.Error("a ledger was written for a proxy with no claims")
+	}
+}
+
+func TestOwnership_ARenderWithNoInputChangedWritesNoLedger(t *testing.T) {
+	var writes atomic.Int32
+	g := newLedgerRigWith(t, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if isLedger(obj) {
+				writes.Add(1)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if isLedger(obj) {
+				writes.Add(1)
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}, ownerIngress("zzz", "shop", ownedHost, "/", t0))
+	g.mustReconcile()
+	first := writes.Load()
+	g.now = g.now.Add(10 * time.Minute)
+	g.mustReconcile()
+	g.mustReconcile()
+	if first != 1 || writes.Load() != first {
+		t.Errorf("ledger written %d times by the first render and %d in all; want 1 and 1", first, writes.Load())
+	}
+}

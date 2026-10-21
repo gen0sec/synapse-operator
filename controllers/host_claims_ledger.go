@@ -81,6 +81,15 @@ func (r *IngressReconciler) ageClaims(ctx context.Context, claims []hostClaim, n
 		}
 		return ledger.age(claims, ledger.now(r.now())), nil
 	}
+	if len(claims) == 0 {
+		// Nothing to age or record. A ledger that is not there has nothing to
+		// mark absent, so a proxy with no claims makes no live read on every
+		// render. A stale answer only delays the marking to a later render.
+		var cm corev1.ConfigMap
+		if apierrors.IsNotFound(r.Get(ctx, r.HostClaims, &cm)) {
+			return claims, nil
+		}
+	}
 	var readErr error
 	werr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		if cm, ledger, readErr = r.loadLedger(ctx); readErr != nil {
