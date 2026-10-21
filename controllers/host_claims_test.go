@@ -199,7 +199,7 @@ func TestHostClaims_AKeyWithWhitespaceIsNotWritten(t *testing.T) {
 }
 
 func TestHostClaims_ADuplicateKeyKeepsTheOldestAndIsCounted(t *testing.T) {
-	body := "a h.example.com 2025-01-01T12:00:00Z\na h.example.com 2025-01-01T15:00:00Z\na h.example.com 2025-01-01T09:00:00Z\n"
+	body := "a h.example.com 2025-01-01T15:00:00Z\na h.example.com 2025-01-01T09:00:00Z\na h.example.com 2025-01-01T12:00:00Z\n"
 	l, malformed := parseHostClaims(body, true)
 	if malformed != 2 {
 		t.Errorf("malformed = %d, want 2", malformed)
@@ -285,10 +285,9 @@ func TestHostClaims_TheByteCapDropsFromTheLargestNamespaceFirst(t *testing.T) {
 	l, _ := parseHostClaims("", true)
 	var claims []hostClaim
 	// Each under the quota; together over the byte cap.
-	for _, ns := range []string{"a", "b", "c", "d", "e"} {
+	for _, ns := range []string{"n1", "n2", "n3", "n4", "n5", "n6"} {
 		claims = append(claims, manyClaims(ns, maxHostClaimsPerNamespace, t0, 150)...)
 	}
-	claims = append(claims, manyClaims("big", maxHostClaimsPerNamespace, t0, 150)...)
 	claims = append(claims, manyClaims("small", 3, t0.Add(time.Hour), 150)...)
 	_, dropped := l.record(claims, t0.Add(2*time.Hour))
 	if len(l.body()) > maxHostClaimsBytes {
@@ -301,7 +300,7 @@ func TestHostClaims_TheByteCapDropsFromTheLargestNamespaceFirst(t *testing.T) {
 		t.Errorf("a small namespace lost lines to larger ones: %d left", got)
 	}
 	lo, hi := maxHostClaimsPerNamespace, 0
-	for _, ns := range []string{"a", "b", "c", "d", "e", "big"} {
+	for _, ns := range []string{"n1", "n2", "n3", "n4", "n5", "n6"} {
 		n := linesOf(l, ns)
 		lo, hi = min(lo, n), max(hi, n)
 	}
@@ -319,5 +318,136 @@ func TestHostClaims_ANamespaceUnderItsShareIsNotDroppedWhileALargerOneHasLines(t
 	l.record(claims, t0.Add(2*time.Hour))
 	if got := linesOf(l, "mid"); got != 300 {
 		t.Errorf("the namespace under the share lost lines: %d left of 300", got)
+	}
+}
+
+// put fills the ledger with n lines of a namespace, hosts padded to length.
+func put(l *hostClaims, ns string, n, pad int, firstSeen, absent time.Time) []claimKey {
+	var keys []claimKey
+	for i := 0; i < n; i++ {
+		k := claimKey{ns, fmt.Sprintf("h-%06d.%s.example.com", i, strings.Repeat("x", pad))}
+		l.entries[k] = claimEntry{firstSeen: firstSeen, absentSince: absent}
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func bodySize(l *hostClaims) int { return len(l.body()) }
+
+func TestHostClaims_TheByteCapDropsNewLinesBeforeAnyLineThatWasThere(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	for _, ns := range []string{"x1", "x2", "x3"} {
+		put(l, ns, 1024, 170, t0, time.Time{})
+	}
+	isNew := map[claimKey]bool{}
+	for _, k := range put(l, "n", 650, 170, t0.Add(time.Hour), time.Time{}) {
+		isNew[k] = true
+	}
+	if bodySize(l) <= maxHostClaimsBytes {
+		t.Fatalf("setup: %d bytes is under the cap", bodySize(l))
+	}
+	if l.capSize(isNew) == 0 || bodySize(l) > maxHostClaimsBytes {
+		t.Fatalf("not capped: %d bytes", bodySize(l))
+	}
+	for _, ns := range []string{"x1", "x2", "x3"} {
+		if got := linesOf(l, ns); got != 1024 {
+			t.Errorf("%s lost lines to new ones: %d left", ns, got)
+		}
+	}
+	if linesOf(l, "n") >= 650 {
+		t.Error("no new line was dropped")
+	}
+}
+
+func TestHostClaims_TheByteCapDropsAbsentLinesBeforeEstablishedOnes(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	for _, ns := range []string{"x1", "x2", "x3"} {
+		put(l, ns, 1024, 170, t0, time.Time{})
+	}
+	put(l, "n", 650, 170, t0, t0.Add(time.Minute))
+	if bodySize(l) <= maxHostClaimsBytes {
+		t.Fatalf("setup: %d bytes is under the cap", bodySize(l))
+	}
+	l.capSize(nil)
+	for _, ns := range []string{"x1", "x2", "x3"} {
+		if got := linesOf(l, ns); got != 1024 {
+			t.Errorf("%s lost lines to absent ones: %d left", ns, got)
+		}
+	}
+	if linesOf(l, "n") >= 650 {
+		t.Error("no absent line was dropped")
+	}
+}
+
+func TestHostClaims_TheByteCapCountsBytesNotLines(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	put(l, "z", maxHostClaimsPerNamespace, 10, t0, time.Time{})
+	put(l, "q", 1000, 232, t0, time.Time{})
+	for _, ns := range []string{"r1", "r2", "r3"} {
+		put(l, ns, 700, 170, t0, time.Time{})
+	}
+	if bodySize(l) <= maxHostClaimsBytes {
+		t.Fatalf("setup: %d bytes is under the cap", bodySize(l))
+	}
+	l.capSize(nil)
+	if got := linesOf(l, "z"); got != maxHostClaimsPerNamespace {
+		t.Errorf("the namespace with the most lines but few bytes lost lines: %d left", got)
+	}
+	if linesOf(l, "q") >= 1000 {
+		t.Error("the namespace with the most bytes lost nothing")
+	}
+}
+
+func TestHostClaims_ATieInBytesDropsFromTheLastNamespaceByName(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	isNew := map[claimKey]bool{}
+	for _, ns := range []string{"m", "n"} {
+		for _, k := range put(l, ns, 1000, 150, t0, time.Time{}) {
+			isNew[k] = true
+		}
+	}
+	// Short filler, until the body is over the cap by less than one line.
+	size := bodySize(l)
+	for i := 0; size <= maxHostClaimsBytes; i++ {
+		k := claimKey{"f", fmt.Sprintf("f%06d.example.com", i)}
+		l.entries[k] = claimEntry{firstSeen: t0}
+		size += len(claimLine(k, l.entries[k])) + 1
+	}
+	if got := l.capSize(isNew); got != 1 {
+		t.Fatalf("dropped %d lines, want 1", got)
+	}
+	if linesOf(l, "n") != 999 || linesOf(l, "m") != 1000 {
+		t.Errorf("m has %d lines and n %d: the tie must go to the last name", linesOf(l, "m"), linesOf(l, "n"))
+	}
+}
+
+func TestHostClaims_AFloodCannotEvictAnEstablishedHostFromAnotherNamespace(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	victim := manyClaims("victim", 699, t0, 1)
+	victim = append(victim, claimOf("victim", "shop.example.com", t0))
+	l.record(victim, t0.Add(time.Hour))
+	l.record(append(victim, claimOf("x1", "shop.example.com", t0)), t0.Add(2*time.Hour))
+	all := append([]hostClaim{claimOf("x1", "shop.example.com", t0)}, victim...)
+	for _, ns := range []string{"x1", "x2", "x3", "x4", "x5"} {
+		all = append(all, manyClaims(ns, 650, t0, 232)...)
+	}
+	_, dropped := l.record(all, t0.Add(5*time.Hour))
+	if dropped == 0 {
+		t.Fatal("setup: nothing dropped")
+	}
+	if got := linesOf(l, "victim"); got != 700 {
+		t.Errorf("victim has %d lines of 700", got)
+	}
+	if got := firstSeenOf(t, l, "victim", "shop.example.com"); !got.Equal(t0.Add(time.Hour)) {
+		t.Errorf("victim's shop is aged %v", got)
+	}
+}
+
+func TestHostClaims_AReadOnlyAgeTreatsAnExpiredLineAsNew(t *testing.T) {
+	l, _ := parseHostClaims(claimLine(claimKey{"a", "h.example.com"}, claimEntry{firstSeen: t0, absentSince: t0.Add(time.Minute)})+"\n", true)
+	now := t0.Add(3 * time.Hour)
+	out := l.age([]hostClaim{claimOf("a", "h.example.com", t0)}, now)
+	if !out[0].created.Equal(now) {
+		t.Errorf("a claim returned after the grace is aged %v, not %v", out[0].created, now)
 	}
 }

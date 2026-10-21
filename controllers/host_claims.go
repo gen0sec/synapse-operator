@@ -159,6 +159,7 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 	before := l.body()
 	l.quotaDropped = nil
 	present := map[claimKey]bool{}
+	newKeys := map[claimKey]bool{}
 	for _, c := range claims {
 		host := hostKey(c.host)
 		if host == "" {
@@ -175,6 +176,7 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 			ok = false
 		}
 		if !ok {
+			newKeys[k] = true
 			e.firstSeen = now
 			if !l.exists && !c.created.IsZero() {
 				e.firstSeen = c.created.UTC()
@@ -196,7 +198,7 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 		}
 	}
 	l.applyQuota()
-	dropped = l.capSize()
+	dropped = l.capSize(newKeys)
 	return l.body() != before, dropped
 }
 
@@ -255,11 +257,15 @@ func (l *hostClaims) applyQuota() {
 	}
 }
 
-// capSize drops lines until the body fits, each time the newest line of the
-// namespace that holds the most: a namespace that floods the ledger loses its
-// own lines before a small one loses any. Among namespaces with as many, the
-// last by name goes first.
-func (l *hostClaims) capSize() int {
+// capSize drops lines until the body fits, in three tiers. First the lines
+// new in this render, then the lines of claims no longer made, then the
+// established ones; a line that was there before the render is never dropped
+// while one that is new remains, so a flood of new claims cannot take a host
+// from the namespace that held it. Within a tier it takes, each time, the
+// newest line of the namespace with the most bytes there: one that floods the
+// ledger loses its own lines before a small one loses any. Among equals, the
+// last namespace by name goes first.
+func (l *hostClaims) capSize(isNew map[claimKey]bool) int {
 	size := len(hostClaimsHeader) + 1
 	for k, e := range l.entries {
 		size += len(claimLine(k, e)) + 1
@@ -267,26 +273,50 @@ func (l *hostClaims) capSize() int {
 	if size <= maxHostClaimsBytes {
 		return 0
 	}
-	groups := l.byNamespace()
+	var tiers [3]map[string][]claimKey
+	for i := range tiers {
+		tiers[i] = map[string][]claimKey{}
+	}
+	for k, e := range l.entries {
+		tier := 2
+		switch {
+		case isNew[k]:
+			tier = 0
+		case !e.absentSince.IsZero():
+			tier = 1
+		}
+		tiers[tier][k.ns] = append(tiers[tier][k.ns], k)
+	}
 	dropped := 0
-	for size > maxHostClaimsBytes {
-		var pick string
+	for _, groups := range tiers {
+		bytes := map[string]int{}
 		for ns, keys := range groups {
-			if len(keys) == 0 {
-				continue
-			}
-			if pick == "" || len(keys) > len(groups[pick]) || (len(keys) == len(groups[pick]) && ns > pick) {
-				pick = ns
+			l.dropOrder(keys)
+			for _, k := range keys {
+				bytes[ns] += len(claimLine(k, l.entries[k])) + 1
 			}
 		}
-		if pick == "" {
-			break
+		for size > maxHostClaimsBytes {
+			pick, found := "", false
+			for ns, keys := range groups {
+				if len(keys) == 0 {
+					continue
+				}
+				if !found || bytes[ns] > bytes[pick] || (bytes[ns] == bytes[pick] && ns > pick) {
+					pick, found = ns, true
+				}
+			}
+			if !found {
+				break
+			}
+			k := groups[pick][0]
+			groups[pick] = groups[pick][1:]
+			n := len(claimLine(k, l.entries[k])) + 1
+			bytes[pick] -= n
+			size -= n
+			delete(l.entries, k)
+			dropped++
 		}
-		k := groups[pick][0]
-		groups[pick] = groups[pick][1:]
-		size -= len(claimLine(k, l.entries[k])) + 1
-		delete(l.entries, k)
-		dropped++
 	}
 	return dropped
 }
@@ -297,7 +327,7 @@ func (l *hostClaims) age(claims []hostClaim, now time.Time) []hostClaim {
 	out := make([]hostClaim, len(claims))
 	for i, c := range claims {
 		out[i] = c
-		if e, ok := l.entries[claimKey{ns: c.ns, host: hostKey(c.host)}]; ok {
+		if e, ok := l.entries[claimKey{ns: c.ns, host: hostKey(c.host)}]; ok && !e.expired(now) {
 			out[i].created = e.firstSeen
 		} else {
 			out[i].created = now
