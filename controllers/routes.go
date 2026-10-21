@@ -917,7 +917,6 @@ func renderUpstreams(m *renderModel) string {
 		if stem := m.hostCert[h]; stem != "" {
 			fmt.Fprintf(&b, "    certificate: %q\n", stem)
 		}
-		b.WriteString("    paths:\n")
 		paths := m.hosts[h]
 		solvers := solverRoutesFor(paths, solved[h], true)
 		pathKeys := make([]string, 0, len(paths)+len(solvers))
@@ -928,6 +927,12 @@ func renderUpstreams(m *renderModel) string {
 			pathKeys = append(pathKeys, p)
 		}
 		sort.Strings(pathKeys)
+		if len(pathKeys) == 0 {
+			// A bare `paths:` is null, which Synapse refuses.
+			b.WriteString("    paths: {}\n")
+			continue
+		}
+		b.WriteString("    paths:\n")
 		for _, p := range pathKeys {
 			rc := paths[p]
 			if rc == nil {
@@ -1113,6 +1118,10 @@ func renderUpstreamsV2(m *renderModel) string {
 			pathKeys = append(pathKeys, p)
 		}
 		sort.Strings(pathKeys)
+		if len(pathKeys) == 0 {
+			b.WriteString("    paths: {}\n")
+			continue
+		}
 		b.WriteString("    paths:\n")
 		for _, p := range pathKeys {
 			rc := paths[p]

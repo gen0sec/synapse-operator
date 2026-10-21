@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	networkingv1 "k8s.io/api/networking/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -33,6 +34,8 @@ func hostKey(host string) string {
 // of a nil pointer holds nothing, and allows everything.
 type hostOwners struct {
 	byKey map[string]string
+	// spelled is the host of the claim that won each key, as it was written.
+	spelled map[string]string
 }
 
 // resolveHostOwners takes the claims oldest first, by creation time, then
@@ -54,7 +57,7 @@ func resolveHostOwners(claims []hostClaim) *hostOwners {
 		}
 		return fmt.Sprintf("%T", a.who) < fmt.Sprintf("%T", b.who)
 	})
-	o := &hostOwners{byKey: map[string]string{}}
+	o := &hostOwners{byKey: map[string]string{}, spelled: map[string]string{}}
 	for _, c := range sorted {
 		key := hostKey(c.host)
 		if key == "" {
@@ -62,6 +65,7 @@ func resolveHostOwners(claims []hostClaim) *hostOwners {
 		}
 		if _, held := o.holder(key); !held {
 			o.byKey[key] = c.ns
+			o.spelled[key] = c.host
 		}
 	}
 	return o
@@ -114,4 +118,54 @@ func ingressClaims(ing *networkingv1.Ingress, a annSettings) []hostClaim {
 		}
 	}
 	return claims
+}
+
+// holdOwnedHosts writes an entry with no paths for each held name that the
+// file has no entry for and a wildcard of another namespace covers. Synapse
+// matches the exact host first and answers 404 for it, where without the
+// entry the wildcard would serve a name its namespace does not hold. A
+// certificate bound to the name goes with the entry.
+func (m *renderModel) holdOwnedHosts(logger logr.Logger) {
+	if m.owners == nil {
+		return
+	}
+	written := map[string]struct{}{}
+	for h := range m.hosts {
+		written[h] = struct{}{}
+	}
+	for h := range m.passthroughHosts {
+		written[h] = struct{}{}
+	}
+	for h := range m.solverRoutes() {
+		written[h] = struct{}{}
+	}
+	writtenKeys := map[string]struct{}{}
+	for h := range written {
+		writtenKeys[hostKey(h)] = struct{}{}
+	}
+	keys := make([]string, 0, len(m.owners.byKey))
+	for key := range m.owners.byKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		ns := m.owners.byKey[key]
+		if _, ok := writtenKeys[key]; ok {
+			continue
+		}
+		w := sameOrCovering(key, written)
+		if w == "" || m.owners.byKey[hostKey(w)] == ns {
+			continue
+		}
+		spelling := m.owners.spelled[key]
+		m.hosts[spelling] = map[string]*routeCfg{}
+		for h, stem := range m.hostCert {
+			if hostKey(h) == key {
+				m.hostCert[spelling] = stem
+				break
+			}
+		}
+		logger.Info("host held without routes: a wildcard of another namespace covers it",
+			"host", spelling, "owner", ns, "wildcard", w)
+	}
 }

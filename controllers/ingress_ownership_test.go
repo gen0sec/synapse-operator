@@ -182,3 +182,88 @@ func TestOwnership_ExtraClaimsAreResolvedWithTheIngresses(t *testing.T) {
 		t.Errorf("a nil ExtraClaims refuses the host:\n%s", out)
 	}
 }
+
+// A younger namespace's wildcard must not serve a host that an older claim
+// holds and the file has no entry for: a backend that cannot be resolved
+// leaves the host out, and Synapse then matches the wildcard.
+func TestOwnership_AYoungerWildcardDoesNotServeAHeldHostWithoutRoutes(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, wild)
+	doc := parseV2(t, out)
+	h, ok := doc.Hosts[ownedHost]
+	if !ok {
+		t.Fatalf("%s has no entry, so aaa's *.example.com serves it:\n%s", ownedHost, out)
+	}
+	if h.Paths == nil || len(h.Paths) != 0 {
+		t.Errorf("paths of %s = %v, want an empty map:\n%s", ownedHost, h.Paths, out)
+	}
+	if _, ok := doc.Hosts["*.example.com"]; !ok {
+		t.Errorf("the wildcard is gone:\n%s", out)
+	}
+}
+
+func TestOwnership_AYoungerWildcardDoesNotServeATLSOnlyClaim(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", "other.zzz.test", "/", t0)
+	owner.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{ownedHost}, SecretName: "zzz-tls"}}
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, certs, _ := renderOwned(t, owner, wild, tlsSecret("zzz", "zzz-tls", "CRT-zzz", "KEY-zzz"))
+	doc := parseV2(t, out)
+	h, ok := doc.Hosts[ownedHost]
+	if !ok {
+		t.Fatalf("%s has no entry, so aaa's *.example.com serves it:\n%s", ownedHost, out)
+	}
+	if h.TLS.Terminate == nil || h.TLS.Terminate.Cert != ownedHost || len(h.Paths) != 0 {
+		t.Errorf("entry = %+v, want the owner's certificate and no paths:\n%s", h, out)
+	}
+	if _, ok := certs[ownedHost+".crt"]; !ok {
+		t.Errorf("the owner's certificate is not projected: %v", keysOf(certs))
+	}
+}
+
+// An owned wildcard under a foreign wildcard is held as well.
+func TestOwnership_AnOwnedWildcardUnderAForeignWildcardIsHeld(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", "*.a.example.com", "/", t0)
+	owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, wild)
+	doc := parseV2(t, out)
+	h, ok := doc.Hosts["*.a.example.com"]
+	if !ok || h.Paths == nil || len(h.Paths) != 0 {
+		t.Errorf("*.a.example.com = %+v (present %v), want an entry with empty paths:\n%s", h, ok, out)
+	}
+}
+
+func TestOwnership_NothingIsReservedWithoutAForeignWildcard(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	other := ownerIngress("aaa", "other", "aaa.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, other)
+	wantHosts(t, out, []string{"aaa.example.com"}, []string{ownedHost})
+}
+
+func TestOwnership_TheOwnersOwnWildcardReservesNothing(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	wild := ownerIngress("zzz", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, wild)
+	wantHosts(t, out, []string{"*.example.com"}, []string{ownedHost})
+}
+
+// The owner's solver for a held name is answered under the name's own entry,
+// not under the wildcard of another namespace.
+func TestOwnership_ASolverOfAHeldNameLandsOnItsEntry(t *testing.T) {
+	owner := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+	solver := ownerIngress("zzz", "cm-acme-http-solver-1", ownedHost, "/.well-known/acme-challenge/tok", t0)
+	wild := ownerIngress("aaa", "wild", "*.example.com", "/", t0.Add(time.Hour))
+	out, _, _ := renderOwned(t, owner, solver, wild)
+	doc := parseV2(t, out)
+	if _, ok := doc.Hosts[ownedHost].Paths["/.well-known/acme-challenge/tok"]; !ok {
+		t.Errorf("the solver is not under %s:\n%s", ownedHost, out)
+	}
+	if _, ok := doc.Hosts["*.example.com"].Paths["/.well-known/acme-challenge/tok"]; ok {
+		t.Errorf("the solver is under the wildcard:\n%s", out)
+	}
+}

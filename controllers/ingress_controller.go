@@ -487,6 +487,8 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 	}
 
+	m.holdOwnedHosts(logger)
+
 	// Project referenced TLS Secrets. Central mode (CertsOutSecret set)
 	// writes them into a Secret the separate proxy pod mounts; sidecar
 	// mode writes <stem>.crt/<stem>.key into the shared CertsOutDir. Both
