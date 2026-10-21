@@ -108,6 +108,10 @@ var (
 		Name: "synapse_operator_proxy_ready",
 		Help: "1 when a SynapseProxy's Ready condition is true, else 0.",
 	}, []string{"namespace", "name"})
+	mHostClaimLedgerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "synapse_operator_host_claim_ledger_errors_total",
+		Help: "Problems with the host claim ledger, by reason: write (could not be written), full (lines dropped to fit), malformed (lines skipped).",
+	}, []string{"reason"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
 		Help: "Referenced TLS Secrets that were missing or not usable.",
@@ -118,7 +122,7 @@ func init() {
 	ctrlmetrics.Registry.MustRegister(
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mHostConflicts, mUnsupportedMatch, mBackendUnresolved,
-		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
+		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors, mHostClaimLedgerErrors,
 		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,

@@ -50,6 +50,7 @@ func SetupProxyControllers(ctx context.Context, mgr ctrl.Manager, clusterDomain,
 		Recorder:      mgr.GetEventRecorderFor("synapse-proxy-routes"),
 		GatewayAPI:    gatewayAPI,
 		Namespace:     namespace,
+		Reader:        mgr.GetAPIReader(),
 	}
 	if err := routes.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("route controller: %w", err)

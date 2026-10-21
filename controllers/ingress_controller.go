@@ -106,6 +106,18 @@ type IngressReconciler struct {
 	// claims of what RenderExtra brings, so that they are resolved with
 	// the Ingresses'.
 	ExtraClaims func() []hostClaim
+	// HostClaims, when named, is the ConfigMap that says when each claim
+	// was first seen, so that a claim is aged by that and not by the
+	// creationTimestamp of the object that makes it; see host_claims.go.
+	// Used when HostOwnership is on.
+	HostClaims types.NamespacedName
+	// LedgerReader reads the ledger without a cache. nil ⇒ Client.
+	LedgerReader client.Reader
+	// RecordClaims says this reconciler writes the ledger. Without it the
+	// ledger is read, and a claim it does not hold is aged as new.
+	RecordClaims bool
+	// Clock is where "now" comes from. nil ⇒ time.Now.
+	Clock func() time.Time
 
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
@@ -185,7 +197,8 @@ func (r *IngressReconciler) usesConfigMapOutput() bool {
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	var certsFailed int
-	changed, n, h, err := r.renderCounting(ctx, &certsFailed)
+	var claimsNotRecorded bool
+	changed, n, h, err := r.renderCounting(ctx, &certsFailed, &claimsNotRecorded)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -193,7 +206,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		logger.Info("rendered synapse upstreams",
 			"ingresses", n, "hosts", h, "path", r.UpstreamsOutPath)
 	}
-	if certsFailed > 0 {
+	if certsFailed > 0 || claimsNotRecorded {
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, nil
@@ -221,13 +234,14 @@ type ingressWithSettings struct {
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
-	return r.renderCounting(ctx, new(int))
+	return r.renderCounting(ctx, new(int), new(bool))
 }
 
 // renderCounting is render that also reports in *certsFailed how many
-// certificates it could not write. The caller owns the count, so renders that
-// run at the same time cannot hide each other's failures.
-func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int) (bool, int, int, error) {
+// certificates it could not write, and in *claimsNotRecorded whether the claim
+// ledger could not be written. The caller owns both, so renders that run at
+// the same time cannot hide each other's failures.
+func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int, claimsNotRecorded *bool) (bool, int, int, error) {
 	mRenderTotal.Inc()
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
@@ -283,6 +297,11 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 		if r.ExtraClaims != nil {
 			claims = append(claims, r.ExtraClaims()...)
+		}
+		var err error
+		if claims, err = r.ageClaims(ctx, claims, claimsNotRecorded); err != nil {
+			mRenderErrTotal.Inc()
+			return false, 0, 0, err
 		}
 		m.owners = resolveHostOwners(claims)
 	}

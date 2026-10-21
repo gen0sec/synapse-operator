@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -31,6 +32,11 @@ func proxyCertsName(proxy *synapsev1alpha1.SynapseProxy) types.NamespacedName {
 	return types.NamespacedName{Namespace: proxy.Namespace, Name: proxy.Name + "-certs"}
 }
 
+// proxyHostClaimsName is the ledger of when each host claim was first seen.
+func proxyHostClaimsName(proxy *synapsev1alpha1.SynapseProxy) types.NamespacedName {
+	return types.NamespacedName{Namespace: proxy.Namespace, Name: proxy.Name + "-host-claims"}
+}
+
 // SynapseRouteReconciler renders, for each SynapseProxy, the routes and TLS
 // certificates of the Ingresses that belong to it: a ConfigMap
 // `<name>-upstreams` and a Secret `<name>-certs`, both controlled by the
@@ -58,6 +64,11 @@ type SynapseRouteReconciler struct {
 	// Namespace is the one the operator is limited to, or empty. What it
 	// does not see outside it is not taken for gone.
 	Namespace string
+	// Reader reads the claim ledger without a cache, so that the age of a
+	// claim is never read from before the last write. nil ⇒ Client.
+	Reader client.Reader
+	// Clock is where "now" comes from. nil ⇒ time.Now.
+	Clock func() time.Time
 }
 
 func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -103,6 +114,10 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
 		HostOwnership:            true,
+		HostClaims:               proxyHostClaimsName(&proxy),
+		LedgerReader:             r.Reader,
+		RecordClaims:             true,
+		Clock:                    r.Clock,
 	}
 	var (
 		gatewayIn     gatewayInputs
@@ -120,7 +135,8 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return lookups()
 		}
 	}
-	if _, _, _, err = render.render(ctx); err != nil {
+	var claimsNotRecorded bool
+	if _, _, _, err = render.renderCounting(ctx, new(int), &claimsNotRecorded); err != nil {
 		// It is retried, but until it succeeds the proxy serves the routes
 		// and certificates of the last render that did, and says nothing.
 		mProxyRenderErrors.WithLabelValues(proxy.Namespace, proxy.Name).Inc()
@@ -135,6 +151,15 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.writeGatewayStatuses(ctx, gatewayIn, gatewayStatus); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if claimsNotRecorded {
+		// The routes are right for now. Without the ledger written, a
+		// claim is aged afresh by the next render, so this is retried.
+		if r.Recorder != nil {
+			r.Recorder.Eventf(&proxy, corev1.EventTypeWarning, "HostClaimLedgerNotWritten",
+				"the host claim ledger %s could not be written; hosts are still given to the namespace that held them", proxyHostClaimsName(&proxy).Name)
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, nil
 }
