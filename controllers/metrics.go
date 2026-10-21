@@ -54,6 +54,10 @@ var (
 		Name: "synapse_operator_route_conflicts_total",
 		Help: "Total host+path route conflicts ignored (first-writer-wins).",
 	})
+	mHostConflicts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_host_conflicts_total",
+		Help: "Total hosts refused to a namespace because another namespace had them first.",
+	})
 	mUnsupportedMatch = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_unsupported_match_total",
 		Help: "Total Ingress/HTTPRoute match features not representable in synapse v1.",
@@ -113,7 +117,7 @@ var (
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
-		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
+		mRouteConflicts, mHostConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
 		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,

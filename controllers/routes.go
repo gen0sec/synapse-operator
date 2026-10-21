@@ -191,6 +191,9 @@ type renderModel struct {
 	// SynapseProxy's routes are written so. The older modes, which write
 	// a v2 file only beside a passthrough host, write it as they did.
 	sameAsV1 bool
+	// owners says which namespace holds each host. nil means no host is
+	// held, and every gate that reads it lets everything through.
+	owners *hostOwners
 }
 
 func newRenderModel() *renderModel {

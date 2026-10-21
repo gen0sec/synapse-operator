@@ -98,6 +98,14 @@ type IngressReconciler struct {
 	// before anything is written. It is how a SynapseProxy's Gateways get
 	// into the same output as its Ingresses.
 	RenderExtra func(ctx context.Context, m *renderModel) error
+	// HostOwnership gives a host to the namespace whose object claimed it
+	// first: another namespace's rule, server-alias or TLS host for it is
+	// left out and reported. Off, the first source in render order wins.
+	HostOwnership bool
+	// ExtraClaims, when set, is called when HostOwnership is on, for the
+	// claims of what RenderExtra brings, so that they are resolved with
+	// the Ingresses'.
+	ExtraClaims func() []hostClaim
 
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
@@ -268,8 +276,21 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		ours = append(ours, ingressWithSettings{ing: ing, a: a})
 	}
 
+	if r.HostOwnership {
+		var claims []hostClaim
+		for _, o := range ours {
+			claims = append(claims, ingressClaims(o.ing, o.a)...)
+		}
+		if r.ExtraClaims != nil {
+			claims = append(claims, r.ExtraClaims()...)
+		}
+		m.owners = resolveHostOwners(claims)
+	}
+
 	for _, o := range ours {
 		ing, a := o.ing, o.a
+		refused := map[string]bool{}
+		allowed := func(host string) bool { return r.hostAllowed(logger, m, ing, host, refused) }
 		// An alias Synapse would not take as a host of a proxy's file is
 		// left out here: in a v2 file it is an error, and the file is
 		// every route there is. The older modes write it as it came: in a
@@ -285,6 +306,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				"server-alias %s cannot be used as a host: %s; this alias is ignored", alias, problem)
 			return true
 		})
+		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -305,6 +327,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				continue
 			}
 			for _, h := range hosts {
+				if !allowed(h) {
+					continue
+				}
 				if stem, bound := certStem(h, ing.Namespace, t.SecretName); bound {
 					m.addCert(h, stem, ing.Namespace, t.SecretName, ing)
 				} else {
@@ -314,7 +339,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
-			if host == "" || rule.HTTP == nil {
+			if host == "" || rule.HTTP == nil || !allowed(host) {
 				continue
 			}
 			// ssl-passthrough: synapse routes the raw TLS stream to a
@@ -543,6 +568,27 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		mReady.Set(1)
 	}
 	return changed, matched, hosts, nil
+}
+
+// hostAllowed reports whether the namespace of ing may use host. A host it
+// may not use is said once per Ingress, to the Ingress, in the log and in the
+// counter.
+func (r *IngressReconciler) hostAllowed(logger logr.Logger, m *renderModel, ing *networkingv1.Ingress, host string, said map[string]bool) bool {
+	if m.owners.allows(host, ing.Namespace) {
+		return true
+	}
+	key := hostKey(host)
+	if said[key] {
+		return false
+	}
+	said[key] = true
+	owner, _ := m.owners.owner(host)
+	logger.Info("host ignored: it belongs to another namespace",
+		"host", host, "owner", owner, "ingress", ing.Namespace+"/"+ing.Name)
+	mHostConflicts.Inc()
+	r.emit(ing, corev1.EventTypeWarning, "HostnameConflict",
+		"host %s belongs to namespace %s, which had it first; this Ingress's use of it is ignored", host, owner)
+	return false
 }
 
 // isOurs reports whether this Ingress is served by us. Precedence
