@@ -384,11 +384,29 @@ func hostKeyProblem(name string) string {
 	return ""
 }
 
+// hostCharsOK says name, without its trailing dots, is made of ASCII
+// letters and digits and of `.`, `*`, `-` and `_` alone. It looks at the
+// runes as written: a case fold would let U+212A (Kelvin) pass for `k`.
+func hostCharsOK(name string) bool {
+	name = strings.TrimRight(name, ".")
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '*', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // hostCharProblem says a name has characters a host name cannot have; ""
 // when it has none. A v1 file without host ownership takes `*` as the host
 // of every name that has no other, so it stops here.
 func hostCharProblem(name string) string {
-	if !validClaimHost(name) {
+	if !hostCharsOK(name) {
 		return "it has characters a host name cannot have"
 	}
 	return ""

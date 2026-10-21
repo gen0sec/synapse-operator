@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -40,6 +41,8 @@ func TestRender_AnAliasThatIsNoHostIsRefusedWithOwnershipOff(t *testing.T) {
 		refused     []string
 	}{
 		{"a space", "ok.example.com, bad host.example.com", []string{"ok.example.com"}, []string{"bad host.example.com"}},
+		{"a Kelvin sign", "ok.example.com, \u212Aelvin.example.com", []string{"ok.example.com"}, []string{"\u212A"}},
+		{"a dotted capital I", "ok.example.com, \u0130nfo.example.com", []string{"ok.example.com"}, []string{"\u0130"}},
 		{"a newline", "x.example.com\ny.example.com", nil, []string{"x.example.com", "y.example.com"}},
 	}
 	for _, v2 := range []bool{false, true} {
@@ -91,5 +94,43 @@ func TestOwnership_AnAliasThatIsNoHostIsStillRefused(t *testing.T) {
 	}
 	if got := eventsOf(events, "InvalidServerAlias"); len(got) == 0 {
 		t.Error("no InvalidServerAlias event")
+	}
+}
+
+func TestHostCharsOK(t *testing.T) {
+	for host, want := range map[string]bool{
+		"www.example.com": true, "WWW.Example.COM.": true, "*.wild.example.com": true, "svc_a-1.ns": true,
+		"": false, "bad host": false, "a\nb": false, "\u212Aelvin.example.com": false,
+		"\u0130nfo.example.com": false, "caf\u00e9.example.com": false,
+	} {
+		if got := hostCharsOK(host); got != want {
+			t.Errorf("hostCharsOK(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// Under host ownership a v1 file refuses a bare `*` too: it is no claim.
+func TestRender_V1WithOwnershipRefusesABareStarAlias(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	ing := routedIngress("aliased", ptr("synapse"), "www.example.com")
+	ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "*, ok.example.com"}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
+	events := record.NewFakeRecorder(64)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, UpstreamsV2: false,
+		HostOwnership: true, HostClaims: types.NamespacedName{Namespace: "default", Name: "claims"},
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(b)
+	if strings.Contains(rendered, fmt.Sprintf("\n  %q:\n", "*")) || !strings.Contains(rendered, fmt.Sprintf("\n  %q:\n", "ok.example.com")) {
+		t.Errorf("the file is:\n%s", rendered)
+	}
+	if got := eventsOf(events, "InvalidServerAlias"); len(got) != 1 {
+		t.Errorf("events = %q, want one InvalidServerAlias", got)
 	}
 }
