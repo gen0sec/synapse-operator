@@ -288,6 +288,7 @@ An `HTTPRoute` attached to that Gateway is then served by the proxy. The rule th
 - **A route belongs to a host, not to a listener.** One attached to a single listener of a Gateway is served on every listener of the proxy, the plain-HTTP ones included.
 - **A route that names no host needs a listener that names one.** Synapse has no host that stands for all others. On a listener without a hostname such a route is not served, and says so.
 - **A host an Ingress of the same proxy routes is taken.** An `HTTPRoute` for it is not accepted (`HostnameConflict`).
+- **A host belongs to one namespace, Gateways included.** A listener's `hostname` is claimed for the Gateway's namespace, and a route's hosts through a Gateway too, whatever the route's own namespace is: routes of several namespaces on one Gateway do not refuse each other. A claim counts from the later of the object's and the Gateway's creation time. When an older claim of another namespace holds the host, the listener says `Accepted: False` (`HostnameConflict`) and is not programmed, and a route says `HostnameConflict`, or `PartiallyInvalid` when it keeps other hosts. An older Gateway also wins a host from a newer Ingress of another namespace.
 - **`/health` is Synapse's own.** It answers that path itself, on every host, and a backend's `/health` is not reached through the proxy.
 
 **A Gateway that asks for more than is done says so.**
