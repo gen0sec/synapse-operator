@@ -23,6 +23,13 @@ const (
 	// maxHostClaimsBytes keeps the ledger well below the 1 MiB a ConfigMap
 	// can hold.
 	maxHostClaimsBytes = 768 << 10
+	// maxHostClaimsPerNamespace is how many lines one namespace may hold. A
+	// namespace that can name any number of hosts (one Ingress may carry
+	// thousands in spec.tls) could otherwise fill the ledger, and every claim
+	// made after that would be aged at the time of each render, so that two
+	// namespaces that contest a host tie and the lower name wins. The limit
+	// leaves room for hundreds of namespaces under maxHostClaimsBytes.
+	maxHostClaimsPerNamespace = 1024
 
 	hostClaimsHeader = "# Written by synapse-operator. Do not edit. <namespace> <host> <first seen> [<absent since>]"
 )
@@ -50,6 +57,9 @@ type hostClaims struct {
 	// refused counts the claims record left out for a name that cannot be
 	// written as a line.
 	refused int
+	// quotaDropped counts, by namespace, the lines record dropped for
+	// maxHostClaimsPerNamespace.
+	quotaDropped map[string]int
 }
 
 // parseHostClaims reads a ledger body and reports how many lines it could
@@ -147,6 +157,7 @@ func (l *hostClaims) now(clock time.Time) time.Time {
 // maxHostClaimsBytes.
 func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dropped int) {
 	before := l.body()
+	l.quotaDropped = nil
 	present := map[claimKey]bool{}
 	for _, c := range claims {
 		host := hostKey(c.host)
@@ -184,13 +195,70 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 			delete(l.entries, k)
 		}
 	}
+	l.applyQuota()
 	dropped = l.capSize()
 	return l.body() != before, dropped
 }
 
-// capSize drops lines, the newest first and, among equals, the last in key
-// order, until the body fits. The newest are the ones with the least to lose:
-// a claim that is dropped is aged at the time it is next seen.
+// dropOrder lists keys, the newest line first and, among equals, the last in
+// key order first: the lines with the least to lose, since a claim that is
+// dropped is aged at the time it is next seen.
+func (l *hostClaims) dropOrder(keys []claimKey) []claimKey {
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := l.entries[keys[i]], l.entries[keys[j]]
+		if !a.firstSeen.Equal(b.firstSeen) {
+			return a.firstSeen.After(b.firstSeen)
+		}
+		return keys[i].host > keys[j].host
+	})
+	return keys
+}
+
+// byNamespace groups the keys by namespace, each group in dropOrder.
+func (l *hostClaims) byNamespace() map[string][]claimKey {
+	groups := map[string][]claimKey{}
+	for k := range l.entries {
+		groups[k.ns] = append(groups[k.ns], k)
+	}
+	for ns := range groups {
+		l.dropOrder(groups[ns])
+	}
+	return groups
+}
+
+// applyQuota drops the lines of a namespace past maxHostClaimsPerNamespace,
+// its newest first. A line already in the ledger is older than a claim new
+// to it, so a namespace at its quota cannot push out its own older lines.
+func (l *hostClaims) applyQuota() {
+	counts := map[string]int{}
+	for k := range l.entries {
+		counts[k.ns]++
+	}
+	var over bool
+	for _, n := range counts {
+		if n > maxHostClaimsPerNamespace {
+			over = true
+			break
+		}
+	}
+	if !over {
+		return
+	}
+	for ns, keys := range l.byNamespace() {
+		for _, k := range keys[:max(0, len(keys)-maxHostClaimsPerNamespace)] {
+			delete(l.entries, k)
+			if l.quotaDropped == nil {
+				l.quotaDropped = map[string]int{}
+			}
+			l.quotaDropped[ns]++
+		}
+	}
+}
+
+// capSize drops lines until the body fits, each time the newest line of the
+// namespace that holds the most: a namespace that floods the ledger loses its
+// own lines before a small one loses any. Among namespaces with as many, the
+// last by name goes first.
 func (l *hostClaims) capSize() int {
 	size := len(hostClaimsHeader) + 1
 	for k, e := range l.entries {
@@ -199,24 +267,26 @@ func (l *hostClaims) capSize() int {
 	if size <= maxHostClaimsBytes {
 		return 0
 	}
-	keys := sortedClaimKeys(l.entries)
-	sort.SliceStable(keys, func(i, j int) bool {
-		return l.entries[keys[i]].firstSeen.After(l.entries[keys[j]].firstSeen)
-	})
-	// Stable on key order, newest first: ties keep the earlier key first, and
-	// would be dropped first. Walk the ties from the end instead.
+	groups := l.byNamespace()
 	dropped := 0
-	for i := 0; i < len(keys) && size > maxHostClaimsBytes; {
-		j := i
-		for j < len(keys) && l.entries[keys[j]].firstSeen.Equal(l.entries[keys[i]].firstSeen) {
-			j++
+	for size > maxHostClaimsBytes {
+		var pick string
+		for ns, keys := range groups {
+			if len(keys) == 0 {
+				continue
+			}
+			if pick == "" || len(keys) > len(groups[pick]) || (len(keys) == len(groups[pick]) && ns > pick) {
+				pick = ns
+			}
 		}
-		for n := j - 1; n >= i && size > maxHostClaimsBytes; n-- {
-			size -= len(claimLine(keys[n], l.entries[keys[n]])) + 1
-			delete(l.entries, keys[n])
-			dropped++
+		if pick == "" {
+			break
 		}
-		i = j
+		k := groups[pick][0]
+		groups[pick] = groups[pick][1:]
+		size -= len(claimLine(k, l.entries[k])) + 1
+		delete(l.entries, k)
+		dropped++
 	}
 	return dropped
 }

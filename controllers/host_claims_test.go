@@ -156,36 +156,6 @@ func TestHostClaims_AgeUsesTheLedgerAndNowForTheRest(t *testing.T) {
 	}
 }
 
-func TestHostClaims_BodyIsCappedAndTheNewestEntriesAreDroppedFirst(t *testing.T) {
-	l, _ := parseHostClaims("", true)
-	var claims []hostClaim
-	for i := 0; i < 14000; i++ {
-		host := fmt.Sprintf("host-%06d.%s.example.com", i, strings.Repeat("x", 20))
-		claims = append(claims, claimOf("ns", host, t0))
-	}
-	// Two later entries, to be dropped before any of the older ones.
-	older := t0.Add(-time.Hour)
-	l.record(claims, older)
-	newest := claimOf("zz", "newest.example.com", t0)
-	l.entries[claimKey{"zz", "newest.example.com"}] = claimEntry{firstSeen: t0.Add(time.Hour)}
-	_, dropped := l.record(append(claims, newest), t0.Add(2*time.Hour))
-	if len(l.body()) > maxHostClaimsBytes {
-		t.Fatalf("body is %d bytes, over the cap", len(l.body()))
-	}
-	if dropped == 0 {
-		t.Fatalf("nothing dropped from %d entries", len(claims)+1)
-	}
-	if _, ok := l.entries[claimKey{"zz", "newest.example.com"}]; ok {
-		t.Error("the newest entry was kept while the cap dropped lines")
-	}
-	if _, ok := l.entries[claimKey{"ns", claims[0].host}]; !ok {
-		t.Error("an old entry was dropped")
-	}
-	if _, ok := l.entries[claimKey{"ns", claims[len(claims)-1].host}]; ok {
-		t.Error("the last of the equally new entries was kept")
-	}
-}
-
 func TestHostClaims_BodyIsSortedAndStable(t *testing.T) {
 	a, _ := parseHostClaims("", true)
 	b, _ := parseHostClaims("", true)
@@ -246,5 +216,108 @@ func TestHostClaims_ANewClaimIsNeverAsOldAsTheNewestLine(t *testing.T) {
 	l.record([]hostClaim{{ns: "a", host: "h.example.com"}, {ns: "b", host: "g.example.com"}}, l.now(t0))
 	if got := l.entries[claimKey{"b", "g.example.com"}].firstSeen; !got.After(future) {
 		t.Errorf("a claim from a later render is aged %v, not after %v", got, future)
+	}
+}
+
+func manyClaims(ns string, n int, created time.Time, pad int) []hostClaim {
+	var claims []hostClaim
+	for i := 0; i < n; i++ {
+		host := fmt.Sprintf("h-%06d.%s.example.com", i, strings.Repeat("x", pad))
+		claims = append(claims, claimOf(ns, host, created))
+	}
+	return claims
+}
+
+func linesOf(l *hostClaims, ns string) int {
+	n := 0
+	for k := range l.entries {
+		if k.ns == ns {
+			n++
+		}
+	}
+	return n
+}
+
+func TestHostClaims_AQuotaDropsTheNewestLinesOfANamespace(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	n := maxHostClaimsPerNamespace + 10
+	var claims []hostClaim
+	for i := 0; i < n; i++ {
+		// Older with a lower number, so the last ten are the newest.
+		claims = append(claims, claimOf("ns", fmt.Sprintf("h-%06d.example.com", i), t0.Add(time.Duration(i)*time.Second)))
+	}
+	l.record(claims, t0.Add(24*time.Hour))
+	if got := linesOf(l, "ns"); got != maxHostClaimsPerNamespace {
+		t.Fatalf("namespace holds %d lines, want %d", got, maxHostClaimsPerNamespace)
+	}
+	if l.quotaDropped["ns"] != 10 {
+		t.Errorf("quotaDropped = %v", l.quotaDropped)
+	}
+	// Seeded from creation: the newest ten are dropped.
+	if _, ok := l.entries[claimKey{"ns", fmt.Sprintf("h-%06d.example.com", n-1)}]; ok {
+		t.Error("the newest line was kept")
+	}
+	if _, ok := l.entries[claimKey{"ns", "h-000000.example.com"}]; !ok {
+		t.Error("the oldest line was dropped")
+	}
+}
+
+func TestHostClaims_ExistingLinesBeatNewClaimsAtTheQuota(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	old := manyClaims("ns", maxHostClaimsPerNamespace, t0, 1)
+	l.record(old, t0)
+	more := append(manyClaims("ns", 5, t0, 2), old...)
+	l.record(more, t0.Add(time.Hour))
+	if got := linesOf(l, "ns"); got != maxHostClaimsPerNamespace {
+		t.Fatalf("namespace holds %d lines", got)
+	}
+	for _, c := range old {
+		if _, ok := l.entries[claimKey{"ns", c.host}]; !ok {
+			t.Fatalf("an existing line %s was evicted by a new claim", c.host)
+		}
+	}
+	if l.quotaDropped["ns"] != 5 {
+		t.Errorf("quotaDropped = %v", l.quotaDropped)
+	}
+}
+
+func TestHostClaims_TheByteCapDropsFromTheLargestNamespaceFirst(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	var claims []hostClaim
+	// Each under the quota; together over the byte cap.
+	for _, ns := range []string{"a", "b", "c", "d", "e"} {
+		claims = append(claims, manyClaims(ns, maxHostClaimsPerNamespace, t0, 150)...)
+	}
+	claims = append(claims, manyClaims("big", maxHostClaimsPerNamespace, t0, 150)...)
+	claims = append(claims, manyClaims("small", 3, t0.Add(time.Hour), 150)...)
+	_, dropped := l.record(claims, t0.Add(2*time.Hour))
+	if len(l.body()) > maxHostClaimsBytes {
+		t.Fatalf("body is %d bytes, over the cap", len(l.body()))
+	}
+	if dropped == 0 {
+		t.Fatal("nothing dropped")
+	}
+	if got := linesOf(l, "small"); got != 3 {
+		t.Errorf("a small namespace lost lines to larger ones: %d left", got)
+	}
+	lo, hi := maxHostClaimsPerNamespace, 0
+	for _, ns := range []string{"a", "b", "c", "d", "e", "big"} {
+		n := linesOf(l, ns)
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	if hi-lo > 1 {
+		t.Errorf("the large namespaces were cut unevenly: %d to %d lines", lo, hi)
+	}
+}
+
+func TestHostClaims_ANamespaceUnderItsShareIsNotDroppedWhileALargerOneHasLines(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	claims := manyClaims("mid", 300, t0.Add(time.Hour), 150)
+	for _, ns := range []string{"a", "b", "c", "d", "e", "f"} {
+		claims = append(claims, manyClaims(ns, maxHostClaimsPerNamespace, t0, 150)...)
+	}
+	l.record(claims, t0.Add(2*time.Hour))
+	if got := linesOf(l, "mid"); got != 300 {
+		t.Errorf("the namespace under the share lost lines: %d left of 300", got)
 	}
 }

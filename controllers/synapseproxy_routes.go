@@ -117,6 +117,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		HostClaims:               proxyHostClaimsName(&proxy),
 		LedgerReader:             r.Reader,
 		RecordClaims:             true,
+		EventsOn:                 &proxy,
 		Clock:                    r.Clock,
 	}
 	var (

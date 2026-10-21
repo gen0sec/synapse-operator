@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -131,10 +132,21 @@ func (r *IngressReconciler) ageClaims(ctx context.Context, claims []hostClaim, n
 	if ledger.refused > 0 {
 		mHostClaimLedgerErrors.WithLabelValues("invalid").Add(float64(ledger.refused))
 	}
+	on := runtime.Object(cm)
+	if r.EventsOn != nil {
+		on = r.EventsOn
+	}
 	if dropped > 0 {
 		mHostClaimLedgerErrors.WithLabelValues("full").Add(float64(dropped))
-		r.emit(cm, corev1.EventTypeWarning, "HostClaimLedgerFull",
-			"the host claim ledger is full: %d of the newest claims were dropped and are aged afresh", dropped)
+		r.emit(on, corev1.EventTypeWarning, "HostClaimLedgerFull",
+			"the host claim ledger is full: %d claims were dropped, from the namespaces with the most, and are aged afresh", dropped)
+	}
+	for _, ns := range sortedKeys(ledger.quotaDropped) {
+		n := ledger.quotaDropped[ns]
+		mHostClaimLedgerErrors.WithLabelValues("quota").Add(float64(n))
+		r.emit(on, corev1.EventTypeWarning, "HostClaimQuotaExceeded",
+			"namespace %s names more than %d hosts: %d of its newest claims were dropped and are aged afresh",
+			ns, maxHostClaimsPerNamespace, n)
 	}
 	return ledger.age(claims, ledger.now(r.now())), nil
 }

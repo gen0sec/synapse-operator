@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -533,5 +535,73 @@ func TestOwnership_ALedgerWithLinesAndNoClaimsMarksThemAbsent(t *testing.T) {
 	if want := "zzz " + ownedHost; !strings.Contains(cm.Data["claims"], want) ||
 		!strings.Contains(cm.Data["claims"], g.now.UTC().Format(time.RFC3339Nano)) {
 		t.Errorf("the line was not marked absent now:\n%s", cm.Data["claims"])
+	}
+}
+
+func floodIngress(hosts int) *networkingv1.Ingress {
+	flood := ownerIngress("flood", "big", "flood.example.com", "/", t0)
+	tls := networkingv1.IngressTLS{}
+	for i := 0; i < hosts; i++ {
+		tls.Hosts = append(tls.Hosts, fmt.Sprintf("flood-host-%06d.example.com", i))
+	}
+	flood.Spec.TLS = []networkingv1.IngressTLS{tls}
+	return flood
+}
+
+func TestOwnership_AFloodedLedgerDoesNotTieAnOlderNewcomer(t *testing.T) {
+	g := newLedgerRig(t, floodIngress(20000))
+	g.mustReconcile()
+	g.now = g.now.Add(time.Minute)
+	g.create(ownerIngress("bbb", "shop", "new.example.com", "/b", g.now))
+	g.mustReconcile()
+	g.now = g.now.Add(time.Hour)
+	g.create(ownerIngress("aaa", "later", "new.example.com", "/a", g.now))
+	g.mustReconcile()
+	if out := g.routes(); !strings.Contains(out, "/b") || strings.Contains(out, "/a") {
+		t.Errorf("the host went to the namespace that sorts first, not to the one that named it first")
+	}
+}
+
+// proxyEvents records the object each event is about.
+type proxyEvents struct {
+	reasons []string
+	msgs    []string
+	objs    []runtime.Object
+}
+
+func (p *proxyEvents) Event(o runtime.Object, _, reason, msg string) {
+	p.objs, p.reasons, p.msgs = append(p.objs, o), append(p.reasons, reason), append(p.msgs, msg)
+}
+func (p *proxyEvents) Eventf(o runtime.Object, t, reason, f string, a ...any) {
+	p.Event(o, t, reason, fmt.Sprintf(f, a...))
+}
+func (p *proxyEvents) AnnotatedEventf(o runtime.Object, _ map[string]string, t, reason, f string, a ...any) {
+	p.Eventf(o, t, reason, f, a...)
+}
+
+func TestOwnership_AnOverQuotaNamespaceIsCountedAndWarnedOnTheProxy(t *testing.T) {
+	g := newLedgerRig(t, floodIngress(maxHostClaimsPerNamespace+100))
+	ev := &proxyEvents{}
+	g.r.Recorder = ev
+	before := counterValue(t, mHostClaimLedgerErrors.WithLabelValues("quota"))
+	g.mustReconcile()
+	if got := counterValue(t, mHostClaimLedgerErrors.WithLabelValues("quota")); got <= before {
+		t.Errorf("quota counter did not move: %v -> %v", before, got)
+	}
+	n := 0
+	for i, reason := range ev.reasons {
+		if reason != "HostClaimQuotaExceeded" {
+			continue
+		}
+		n++
+		if _, ok := ev.objs[i].(*synapsev1alpha1.SynapseProxy); !ok {
+			t.Errorf("event is on a %T, not the proxy", ev.objs[i])
+		}
+		if !strings.Contains(ev.msgs[i], "flood") || !strings.Contains(ev.msgs[i], "101") {
+			t.Errorf("message = %q", ev.msgs[i])
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d quota warnings, want 1 (reasons %v)", n, ev.reasons)
 	}
 }

@@ -116,6 +116,9 @@ type IngressReconciler struct {
 	// RecordClaims says this reconciler writes the ledger. Without it the
 	// ledger is read, and a claim it does not hold is aged as new.
 	RecordClaims bool
+	// EventsOn is the object the ledger's events are about: the proxy. nil
+	// ⇒ the ledger ConfigMap, which may not exist yet.
+	EventsOn runtime.Object
 	// Clock is where "now" comes from. nil ⇒ time.Now.
 	Clock func() time.Time
 

@@ -110,7 +110,7 @@ var (
 	}, []string{"namespace", "name"})
 	mHostClaimLedgerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "synapse_operator_host_claim_ledger_errors_total",
-		Help: "Problems with the host claim ledger, by reason: write (could not be written), full (lines dropped to fit), malformed (lines skipped).",
+		Help: "Problems with the host claim ledger, by reason: write (could not be written), full (lines dropped to fit), quota (lines dropped past the per-namespace limit), invalid (names that cannot be a line), malformed (lines skipped).",
 	}, []string{"reason"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
