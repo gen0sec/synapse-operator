@@ -297,8 +297,8 @@ func TestProjectCertsToSecret(t *testing.T) {
 		t.Fatalf("prune: ch=%v n=%d", ch, n)
 	}
 	_ = c.Get(context.Background(), out, &got)
-	if len(got.Data) != 0 {
-		t.Fatalf("unreferenced certs must be pruned from secret: %v", got.Data)
+	if len(got.Data) != 2 || got.Data[defaultCertStem+".crt"] == nil {
+		t.Fatalf("unreferenced certs must be pruned from secret, leaving the default: %v", keysOf(got.Data))
 	}
 	// Missing source Secret ⇒ skipped softly (no error, no change).
 	m2 := newRenderModel()

@@ -98,6 +98,9 @@ type IngressReconciler struct {
 	// before anything is written. It is how a SynapseProxy's Gateways get
 	// into the same output as its Ingresses.
 	RenderExtra func(ctx context.Context, m *renderModel) error
+	// Now is the clock the default certificate's age is read from. Nil
+	// means time.Now.
+	Now func() time.Time
 
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
