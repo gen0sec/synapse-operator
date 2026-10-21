@@ -402,13 +402,43 @@ func TestRoutes_RefusedIngressHasNoAddress(t *testing.T) {
 	free.Host = "bbb.example.com"
 	mixed.Spec.Rules = append(mixed.Spec.Rules, *free)
 
-	r := newRouteReconciler(t, edge, classFor("public", edge), svc, owner, intruder, mixed)
+	// Only the refused host is named by a rule; the rest of the Ingress is
+	// what the table pins: none of it makes the Ingress served.
+	refusedPlus := func(ns string, more func(*networkingv1.Ingress)) *networkingv1.Ingress {
+		ing := ownerIngress(ns, "plus", ownedHost, "/", t0.Add(time.Hour))
+		ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{{IP: "203.0.113.10"}}
+		more(ing)
+		return ing
+	}
+	hostless := refusedPlus("ccc", func(ing *networkingv1.Ingress) {
+		rule := ing.Spec.Rules[0].DeepCopy()
+		rule.Host = ""
+		ing.Spec.Rules = append(ing.Spec.Rules, *rule)
+	})
+	allowedTLS := refusedPlus("ddd", func(ing *networkingv1.Ingress) {
+		ing.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"ddd.example.com"}, SecretName: "ddd-tls"}}
+	})
+	allowedAlias := refusedPlus("eee", func(ing *networkingv1.Ingress) {
+		ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "eee.example.com"}
+	})
+	// A rule with no http serves nothing, but it names an allowed host: the
+	// Ingress is served in part and keeps its address.
+	noHTTP := refusedPlus("fff", func(ing *networkingv1.Ingress) {
+		rule := ing.Spec.Rules[0].DeepCopy()
+		rule.Host, rule.HTTP = "fff.example.com", nil
+		ing.Spec.Rules = append(ing.Spec.Rules, *rule)
+	})
+
+	r := newRouteReconciler(t, edge, classFor("public", edge), svc, owner, intruder, mixed,
+		hostless, allowedTLS, allowedAlias, noHTTP)
 	mustReconcileRoutes(t, r, edge)
 	for _, c := range []struct {
 		name string
 		ing  *networkingv1.Ingress
 		want int
-	}{{"owner", owner, 1}, {"newcomer", intruder, 0}, {"partly refused", mixed, 1}} {
+	}{{"owner", owner, 1}, {"newcomer", intruder, 0}, {"partly refused", mixed, 1},
+		{"refused host and a hostless rule", hostless, 0}, {"refused host and an allowed tls host", allowedTLS, 0},
+		{"refused host and an allowed server-alias", allowedAlias, 0}, {"allowed host without http", noHTTP, 1}} {
 		if got := statusOf(t, r, c.ing); len(got) != c.want {
 			t.Errorf("%s: status = %+v, want %d address(es)", c.name, got, c.want)
 		}
