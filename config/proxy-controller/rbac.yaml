@@ -89,7 +89,8 @@ rules:
       - update
       - patch
       - delete
-  # Each proxy's routes.
+  # Each proxy's routes, and its host claim ledger `<proxy>-host-claims`: a
+  # ConfigMap the proxy controls, read live and written when a claim is new.
   - apiGroups:
       - ""
     resources:
