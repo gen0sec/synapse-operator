@@ -1,0 +1,67 @@
+package controllers
+
+import (
+	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+func TestGatewayClaims_AListenerIsAgedByItsGateway(t *testing.T) {
+	gw := gateway("edge", "web", httpListener("a", 80, "a.example.com"), httpListener("b", 80, ""), httpListener("c", 80, "*.example.org"))
+	gw.CreationTimestamp = metav1.NewTime(t0)
+	got := listenerClaims(&gw)
+	if len(got) != 2 {
+		t.Fatalf("claims = %v, want the two listeners that name a host", got)
+	}
+	for _, c := range got {
+		if c.ns != "edge" || !c.created.Equal(t0) || c.who != &gw {
+			t.Errorf("claim %+v: want ns edge, created %v, made by the Gateway", c, t0)
+		}
+	}
+	if got[0].host != "a.example.com" || got[1].host != "*.example.org" {
+		t.Errorf("hosts = %q, %q", got[0].host, got[1].host)
+	}
+}
+
+func TestGatewayClaims_ARouteClaimsAsTheGatewayAgedByTheLaterOfTheTwo(t *testing.T) {
+	gw := gateway("edge", "web", httpListener("http", 80, ""))
+	rt := httpRoute("shop", []string{"shop.example.com"}, to("app"))
+	for _, c := range []struct {
+		gateway, route, want time.Time
+	}{
+		{t0, t0.Add(time.Hour), t0.Add(time.Hour)},
+		{t0.Add(time.Hour), t0, t0.Add(time.Hour)},
+	} {
+		gw.CreationTimestamp, rt.CreationTimestamp = metav1.NewTime(c.gateway), metav1.NewTime(c.route)
+		got := routeClaims(&rt, &gw)
+		if len(got) != 1 {
+			t.Fatalf("claims = %v, want one", got)
+		}
+		if got[0].ns != "edge" || got[0].host != "shop.example.com" || !got[0].created.Equal(c.want) || got[0].who != &rt {
+			t.Errorf("claim %+v, want ns edge, created %v, made by the route", got[0], c.want)
+		}
+	}
+}
+
+func TestGatewayClaims_OneClaimPerParentRefToTheGateway(t *testing.T) {
+	gw := gateway("edge", "web", httpListener("http", 80, ""), httpListener("alt", 8080, ""))
+	rt := httpRoute("shop", []string{"shop.example.com"}, to("app"))
+	rt.Spec.ParentRefs = []gwv1.ParentReference{
+		{Namespace: ptr(gwv1.Namespace("edge")), Name: "web", SectionName: ptr(gwv1.SectionName("http"))},
+		{Namespace: ptr(gwv1.Namespace("edge")), Name: "web", SectionName: ptr(gwv1.SectionName("alt"))},
+		{Namespace: ptr(gwv1.Namespace("edge")), Name: "elsewhere"},
+		{Namespace: ptr(gwv1.Namespace("edge")), Name: "web", Kind: ptr(gwv1.Kind("Service"))},
+	}
+	if got := routeClaims(&rt, &gw); len(got) != 2 {
+		t.Errorf("claims = %v, want one for each of the two parentRefs to the Gateway", got)
+	}
+	// A listener's host narrows what the route claims.
+	gw = gateway("edge", "web", httpListener("http", 80, "*.example.org"))
+	rt.Spec.ParentRefs = rt.Spec.ParentRefs[:1]
+	rt.Spec.ParentRefs[0].SectionName = nil
+	if got := routeClaims(&rt, &gw); len(got) != 0 {
+		t.Errorf("claims = %v, want none for a host no listener serves", got)
+	}
+}
