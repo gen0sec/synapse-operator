@@ -694,7 +694,7 @@ const acmeChallengePrefix = "/.well-known/acme-challenge"
 // (synapse-utils filewatch.rs `is_reload_event`) matches
 // Modify(Name) alongside Modify(Data)/Create/Remove, so a rename IS
 // seen. (The CERT watcher is the one that ignores renames — see
-// writeFileIfChanged in certs.go.) The reload is additionally driven
+// certTempName in certs.go.) The reload is additionally driven
 // explicitly by SIGHUP (see signalReload), which makes the re-read
 // deterministic and bypasses the watcher's content-digest gate.
 func writeIfChanged(path, content string) (bool, error) {

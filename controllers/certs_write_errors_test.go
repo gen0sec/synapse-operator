@@ -322,3 +322,48 @@ func TestWriteCertPair_PutsTheOldKeyBackWhenTheCertificateCannotBeMoved(t *testi
 		t.Errorf("temporary files left behind: %v", tmp)
 	}
 }
+
+// Synapse's cert watcher ignores renames. It rescans on the creation of a
+// file whose name starts with ".." or ends in .crt, .key or .pem
+// (synapse-utils tools.rs reload_relevant_path), so a staged file has to be
+// the first kind, and must not be the second, which the loader would read.
+func TestCertTempName_IsWhatSynapseWatcherReactsToAndLoaderIgnores(t *testing.T) {
+	for _, ext := range []string{".crt", ".key"} {
+		name := certTempName("shop.example.com", ext)
+		if !strings.HasPrefix(name, "..") {
+			t.Errorf("%q does not start with .., so creating it does not trigger a reload", name)
+		}
+		for _, loaded := range []string{".crt", ".key", ".pem"} {
+			if strings.HasSuffix(name, loaded) {
+				t.Errorf("%q ends in %s, the loader would read it", name, loaded)
+			}
+		}
+	}
+}
+
+// A certificates directory that cannot be made is retried, not forgotten.
+func TestReconcile_RequeuesWhileTheCertsDirIsUnavailable(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "certs")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &IngressReconciler{
+		IngressClassName: "synapse",
+		CertsOutDir:      notADir,
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "upstreams.yaml"),
+		ClusterDomain:    "cluster.local",
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		[]client.Object{
+			tlsIngress("a", "a.example.com", "a-tls"),
+			tlsSecret("default", "a-tls", "CRT-a", "KEY-a"),
+		}...).Build()
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+}

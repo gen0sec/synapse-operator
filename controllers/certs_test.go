@@ -69,26 +69,6 @@ func TestRenderUpstreams_PerHostCertificate(t *testing.T) {
 	}
 }
 
-func TestWriteFileIfChanged(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "x.key")
-	if ch, err := writeFileIfChanged(p, []byte("A"), 0o600); err != nil || !ch {
-		t.Fatalf("first write changed: %v %v", ch, err)
-	}
-	fi, _ := os.Stat(p)
-	if fi.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %v", fi.Mode().Perm())
-	}
-	if ch, _ := writeFileIfChanged(p, []byte("A"), 0o600); ch {
-		t.Fatal("unchanged must be no-op")
-	}
-	if ch, _ := writeFileIfChanged(p, []byte("B"), 0o600); !ch {
-		t.Fatal("changed must rewrite")
-	}
-	if b, _ := os.ReadFile(p); string(b) != "B" {
-		t.Fatalf("content=%q", b)
-	}
-}
-
 func TestPruneCerts(t *testing.T) {
 	d := t.TempDir()
 	for _, n := range []string{"keep.crt", "keep.key", "stale.crt", "stale.key", "junk.tmp", "other.txt"} {

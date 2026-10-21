@@ -91,7 +91,7 @@ func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (cha
 
 	if err := os.MkdirAll(r.CertsOutDir, 0o755); err != nil {
 		for _, stem := range stems {
-			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err))
+			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
 		}
 		mCerts.Set(0)
 		return false, 0, len(stems), nil
@@ -117,9 +117,10 @@ func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (cha
 		}
 		pch, err := writeCertPair(r.CertsOutDir, stem, crt, key)
 		if err != nil {
-			r.certNotWritten(logger, cp, err)
+			kept := certPairExists(r.CertsOutDir, stem)
+			r.certNotWritten(logger, cp, err, kept)
 			failed++
-			if certPairExists(r.CertsOutDir, stem) {
+			if kept {
 				want[stem] = struct{}{} // the last good pair keeps serving
 			}
 			continue
@@ -198,16 +199,21 @@ func writeCertPair(dir, stem string, crt, key []byte) (bool, error) {
 
 // certTempName is where a certificate file is staged before it is renamed
 // into place. The ".." prefix is what synapse's cert watcher treats as a
-// Kubernetes atomic-update marker: creating the file triggers a rescan even
+// Kubernetes atomic-update marker (synapse-utils tools.rs
+// reload_relevant_path): creating the file triggers a rescan even
 // though the rename that follows is invisible to it. The name does not end
 // in .crt or .key, so the loader never reads it, and prune removes it.
 func certTempName(stem, ext string) string { return ".." + stem + ext + ".tmp" }
 
 // certNotWritten records a certificate that could not be written to
-// CertsOutDir. The stem stays out of the wanted set, so the prune removes
-// whatever half of the pair was written.
-func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection, err error) {
-	logger.Error(err, "TLS cert not written; skipping (host will fall back to default)",
+// CertsOutDir. kept says whether a pair from an earlier render is still on
+// disk and keeps serving; if not, the host falls back to the default.
+func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection, err error, kept bool) {
+	outcome := "host will fall back to default"
+	if kept {
+		outcome = "the previous pair stays in place"
+	}
+	logger.Error(err, "TLS cert not written; skipping ("+outcome+")",
 		"secret", cp.ns+"/"+cp.name, "stem", cp.stem)
 	mCertErrors.Inc()
 	r.emit(cp.from, corev1.EventTypeWarning, "CertificateNotWritten",
@@ -333,34 +339,6 @@ func bytesMapEqual(a, b map[string][]byte) bool {
 		}
 	}
 	return true
-}
-
-// writeFileIfChanged writes content IN PLACE (no tmp+rename) only when
-// it differs. In-place is REQUIRED here, not a shortcut: synapse's
-// cert watcher (synapse-utils tools.rs `watch_folder`) only re-scans on
-// inotify Create / Modify(Data) / Remove and IGNORES rename/MOVED_TO.
-// (The UPSTREAMS filewatch does NOT share this limitation — its
-// is_reload_event matches Modify(Name) too, which is why
-// writeIfChanged in ingress_controller.go can write atomically.)
-// An atomic
-// tmp+rename lands as Modify(Name) and would be invisible at runtime —
-// the cert would never load until a process restart. A plain create
-// fires Create; an overwrite fires Modify(Data); a prune fires Remove
-// — all honored. Partial-write safety is the watcher's own job: it
-// sleeps 500ms after an event before re-scanning ("so both .crt and
-// .key are fully written") and only pairs files that parse, so a torn
-// read is simply retried on the next event while existing SslContexts
-// keep serving (no 502 — unlike the upstreams torn-read case). Writing
-// only on a real content change avoids needless inotify churn /
-// Certificates rebuilds.
-func writeFileIfChanged(path string, content []byte, mode os.FileMode) (bool, error) {
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == string(content) {
-		return false, nil
-	}
-	if err := os.WriteFile(path, content, mode); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // pruneCerts removes <stem>.crt/<stem>.key (and stray .tmp) for stems
