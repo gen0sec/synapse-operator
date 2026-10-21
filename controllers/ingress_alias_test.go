@@ -176,10 +176,11 @@ func TestRender_APromotedV2FileTakesTheV2AliasRule(t *testing.T) {
 			if !strings.Contains(rendered, "version: 2") {
 				t.Fatalf("not a v2 file:\n%s", rendered)
 			}
-			if strings.Contains(rendered, fmt.Sprintf("\n  %q:\n", tc.bad)) {
+			hosts := parseV2(t, rendered).Hosts
+			if _, ok := hosts[tc.bad]; ok {
 				t.Errorf("the v2 file has the host %q\n%s", tc.bad, rendered)
 			}
-			if !strings.Contains(rendered, "ok.example.com") {
+			if _, ok := hosts["ok.example.com"]; !ok {
 				t.Errorf("ok.example.com is not served\n%s", rendered)
 			}
 			if got := eventsOf(events, "InvalidServerAlias"); len(got) != 1 {
