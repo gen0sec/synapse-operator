@@ -204,6 +204,12 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 	return nil
 }
 
+// ingressWithSettings is one of our Ingresses with its annotations read.
+type ingressWithSettings struct {
+	ing *networkingv1.Ingress
+	a   annSettings
+}
+
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
@@ -247,6 +253,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 
 	matched := 0
 	var matchedIngs []*networkingv1.Ingress
+	var ours []ingressWithSettings
 	for i := range list.Items {
 		ing := &list.Items[i]
 		if !r.isOurs(ing, defaultOurs) {
@@ -258,6 +265,11 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		if a.sticky {
 			m.sticky = true
 		}
+		ours = append(ours, ingressWithSettings{ing: ing, a: a})
+	}
+
+	for _, o := range ours {
+		ing, a := o.ing, o.a
 		// An alias Synapse would not take as a host of a proxy's file is
 		// left out here: in a v2 file it is an error, and the file is
 		// every route there is. The older modes write it as it came: in a
