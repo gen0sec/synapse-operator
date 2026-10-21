@@ -86,3 +86,29 @@ func TestGatewayClaims_OneClaimPerParentRefToTheGateway(t *testing.T) {
 		t.Errorf("claims = %v, want none for a host no listener serves", got)
 	}
 }
+
+// A Gateway whose class no proxy binds is not this proxy's: it claims nothing.
+func TestGatewayClaims_AGatewayOfAnUnboundClassClaimsNothing(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "shop.example.com"))}
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("shop", []string{"shop.example.com"}, to("app"))}
+	if got := w.in.claims(); len(got) != 2 {
+		t.Fatalf("claims = %v, want the listener's and the route's", got)
+	}
+	w.in.gateways[0].Spec.GatewayClassName = "elsewhere"
+	if got := w.in.claims(); len(got) != 0 {
+		t.Errorf("claims = %v, want none from a Gateway of a class the proxy does not bind", got)
+	}
+}
+
+// A parentRef with a port reaches the listeners on that port, and claims
+// through those alone.
+func TestGatewayClaims_AParentRefPortNarrowsTheClaim(t *testing.T) {
+	gw := gateway("edge", "web", httpListener("a", 80, "a.example.com"), httpListener("b", 8080, "b.example.com"))
+	rt := httpRoute("shop", nil, to("app"))
+	rt.Spec.ParentRefs[0].Port = ptr(gwv1.PortNumber(8080))
+	got := routeClaims(&rt, &gw, admitAll)
+	if len(got) != 1 || got[0].host != "b.example.com" {
+		t.Errorf("claims = %v, want b.example.com alone", got)
+	}
+}

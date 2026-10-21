@@ -2,13 +2,16 @@ package controllers
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -320,4 +323,69 @@ func TestGatewayOwnership_AForeignRouteCannotReachAHostTheGatewaysNamespaceNames
 			t.Errorf("the second foreign route is not accepted: %+v", parents)
 		}
 	})
+}
+
+// The reconciler hands the proxy's Gateways to the Ingress render as claims:
+// without that wiring an Ingress and a Gateway would not see each other.
+func TestGatewayOwnership_TheReconcilerHandsGatewayClaimsToTheIngressRender(t *testing.T) {
+	proxy := testProxy("synapse-os", "edge")
+	class := gwClass("edge", "synapse-os", "edge")
+	render := func(gatewayAt, ingressAt time.Time) string {
+		t.Helper()
+		gw := gateway("gwns", "web", httpListener("http", 80, "shop.example.com"))
+		gw.CreationTimestamp = metav1.NewTime(gatewayAt)
+		late := ownerIngress("shop", "late", "shop.example.com", "/late", ingressAt)
+		r := newRouteReconciler(t)
+		r.GatewayAPI = true
+		r.Client = fake.NewClientBuilder().WithScheme(proxyTestScheme(t)).
+			WithObjects(proxy, classFor("public", proxy), &class, &gw, late).
+			WithStatusSubresource(&networkingv1.Ingress{}, &gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
+		mustReconcileRoutes(t, r, proxy)
+		return upstreamsOf(t, r, proxy)
+	}
+	if out := render(t0, t0.Add(time.Hour)); strings.Contains(out, "/late") {
+		t.Errorf("an Ingress newer than the Gateway's listener is served:\n%s", out)
+	}
+	if out := render(t0.Add(time.Hour), t0); !strings.Contains(out, "/late") {
+		t.Errorf("an Ingress older than the Gateway's listener is not served:\n%s", out)
+	}
+}
+
+// A name its namespace holds, with no entry of its own, is held without
+// routes under a wildcard of another namespace that a Gateway's route brings
+// in; under a wildcard of its own namespace, nothing is written for it.
+func TestGatewayOwnership_AnOwnedNameUnderAGatewayWildcard(t *testing.T) {
+	render := func(ingressNamespace string) string {
+		t.Helper()
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "*.example.com"))}
+		w.gatewayCreated(t0.Add(time.Hour))
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("wild", nil, to("app"))}
+		owner := ingressIn(ingressNamespace, "shop", "shop.example.com", "/")
+		owner.CreationTimestamp = metav1.NewTime(t0)
+		owner.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+		r := &IngressReconciler{IngressClassName: "synapse", HostOwnership: true,
+			ExtraClaims: w.in.claims,
+			RenderExtra: func(_ context.Context, m *renderModel) error {
+				translateGateways(w.in, m)
+				return nil
+			}}
+		return renderToFile(t, r, owner)
+	}
+
+	out := render("zzz")
+	if !strings.Contains(out, `"*.example.com":`) {
+		t.Fatalf("the Gateway's wildcard is not served:\n%s", out)
+	}
+	if !regexp.MustCompile(`"shop\.example\.com":\s+paths: \{\}`).MatchString(out) {
+		t.Errorf("the owned name under a younger foreign wildcard has no entry without paths:\n%s", out)
+	}
+
+	out = render("edge")
+	if !strings.Contains(out, `"*.example.com":`) {
+		t.Fatalf("the Gateway's wildcard is not served:\n%s", out)
+	}
+	if strings.Contains(out, "shop.example.com") {
+		t.Errorf("the owned name under its own namespace's wildcard has an entry:\n%s", out)
+	}
 }
