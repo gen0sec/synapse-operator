@@ -286,6 +286,53 @@ func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	}
 }
 
+// The older modes read an HTTPRoute's redirect annotations too: a code
+// Synapse does not serve keeps the default and the HTTPRoute is told.
+func TestRenderGateways_ARefusedRedirectCodeIsReported(t *testing.T) {
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "synapse-gw", "default"
+	gw.Spec.GatewayClassName = gwv1.ObjectName("synapse")
+	rt := &gwv1.HTTPRoute{}
+	rt.Name, rt.Namespace = "moved", "default"
+	rt.Annotations = map[string]string{
+		"synapse.gen0sec.com/permanent-redirect":      "https://example.com/new",
+		"synapse.gen0sec.com/permanent-redirect-code": "70000",
+	}
+	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	rt.Spec.Hostnames = []gwv1.Hostname{"moved.example.com"}
+	rt.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Value: ptr("/")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{
+			Name: "app", Port: ptr(gwv1.PortNumber(80))}}}},
+	}}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(gc, gw, rt).
+		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true, Recorder: events}
+
+	m := newRenderModel()
+	if n := r.renderGateways(context.Background(), m); n != 1 {
+		t.Fatalf("programmed %d HTTPRoutes, want 1", n)
+	}
+	rc := m.hosts["moved.example.com"]["/"]
+	if rc == nil || rc.redirectStatus == nil || *rc.redirectStatus != 301 {
+		t.Fatalf("the route is %+v, want a redirect with status 301", rc)
+	}
+	var told bool
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.Contains(event, " InvalidRedirectCode ") && strings.Contains(event, "70000") {
+			told = true
+		}
+	}
+	if !told {
+		t.Error("the HTTPRoute was not told with an InvalidRedirectCode event")
+	}
+}
+
 func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 	gc := &gwv1.GatewayClass{}
 	gc.Name = "other"

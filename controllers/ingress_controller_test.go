@@ -1191,6 +1191,29 @@ func TestParseAnnotations_RedirectCodeRange(t *testing.T) {
 	}
 }
 
+// When both redirects are set, the permanent one wins, and the refused value
+// is the winner's own.
+func TestParseAnnotations_RedirectCodeRefusedBelongsToTheWinner(t *testing.T) {
+	a := parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":       "/t",
+		annPrefix + "temporal-redirect-code":  "abc",
+		annPrefix + "permanent-redirect":      "/p",
+		annPrefix + "permanent-redirect-code": "308",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 308 || a.redirectCodeRefused != "" {
+		t.Errorf("temporal abc + permanent 308: status %v, refused %q", a.redirectStatus, a.redirectCodeRefused)
+	}
+	a = parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":       "/t",
+		annPrefix + "temporal-redirect-code":  "307",
+		annPrefix + "permanent-redirect":      "/p",
+		annPrefix + "permanent-redirect-code": "70000",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 301 || a.redirectCodeRefused != "70000" {
+		t.Errorf("temporal 307 + permanent 70000: status %v, refused %q", a.redirectStatus, a.redirectCodeRefused)
+	}
+}
+
 // renderUpstreams emits a redirect: block on the route when set, both
 // in v1 emission and v2 emission. Verified separately for each.
 func TestRenderUpstreams_RedirectEmitted(t *testing.T) {
