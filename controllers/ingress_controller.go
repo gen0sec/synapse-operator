@@ -595,6 +595,18 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 // may not use is said once per Ingress, to the Ingress, in the log and in the
 // counter.
 func (r *IngressReconciler) hostAllowed(logger logr.Logger, m *renderModel, ing *networkingv1.Ingress, host string, said map[string]bool) bool {
+	if m.owners != nil && host != "" && !validClaimHost(host) {
+		// Not a host name, and so no claim to compare: it is not passed as
+		// unowned either.
+		if said[host] {
+			return false
+		}
+		said[host] = true
+		logger.Info("host ignored: not a host name", "host", host, "ingress", ing.Namespace+"/"+ing.Name)
+		r.emit(ing, corev1.EventTypeWarning, "InvalidHostname",
+			"host %q is not a host name; this Ingress's use of it is ignored", host)
+		return false
+	}
 	if m.owners.allows(host, ing.Namespace) {
 		return true
 	}

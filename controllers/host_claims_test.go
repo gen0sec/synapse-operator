@@ -210,3 +210,32 @@ func TestHostClaims_BodyIsSortedAndStable(t *testing.T) {
 		t.Error("recording the same claims again changed the body")
 	}
 }
+
+func TestHostClaims_AKeyWithWhitespaceIsNotWritten(t *testing.T) {
+	l, _ := parseHostClaims("", true)
+	now := t0.Add(time.Hour)
+	l.record([]hostClaim{
+		{ns: "a", host: "ok.example.com"},
+		{ns: "b", host: "x.example.com\naaa owned.example.com"},
+		{ns: "c d", host: "z.example.com"},
+	}, now)
+	body := l.body()
+	if strings.Contains(body, "aaa owned") || strings.Contains(body, "c d") || !strings.Contains(body, "a ok.example.com") {
+		t.Errorf("body:\n%s", body)
+	}
+	if _, malformed := parseHostClaims(body, true); malformed != 0 {
+		t.Errorf("the body written does not parse cleanly: %d", malformed)
+	}
+}
+
+func TestHostClaims_ADuplicateKeyKeepsTheOldestAndIsCounted(t *testing.T) {
+	body := "a h.example.com 2025-01-01T12:00:00Z\na h.example.com 2025-01-01T15:00:00Z\na h.example.com 2025-01-01T09:00:00Z\n"
+	l, malformed := parseHostClaims(body, true)
+	if malformed != 2 {
+		t.Errorf("malformed = %d, want 2", malformed)
+	}
+	want := time.Date(2025, 1, 1, 9, 0, 0, 0, time.UTC)
+	if got := l.entries[claimKey{"a", "h.example.com"}].firstSeen; !got.Equal(want) {
+		t.Errorf("firstSeen = %v, want the oldest %v", got, want)
+	}
+}

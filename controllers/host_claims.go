@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // The claim ledger says when the proxy first saw each (namespace, host)
@@ -39,6 +40,9 @@ type claimEntry struct {
 type hostClaims struct {
 	entries map[claimKey]claimEntry
 	exists  bool
+	// refused counts the claims record left out for a name that cannot be
+	// written as a line.
+	refused int
 }
 
 // parseHostClaims reads a ledger body and reports how many lines it could
@@ -70,7 +74,16 @@ func parseHostClaims(body string, exists bool) (*hostClaims, int) {
 			}
 			e.absentSince = absent.UTC()
 		}
-		l.entries[claimKey{ns: f[0], host: f[1]}] = e
+		k := claimKey{ns: f[0], host: f[1]}
+		if old, dup := l.entries[k]; dup {
+			// Two lines for one claim: the oldest stands, so that a line
+			// added to the text cannot make a claim younger.
+			malformed++
+			if old.firstSeen.Before(e.firstSeen) {
+				e = old
+			}
+		}
+		l.entries[k] = e
 	}
 	return l, malformed
 }
@@ -131,6 +144,10 @@ func (l *hostClaims) record(claims []hostClaim, now time.Time) (changed bool, dr
 	for _, c := range claims {
 		host := hostKey(c.host)
 		if host == "" {
+			continue
+		}
+		if strings.ContainsFunc(c.ns, unicode.IsSpace) || strings.ContainsFunc(host, unicode.IsSpace) {
+			l.refused++
 			continue
 		}
 		k := claimKey{ns: c.ns, host: host}

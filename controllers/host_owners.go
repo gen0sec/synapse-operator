@@ -30,6 +30,24 @@ func hostKey(host string) string {
 	return strings.ToLower(strings.TrimRight(host, "."))
 }
 
+// validClaimHost says a host is made of what a DNS name, a wildcard or a
+// service-style name is made of. Anything else is no claim: the ledger is
+// text, one line to a claim.
+func validClaimHost(host string) bool {
+	key := hostKey(host)
+	if key == "" {
+		return false
+	}
+	for _, c := range key {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '-', c == '*', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // hostOwners tells which namespace holds each claimed host. The zero value
 // of a nil pointer holds nothing, and allows everything.
 type hostOwners struct {
@@ -101,7 +119,7 @@ func (o *hostOwners) allows(host, ns string) bool {
 func ingressClaims(ing *networkingv1.Ingress, a annSettings) []hostClaim {
 	var claims []hostClaim
 	add := func(host string) {
-		if host == "" || hostKeyProblem(host) != "" {
+		if host == "" || hostKeyProblem(host) != "" || !validClaimHost(host) {
 			return
 		}
 		claims = append(claims, hostClaim{host: host, ns: ing.Namespace, created: ing.CreationTimestamp.Time, who: ing})

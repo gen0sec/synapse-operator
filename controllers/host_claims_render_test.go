@@ -482,3 +482,27 @@ func TestOwnership_ARenderWithNoInputChangedWritesNoLedger(t *testing.T) {
 		t.Errorf("ledger written %d times by the first render and %d in all; want 1 and 1", first, writes.Load())
 	}
 }
+
+func TestOwnership_AnAliasCannotForgeALedgerLine(t *testing.T) {
+	g := newLedgerRig(t,
+		ownerIngress("aaa", "shop", ownedHost, "/a", t0),
+		ownerIngress("zzz", "later", ownedHost, "/z", t0.Add(time.Hour)))
+	g.mustReconcile()
+	forged := annotated(ownerIngress("evil", "x", "x.example.com", "/", t0.Add(3*time.Hour)),
+		"server-alias", "y.example.com\naaa "+ownedHost)
+	g.create(forged)
+	for range 3 {
+		g.now = g.now.Add(10 * time.Minute)
+		g.mustReconcile()
+	}
+	if out := g.routes(); !strings.Contains(out, "/a") || strings.Contains(out, "/z") {
+		t.Errorf("a forged ledger line moved the host from its owner:\n%s", out)
+	}
+	cm, _ := g.ledger()
+	if strings.Contains(cm.Data["claims"], "y.example.com") {
+		t.Errorf("the ledger holds the forged host:\n%s", cm.Data["claims"])
+	}
+	if got := eventsOf(g.events, "InvalidHostname"); len(got) == 0 {
+		t.Error("the invalid host was not said")
+	}
+}

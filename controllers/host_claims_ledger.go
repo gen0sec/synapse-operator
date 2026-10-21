@@ -128,6 +128,9 @@ func (r *IngressReconciler) ageClaims(ctx context.Context, claims []hostClaim, n
 		mHostClaimLedgerErrors.WithLabelValues("write").Inc()
 		*notRecorded = true
 	}
+	if ledger.refused > 0 {
+		mHostClaimLedgerErrors.WithLabelValues("invalid").Add(float64(ledger.refused))
+	}
 	if dropped > 0 {
 		mHostClaimLedgerErrors.WithLabelValues("full").Add(float64(dropped))
 		r.emit(cm, corev1.EventTypeWarning, "HostClaimLedgerFull",
