@@ -206,7 +206,7 @@ func (m *renderModel) holdOwnedHosts(logger logr.Logger) {
 		}
 		owner, _ := m.owners.holder(w)
 		// The wildcard's own namespace holds a name it also names, when
-		// only routes of other namespaces brought the wildcard in.
+		// a route of another namespace brought the wildcard in.
 		if owner == ns && !(m.foreignWild[hostKey(w)] && m.owners.named[owner][key]) {
 			continue
 		}

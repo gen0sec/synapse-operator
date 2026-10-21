@@ -257,7 +257,7 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		rules     ruleSet
 	}
 	var all []attached
-	own, foreign := map[string]bool{}, map[string]bool{}
+	foreign := map[string]bool{}
 	// In any order: the matches are put in theirs when they are emitted.
 	var matches []gwMatch
 	for i := range in.routes {
@@ -286,9 +286,7 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 			conflicts = append(conflicts, attach.conflicts)
 			for host := range attach.hosts {
 				hosts[host] = true
-				if rt.Namespace == gwKey.Namespace {
-					own[hostKey(host)] = true
-				} else {
+				if rt.Namespace != gwKey.Namespace {
 					foreign[hostKey(host)] = true
 				}
 			}
@@ -314,12 +312,7 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		all = append(all, attached{rt: rt, parents: parents, accepted: accepted, hosts: len(hosts), conflicts: conflicts, partial: partial, rules: rules})
 	}
 	served := emitGatewayMatches(m, matches)
-	m.foreignWild = map[string]bool{}
-	for host := range foreign {
-		if !own[host] {
-			m.foreignWild[host] = true
-		}
-	}
+	m.foreignWild = foreign
 
 	for _, a := range all {
 		rt, parents, rules := a.rt, a.parents, a.rules

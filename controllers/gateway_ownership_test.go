@@ -479,3 +479,87 @@ func TestGatewayOwnership_AForeignWildcardRouteDoesNotServeANameTheNamespaceName
 		}
 	})
 }
+
+func renderGateways(t *testing.T, w *gwWorld, objs ...client.Object) string {
+	t.Helper()
+	r := &IngressReconciler{IngressClassName: "synapse", HostOwnership: true,
+		ExtraClaims: w.in.claims,
+		RenderExtra: func(_ context.Context, m *renderModel) error {
+			translateGateways(w.in, m)
+			return nil
+		}}
+	return renderToFile(t, r, objs...)
+}
+
+var heldAdmin = regexp.MustCompile(`"admin\.example\.com":\s+paths: \{\}`)
+
+// Any route of another namespace that brings a wildcard in makes it one the
+// namespace's names are held against, whatever else brings it in.
+func TestGatewayOwnership_AWildcardTheNamespaceAndAForeignRouteBothBringIn(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{
+		gateway("edge", "internal", ownListener("admin", 8080, "admin.example.com")),
+		gateway("edge", "web", httpListener("http", 80, "*.example.com")),
+	}
+	w.gatewayCreated(t0)
+	w.service("edge", "app", "10.0.2.1")
+	mine := httpRoute("mine", nil, to("app", prefix("/")))
+	mine.Namespace = "edge"
+	w.in.routes = []gwv1.HTTPRoute{mine, httpRoute("wild", nil, to("app", prefix("/admin")))}
+	out := renderGateways(t, w)
+	if !strings.Contains(out, `"*.example.com":`) {
+		t.Fatalf("the wildcard is not served:\n%s", out)
+	}
+	if !heldAdmin.MatchString(out) {
+		t.Errorf("the name edge names has no entry without paths:\n%s", out)
+	}
+}
+
+// A namespace that does not hold a wildcard cannot blank a host under it.
+func TestGatewayOwnership_AnotherNamespaceCannotBlankAHostUnderTheWildcard(t *testing.T) {
+	w := newGwWorld()
+	w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, "*.example.com"))}
+	w.gatewayCreated(t0)
+	w.in.routes = []gwv1.HTTPRoute{httpRoute("wild", nil, to("app"))}
+	ing := ingressIn("shop", "tlsonly", "shop.example.com", "/")
+	ing.CreationTimestamp = metav1.NewTime(t0.Add(2 * time.Hour))
+	ing.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"victim.example.com"}, SecretName: "tls"}}
+	out := renderGateways(t, w, ing)
+	if !strings.Contains(out, `"*.example.com":`) {
+		t.Fatalf("the wildcard is not served:\n%s", out)
+	}
+	if strings.Contains(out, "victim.example.com") {
+		t.Errorf("a namespace that lost the host blanked it:\n%s", out)
+	}
+}
+
+// The name comes after the wildcard: no claim of it is in the owners' table,
+// since an older wildcard of its own namespace already covers it.
+func TestGatewayOwnership_ANameNamedAfterTheWildcardIsHeld(t *testing.T) {
+	t.Run("a listener", func(t *testing.T) {
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{
+			gateway("edge", "internal", ownListener("admin", 8080, "admin.example.com")),
+			gateway("edge", "web", httpListener("http", 80, "")),
+		}
+		w.in.gateways[0].CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
+		w.in.gateways[1].CreationTimestamp = metav1.NewTime(t0)
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("wild", []string{"*.example.com"}, to("app", prefix("/admin")))}
+		if out := renderGateways(t, w); !heldAdmin.MatchString(out) {
+			t.Errorf("the name edge names has no entry without paths:\n%s", out)
+		}
+	})
+
+	t.Run("an Ingress", func(t *testing.T) {
+		w := newGwWorld()
+		w.in.gateways = []gwv1.Gateway{gateway("edge", "web", httpListener("http", 80, ""))}
+		w.gatewayCreated(t0)
+		w.in.routes = []gwv1.HTTPRoute{httpRoute("wild", []string{"*.example.com"}, to("app", prefix("/admin")))}
+		ing := ingressIn("edge", "admin", "admin.example.com", "/")
+		ing.CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
+		ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
+		if out := renderGateways(t, w, ing); !heldAdmin.MatchString(out) {
+			t.Errorf("the name edge names has no entry without paths:\n%s", out)
+		}
+	})
+}
