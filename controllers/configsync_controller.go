@@ -173,18 +173,20 @@ func (r *ConfigSyncReconciler) SyncAll(ctx context.Context) (int, error) {
 }
 
 // EnsureFiles guarantees the named files exist, creating a minimal but
-// SCHEMA-VALID upstreams document for any that do not.
+// SCHEMA-VALID upstreams document for any that do not. The document is
+// the empty v2 one, which needs Synapse 0.7.0 or newer.
 //
 // This is not defensive padding. synapse-proxy's background service does a
 // blocking initial read of the upstreams file and, if that read fails,
 // logs an error and RETURNS — killing the service outright, so no file
 // watch is ever established and no later write is ever picked up. A pod
 // that starts before the operator has written the ConfigMap would be
-// permanently deaf rather than briefly empty. The rendered floor parses
-// (provider defaults to "file" in synapse's serde model), so the watcher
-// installs and the first real sync takes over sub-second.
+// permanently deaf rather than briefly empty. The rendered floor parses, so
+// the watcher installs and the first real sync takes over sub-second.
 func (r *ConfigSyncReconciler) EnsureFiles(names []string) error {
-	floor := renderUpstreams(newRenderModel())
+	m := newRenderModel()
+	m.sameAsV1 = true
+	floor := renderUpstreamsV2(m)
 	for _, n := range names {
 		n = strings.TrimSpace(n)
 		if n == "" {

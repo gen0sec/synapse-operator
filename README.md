@@ -126,7 +126,7 @@ The operator runs as **one** of three controllers per process, selected by `--in
 
 > **The routes file is always a v2 file.** `--ingress-mode` and `--gateway-api` used to write Synapse's v1 schema unless an Ingress had `ssl-passthrough`. They now write the v2 schema every time, the file a `SynapseProxy` writes. Synapse MUST be 0.8.8 or newer: an older one refuses a v2 file with a host without a certificate, a `use-regex` path or `healthcheck: "false"`, and does not start on a refused first file. Upgrade Synapse first. The file name and `upstream.conf` do not change.
 >
-> What stops working: `server-alias: "*"` and a mid-name wildcard such as `www.*.example.com` are no longer a catch-all or a pattern; they are left out with `InvalidServerAlias`. A `use-regex` path (or a Gateway `RegularExpression` path) Synapse cannot compile is left out with `UnsupportedMatch`. A path without header annotations no longer takes the headers of the path above it; set them on each Ingress.
+> What stops working: `server-alias: "*"` and a mid-name wildcard such as `www.*.example.com` are no longer a catch-all or a pattern; they are left out with `InvalidServerAlias`. A `use-regex` path (or a Gateway `RegularExpression` path) Synapse cannot compile is left out with `UnsupportedMatch`. A path without header annotations no longer takes the headers of the path above it; set them on each Ingress. `--config-sync --ensure-files` creates a v2 placeholder (Synapse 0.7.0 or newer).
 >
 > Every `use-regex` path and every Gateway `RegularExpression` path is written in Go's canonical form. For the few expressions the two engines read differently, such as `\<` (a literal character in Go, a word boundary in Synapse), the meaning follows Go's reading.
 >
@@ -399,7 +399,7 @@ flowchart TD
 | `--out-dir` | `/shared` | Directory to project ConfigMap keys into (the volume shared with synapse) |
 | `--sync-keys` | _(all)_ | Comma-separated data keys to project |
 | `--sync-once` | `false` | One-shot: project once, guarantee `--ensure-files`, exit (initContainer) |
-| `--ensure-files` | `upstreams.yaml` | Filenames that must exist in `--out-dir` before synapse starts |
+| `--ensure-files` | `upstreams.yaml` | Filenames that must exist in `--out-dir` before synapse starts. A missing one is created as an empty v2 document (Synapse 0.7.0 or newer) |
 | `--reload-process-name` | `synapse` | argv0 of the co-located proxy to `SIGHUP` |
 | `--reload-debounce` | `500ms` | Coalesce SIGHUP bursts |
 
