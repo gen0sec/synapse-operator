@@ -126,9 +126,13 @@ The operator runs as **one** of three controllers per process, selected by `--in
 
 > **The routes file is always a v2 file.** `--ingress-mode` and `--gateway-api` used to write Synapse's v1 schema unless an Ingress had `ssl-passthrough`. They now write the v2 schema every time, the file a `SynapseProxy` writes. Synapse MUST be 0.8.8 or newer: an older one refuses a v2 file with a host without a certificate, a `use-regex` path or `healthcheck: "false"`, and does not start on a refused first file. Upgrade Synapse first. The file name and `upstream.conf` do not change.
 >
-> What stops working: `server-alias: "*"` is no longer a catch-all; it is left out with `InvalidServerAlias`. A `use-regex` path Synapse cannot compile is left out with `UnsupportedMatch`. A path without header annotations no longer takes the headers of the path above it; set them on each Ingress. `--config-sync --ensure-files` creates a v2 placeholder (Synapse 0.7.0 or newer).
+> What stops working: `server-alias: "*"` and a mid-name wildcard such as `www.*.example.com` are no longer a catch-all or a pattern; they are left out with `InvalidServerAlias`. A `use-regex` path (or a Gateway `RegularExpression` path) Synapse cannot compile is left out with `UnsupportedMatch`. A path without header annotations no longer takes the headers of the path above it; set them on each Ingress.
 >
-> What stays: every annotation means what it meant: plain HTTP unless `backend-protocol` asks for TLS, a probe unless `healthcheck: "false"`, 120 s to send, no fingerprints forwarded. A file that was already v2 because of passthrough now says these values.
+> Every `use-regex` path and every Gateway `RegularExpression` path is written in Go's canonical form. For the few expressions the two engines read differently, such as `\<` (a literal character in Go, a word boundary in Synapse), the meaning follows Go's reading.
+>
+> What stays: every annotation means what it meant: plain HTTP unless `backend-protocol` asks for TLS, a probe unless `healthcheck: "false"`, 120 s to send, no fingerprints forwarded.
+>
+> A file that was already v2 because of passthrough now says the v1 values. A route with no TLS setting says `ssl_enabled: false` (plain HTTP, not chosen by port). `healthcheck: "true"` uses the global probe, not a TCP probe. `healthcheck: "false"` writes `type: none`. The read timeout is 120 s, not 60 s. Client fingerprints are not forwarded.
 >
 > To roll back, run operator 0.1.x again; the next render rewrites the file in v1.
 

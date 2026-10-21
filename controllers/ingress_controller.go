@@ -402,13 +402,8 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					// As Synapse's engine will read it, or not at all: an
 					// expression it cannot compile is an error in a v2 file,
 					// and the file is every route there is.
-					written, err := canonicalRegex(path)
-					if err != nil {
-						logger.Info("regex path ignored: not a regular expression Synapse takes",
-							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "error", err.Error())
-						mUnsupportedMatch.Inc()
-						r.emit(ing, corev1.EventTypeWarning, "UnsupportedMatch",
-							"path %s on host %s cannot be used as a regular expression: %v; this path is ignored", path, host, err)
+					written, ok := r.canonicalRegexPath(logger, ing, path, " on host "+host)
+					if !ok {
 						continue
 					}
 					path = written
@@ -661,6 +656,23 @@ func (r *IngressReconciler) leader() bool {
 
 // emit records a Kubernetes Event on obj (no-op when there is no
 // recorder, e.g. --render-once).
+// canonicalRegexPath returns the regex path as Synapse's engine will read it.
+// An expression it cannot compile is reported as UnsupportedMatch on obj and
+// not returned: one such expression makes Synapse refuse the whole v2 file.
+// where is appended to the event text.
+func (r *IngressReconciler) canonicalRegexPath(logger logr.Logger, obj client.Object, path, where string) (string, bool) {
+	written, err := canonicalRegex(path)
+	if err != nil {
+		logger.Info("regex path ignored: not a regular expression Synapse takes",
+			"regex", path, "object", obj.GetNamespace()+"/"+obj.GetName(), "error", err.Error())
+		mUnsupportedMatch.Inc()
+		r.emit(obj, corev1.EventTypeWarning, "UnsupportedMatch",
+			"path %s%s cannot be used as a regular expression: %v; this path is ignored", path, where, err)
+		return "", false
+	}
+	return written, true
+}
+
 func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
 	if r.Recorder == nil || obj == nil {
 		return

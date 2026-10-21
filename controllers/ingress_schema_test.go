@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // renderSchema renders objs the way --ingress-mode does, with host ownership
@@ -184,6 +185,52 @@ func TestRender_RegexPathsAreCanonicalisedInEveryMode(t *testing.T) {
 				t.Errorf("events = %q, want one UnsupportedMatch", got)
 			}
 		})
+	}
+}
+
+// An HTTPRoute RegularExpression path is held to the same rule.
+func TestRender_RegexPathsAreCanonicalisedInEveryMode_GatewayAPI(t *testing.T) {
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "gw", "default"
+	gw.Spec.GatewayClassName = "synapse"
+	gw.Spec.Listeners = []gwv1.Listener{{Name: "http", Port: 80, Protocol: gwv1.HTTPProtocolType}}
+	rt := &gwv1.HTTPRoute{}
+	rt.Name, rt.Namespace = "route", "default"
+	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: "gw"}}
+	rt.Spec.Hostnames = []gwv1.Hostname{"gw.example.com"}
+	backend := []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
+		BackendObjectReference: gwv1.BackendObjectReference{Name: "gwapp", Port: ptr(gwv1.PortNumber(8080))}}}}
+	re := gwv1.PathMatchRegularExpression
+	for _, v := range []string{"/v[0-9]+/.*", "/("} {
+		rt.Spec.Rules = append(rt.Spec.Rules, gwv1.HTTPRouteRule{
+			Matches:     []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Type: &re, Value: ptr(v)}}},
+			BackendRefs: backend,
+		})
+	}
+	events := record.NewFakeRecorder(64)
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	r := &IngressReconciler{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(gc, gw, rt).
+			WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build(),
+		IngressClassName: "synapse", ClusterDomain: "cluster.local", GatewayAPI: true,
+		UpstreamsOutPath: out, CertsOutDir: t.TempDir(), Recorder: events,
+	}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := parseV2(t, string(b)).Hosts["gw.example.com"].Paths
+	if _, ok := paths["expr:(?-s:/v[0-9]+/.*)"]; !ok || len(paths) != 1 {
+		t.Errorf("paths = %v, want only the canonical regex\n%s", paths, b)
+	}
+	if got := eventsOf(events, "UnsupportedMatch"); len(got) != 1 {
+		t.Errorf("events = %q, want one UnsupportedMatch", got)
 	}
 }
 
