@@ -60,9 +60,9 @@ hosts:
     tls:
       terminate: {}
     paths:
-      "expr:/v[0-9]+/.*":
+      "expr:(?-s:/v[0-9]+/.*)":
         upstream: "app.zzz.svc.cluster.local:80"
-        match_expr: "http.request.path matches \"^(?:/v[0-9]+/.*)\""
+        match_expr: "http.request.path matches \"^(?:(?-s:/v[0-9]+/.*))\""
   "gw.example.com":
     tls:
       terminate: {}

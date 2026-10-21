@@ -313,7 +313,8 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	for _, o := range ours {
 		anyPassthrough = anyPassthrough || o.a.passthrough
 	}
-	v2Aliases := r.writesV2(anyPassthrough) || r.HostOwnership
+	v2 := r.writesV2(anyPassthrough)
+	v2Aliases := v2 || r.HostOwnership
 
 	for _, o := range ours {
 		ing, a := o.ing, o.a
@@ -423,7 +424,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					// error in a v2 file, and the file is every route there
 					// is. The older modes write it as it came.
 					written, err := path, error(nil)
-					if r.UpstreamsV2 {
+					if v2 {
 						written, err = canonicalRegex(path)
 					}
 					if err != nil {
