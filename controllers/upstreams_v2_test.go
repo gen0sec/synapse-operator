@@ -292,10 +292,9 @@ func TestRenderUpstreamsV2_FingerprintsAreNotSentToBackends(t *testing.T) {
 	}
 }
 
-// The older modes write a v2 file only beside a passthrough host, and write
-// it as they did: what a proxy's file says of TLS to backends, of the read
-// timeout and of fingerprints is left unsaid in theirs.
-func TestRender_TheOlderModesV2FileIsAsItWas(t *testing.T) {
+// The older modes write a v2 file that says what their v1 file said, beside
+// a passthrough host as without one.
+func TestRender_TheOlderModesV2FileSaysWhatTheV1FileSaid(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "u.yaml")
 	plain := routedIngress("plain", ptr("synapse"), "plain.example.com")
 	raw := routedIngress("raw", ptr("synapse"), "raw.example.com")
@@ -318,14 +317,14 @@ func TestRender_TheOlderModesV2FileIsAsItWas(t *testing.T) {
 	if !ok {
 		t.Fatalf("plain.example.com has no route:\n%s", rendered)
 	}
-	if route.SSLEnabled != nil {
-		t.Errorf("ssl_enabled is said: %v", *route.SSLEnabled)
+	if route.SSLEnabled == nil || *route.SSLEnabled {
+		t.Errorf("ssl_enabled is %v, want false", route.SSLEnabled)
 	}
-	if doc.Timeouts != (v2Timeouts{}) {
-		t.Errorf("the file sets timeouts: %+v", doc.Timeouts)
+	if doc.Timeouts.Read == nil || *doc.Timeouts.Read != 120 {
+		t.Errorf("timeouts.read is %v, want 120", doc.Timeouts.Read)
 	}
-	if got := doc.Proxy.Fingerprints.Forward; got != nil {
-		t.Errorf("the file says fingerprints.forward: %v", *got)
+	if got := doc.Proxy.Fingerprints.Forward; got == nil || *got {
+		t.Errorf("fingerprints.forward is %v, want false", got)
 	}
 }
 
@@ -596,9 +595,9 @@ func TestRoutes_ASolverOnAPassthroughHostIsSaid(t *testing.T) {
 	}
 }
 
-// The older modes write a `use-regex` path as it came: what their Synapse
-// makes of it is not this change's to decide.
-func TestRender_TheOlderModesRegularExpressionsAreAsTheyCame(t *testing.T) {
+// A `use-regex` path is written in the form Synapse's engine reads, and one
+// it cannot read is left out with an event.
+func TestRender_TheOlderModesRegularExpressionsAreCanonical(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "u.yaml")
 	ing := routedIngress("versioned", ptr("synapse"), "api.example.com")
 	ing.Annotations = map[string]string{"synapse.gen0sec.com/use-regex": "true"}
@@ -611,8 +610,9 @@ func TestRender_TheOlderModesRegularExpressionsAreAsTheyCame(t *testing.T) {
 	}
 	ing.Spec.Rules[0].HTTP.Paths = paths
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).Build()
+	events := record.NewFakeRecorder(16)
 	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out,
-		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local"}
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
 	if _, _, _, err := r.render(context.Background()); err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -620,10 +620,15 @@ func TestRender_TheOlderModesRegularExpressionsAreAsTheyCame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{pathRegexExpr(`/v\d+/items`), pathRegexExpr("/app/(?!admin).*")} {
-		if !strings.Contains(string(rendered), fmt.Sprintf("%q", want)) {
-			t.Errorf("the file has no route by %s\n%s", want, rendered)
-		}
+	var exprs []string
+	for _, route := range parseV2(t, string(rendered)).Hosts["api.example.com"].Paths {
+		exprs = append(exprs, route.MatchExpr)
+	}
+	if want := []string{pathRegexExpr(`/v[0-9]+/items`)}; !slices.Equal(exprs, want) {
+		t.Errorf("api.example.com is routed by %q, want %q\n%s", exprs, want, rendered)
+	}
+	if got := eventsOf(events, "UnsupportedMatch"); len(got) != 1 {
+		t.Errorf("events = %q, want one UnsupportedMatch", got)
 	}
 }
 
@@ -719,9 +724,9 @@ func TestSolverHost_InTheOrderSynapseLooks(t *testing.T) {
 	}
 }
 
-// To the older modes' Synapse an alias is whatever it is: `*` in a v1 file
-// is the host for every name that has no other. They write it as it came.
-func TestRender_TheOlderModesAliasesAreAsTheyCame(t *testing.T) {
+// An alias that is no host a v2 file takes is left out and the Ingress is
+// told; the others are served.
+func TestRender_TheOlderModesAliasesAreLeftOutWhenV2RefusesThem(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "u.yaml")
 	ing := routedIngress("aliased", ptr("synapse"), "www.example.com")
 	ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "*, www.*.example.com, alt.example.com"}
@@ -736,15 +741,11 @@ func TestRender_TheOlderModesAliasesAreAsTheyCame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, host := range []string{"*", "www.*.example.com", "alt.example.com", "www.example.com"} {
-		if !strings.Contains(string(rendered), fmt.Sprintf("\n  %q:\n", host)) {
-			t.Errorf("the file has no host %q\n%s", host, rendered)
-		}
+	if want := []string{"alt.example.com", "www.example.com"}; !slices.Equal(sortedKeys(parseV2(t, string(rendered)).Hosts), want) {
+		t.Errorf("the hosts are %q, want %q\n%s", sortedKeys(parseV2(t, string(rendered)).Hosts), want, rendered)
 	}
-	for len(events.Events) > 0 {
-		if event := <-events.Events; strings.Contains(event, " InvalidServerAlias ") {
-			t.Errorf("the Ingress was told: %s", event)
-		}
+	if got := eventsOf(events, "InvalidServerAlias"); len(got) != 2 {
+		t.Errorf("events = %q, want two InvalidServerAlias", got)
 	}
 }
 

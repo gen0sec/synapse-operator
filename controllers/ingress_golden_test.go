@@ -104,7 +104,7 @@ func renderOlderMode(t *testing.T, objs []client.Object) string {
 // for everyone who runs them, and has to be made on purpose.
 func TestOlderModes_OutputIsPinned(t *testing.T) {
 	passthrough := annotated(ingressIn("zzz", "raw", "raw.example.com", "/"), "ssl-passthrough", "true")
-	got := "# v1: no passthrough host\n" + renderOlderMode(t, olderModeObjects()) +
+	got := "# v2: no passthrough host\n" + renderOlderMode(t, olderModeObjects()) +
 		"# v2: a passthrough host\n" + renderOlderMode(t, append(olderModeObjects(), passthrough))
 
 	path := filepath.Join("testdata", "render", "older_mode.yaml")

@@ -254,8 +254,9 @@ func TestRender_CollectsIngressTLS(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dir, "app.example.com.crt")); string(b) != "C" {
 		t.Fatalf("empty-Hosts spec.tls must bind the rule host: %q", b)
 	}
-	if s, _ := os.ReadFile(out); !strings.Contains(string(s), "certificate: \"app.example.com\"") {
-		t.Fatalf("per-host certificate: not emitted:\n%s", s)
+	s, _ := os.ReadFile(out)
+	if got := parseV2(t, string(s)).Hosts["app.example.com"].TLS.Terminate; got == nil || got.Cert != "app.example.com" {
+		t.Fatalf("per-host certificate not emitted: terminate is %+v\n%s", got, s)
 	}
 }
 

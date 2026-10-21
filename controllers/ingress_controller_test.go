@@ -537,15 +537,16 @@ func TestRender_IngressACMESolverAndAnnotation(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	s, _ := os.ReadFile(out)
-	if strings.Contains(string(s), "internal_paths:") {
-		t.Fatalf("the file has internal_paths:\n%s", s)
+	doc := parseV2(t, string(s))
+	if len(doc.Internal) != 0 {
+		t.Fatalf("the file has internal paths:\n%s", s)
 	}
-	route, ok := parseV1(t, string(s)).Upstreams["app.example.com"].Paths["/.well-known/acme-challenge/tok"]
-	if !ok || route.Servers[0] != "solver.default.svc.cluster.local:8089" {
+	route, ok := doc.Hosts["app.example.com"].Paths["/.well-known/acme-challenge/tok"]
+	if !ok || route.Upstream != "solver.default.svc.cluster.local:8089" {
 		t.Fatalf("the solver is not a route of its host:\n%s", s)
 	}
-	if !strings.Contains(string(s), "read_timeout: 42") {
-		t.Fatalf("annotation not applied to route:\n%s", s)
+	if got := doc.Hosts["app.example.com"].Paths["/"].Timeouts.Read; got == nil || *got != 42 {
+		t.Fatalf("annotation not applied to route: read timeout is %v\n%s", got, s)
 	}
 }
 

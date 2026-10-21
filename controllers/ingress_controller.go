@@ -86,13 +86,6 @@ type IngressReconciler struct {
 	// for the long-running sidecar; off for the --render-once
 	// initContainer (synapse isn't running yet).
 	SignalReload bool
-	// UpstreamsV2 has the routes written in Synapse's v2 schema whatever is
-	// in them, saying what the v1 file said (renderModel.sameAsV1). The
-	// older modes go on writing v1 unless a host is passthrough: the
-	// Synapse they run beside may be one that takes a route chosen by an
-	// expression, or a host without a certificate, for an error in a v2
-	// file, and refuses the file.
-	UpstreamsV2 bool
 	// RenderExtra, when set, is called on every render with the routes and
 	// certificates of the Ingresses already in the model, to add its own
 	// before anything is written. It is how a SynapseProxy's Gateways get
@@ -309,26 +302,14 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		m.owners = resolveHostOwners(claims)
 	}
 
-	anyPassthrough := false
-	for _, o := range ours {
-		anyPassthrough = anyPassthrough || o.a.passthrough
-	}
-	v2Aliases := r.writesV2(anyPassthrough) || r.HostOwnership
-
 	for _, o := range ours {
 		ing, a := o.ing, o.a
 		refused := map[string]bool{}
 		allowed := func(host string) bool { return r.hostAllowed(logger, m, ing, host, refused) }
-		// An alias that is no host name is left out here. In a v2 file or
-		// under host ownership that is what hostKeyProblem says too; a v1
-		// file without ownership keeps `*`, the host of every name that
-		// has no other, and refuses only what would be a bogus host key.
-		// A passthrough Ingress makes the file v2, so it counts as v2 here.
+		// An alias that is no host name Synapse's v2 file takes is left out
+		// here, `*` and `www.*` included.
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
 			problem := hostProblem(alias)
-			if !v2Aliases {
-				problem = hostCharProblem(alias)
-			}
 			if alias == "" || problem == "" {
 				return false
 			}
@@ -418,14 +399,10 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				// render a synapse match_expr regex route (under the primary host
 				// and any server-aliases). Otherwise fall through to prefix/Exact.
 				if a.useRegex {
-					// For a proxy's file, as Synapse's engine will read it,
-					// or not at all: an expression it cannot compile is an
-					// error in a v2 file, and the file is every route there
-					// is. The older modes write it as it came.
-					written, err := path, error(nil)
-					if r.UpstreamsV2 {
-						written, err = canonicalRegex(path)
-					}
+					// As Synapse's engine will read it, or not at all: an
+					// expression it cannot compile is an error in a v2 file,
+					// and the file is every route there is.
+					written, err := canonicalRegex(path)
 					if err != nil {
 						logger.Info("regex path ignored: not a regular expression Synapse takes",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "error", err.Error())
@@ -545,17 +522,8 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	}
 	hosts += len(m.passthroughHosts)
 
-	// Schema selection: any SNI passthrough host forces v2 emission
-	// (the v1 schema has no passthrough representation). Otherwise
-	// keep emitting v1 so unrelated deployments see zero behaviour
-	// change.
-	var yaml string
-	if r.writesV2(len(m.passthroughHosts) > 0) {
-		m.sameAsV1 = r.UpstreamsV2
-		yaml = renderUpstreamsV2(m)
-	} else {
-		yaml = renderUpstreams(m)
-	}
+	m.sameAsV1 = true
+	yaml := renderUpstreamsV2(m)
 	var (
 		changed bool
 		err     error
@@ -968,11 +936,4 @@ func (p renderPrimer) Start(ctx context.Context) error {
 func (r *IngressReconciler) LogStartup(log logr.Logger) {
 	log.Info("synapse ingress controller",
 		"ingressClass", r.IngressClassName, "out", r.UpstreamsOutPath)
-}
-
-// writesV2 says whether the routes file is written in the v2 schema: always
-// with UpstreamsV2, otherwise only beside a passthrough host, which v1 cannot
-// represent.
-func (r *IngressReconciler) writesV2(passthrough bool) bool {
-	return r.UpstreamsV2 || passthrough
 }
