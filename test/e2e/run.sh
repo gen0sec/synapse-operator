@@ -61,6 +61,8 @@ diagnostics() {
     k get events --all-namespaces --sort-by=.lastTimestamp | tail -n 60
     echo "--- operator"
     k --namespace synapse-os logs deployment/synapse-operator --tail=200
+    echo "--- sidecar pod"
+    k --namespace e2e-edge logs deployment/sidecar --all-containers --prefix --tail=200
     k get pods --all-namespaces --selector synapse.gen0sec.com/proxy \
       --output 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' |
       while read -r namespace pod; do

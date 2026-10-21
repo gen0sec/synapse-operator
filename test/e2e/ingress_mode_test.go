@@ -508,11 +508,13 @@ func TestIngressMode(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
-			if strings.Contains(log, "SIGHUP failed") {
-				return "the signal was refused:\n" + log
+			for _, bad := range []string{"SIGHUP failed", "no target process found"} {
+				if strings.Contains(log, bad) {
+					return "the signal did not reach Synapse (" + bad + "):\n" + log
+				}
 			}
-			if !strings.Contains(log, "SIGHUP") {
-				return "no SIGHUP in the sidecar's log"
+			if !strings.Contains(log, "SIGHUP → reload") {
+				return "no \"SIGHUP → reload\" in the sidecar's log"
 			}
 			return ""
 		})
@@ -527,10 +529,15 @@ func TestIngressMode(t *testing.T) {
 		}
 		eventually(t, soon, "the late host stops answering", func() string {
 			a, err := c.get("http", lateHost)
-			if err == nil && a.status == http.StatusOK && a.backend == "api" {
+			if err != nil {
+				return err.Error()
+			}
+			if a.status == http.StatusOK && a.backend == "api" {
 				return "the late host still answers"
 			}
 			return ""
 		})
+		// Synapse is up, not gone: the others are served still.
+		eventually(t, soon, "the shop host answers after the removal", func() string { return c.routed("http", shopHost, "shop") })
 	})
 }
