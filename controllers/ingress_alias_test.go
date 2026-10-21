@@ -10,6 +10,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -132,5 +133,70 @@ func TestRender_V1WithOwnershipRefusesABareStarAlias(t *testing.T) {
 	}
 	if got := eventsOf(events, "InvalidServerAlias"); len(got) != 1 {
 		t.Errorf("events = %q, want one InvalidServerAlias", got)
+	}
+}
+
+// renderPromotable renders an Ingress with the given server-alias and, when
+// passthrough is set, a second Ingress with ssl-passthrough, in v1 mode
+// without host ownership.
+func renderPromotable(t *testing.T, alias string, passthrough bool) (string, *record.FakeRecorder) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	ing := routedIngress("aliased", ptr("synapse"), "www.example.com")
+	ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": alias}
+	objs := []client.Object{ing}
+	if passthrough {
+		pt := routedIngress("pass", ptr("synapse"), "tls.example.com")
+		pt.Annotations = map[string]string{"synapse.gen0sec.com/ssl-passthrough": "true"}
+		objs = append(objs, pt)
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
+	events := record.NewFakeRecorder(64)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out,
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), events
+}
+
+// A passthrough Ingress turns the whole v1 file into a v2 one, and v2 takes
+// no bare `*` or mid-name wildcard; without it the v1 file keeps them.
+func TestRender_APromotedV2FileTakesTheV2AliasRule(t *testing.T) {
+	for _, tc := range []struct{ name, alias, bad string }{
+		{"bare star", "*, ok.example.com", "*"},
+		{"mid wildcard", "www.*.example.com, ok.example.com", "www.*.example.com"},
+	} {
+		t.Run(tc.name+"/promoted", func(t *testing.T) {
+			rendered, events := renderPromotable(t, tc.alias, true)
+			if !strings.Contains(rendered, "version: 2") {
+				t.Fatalf("not a v2 file:\n%s", rendered)
+			}
+			if strings.Contains(rendered, fmt.Sprintf("\n  %q:\n", tc.bad)) {
+				t.Errorf("the v2 file has the host %q\n%s", tc.bad, rendered)
+			}
+			if !strings.Contains(rendered, "ok.example.com") {
+				t.Errorf("ok.example.com is not served\n%s", rendered)
+			}
+			if got := eventsOf(events, "InvalidServerAlias"); len(got) != 1 {
+				t.Errorf("events = %q, want one InvalidServerAlias", got)
+			}
+		})
+		t.Run(tc.name+"/not promoted", func(t *testing.T) {
+			rendered, events := renderPromotable(t, tc.alias, false)
+			if strings.Contains(rendered, "version: 2") {
+				t.Fatalf("a v2 file:\n%s", rendered)
+			}
+			if !strings.Contains(rendered, fmt.Sprintf("\n  %q:\n", tc.bad)) {
+				t.Errorf("the v1 file lost the host %q\n%s", tc.bad, rendered)
+			}
+			if got := eventsOf(events, "InvalidServerAlias"); len(got) != 0 {
+				t.Errorf("events = %q, want none", got)
+			}
+		})
 	}
 }
