@@ -207,7 +207,6 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		_ = k8s.Get(ctx, client.ObjectKeyFromObject(&class), &class)
 		return route.ResourceVersion + " " + gw.ResourceVersion + " " + class.ResourceVersion
 	}
-	quiet(t, "the objects settle after the first render", versions)
 	settled := versions()
 	time.Sleep(2 * time.Second)
 	if now := versions(); now != settled {
@@ -282,6 +281,22 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		}
 		return nil
 	}
+	// caughtUp says whether both proxies have written their entry for the
+	// route as it is now.
+	caughtUp := func() string {
+		for _, parent := range []string{"web", "side"} {
+			p := entry(ControllerName, parent)
+			if p == nil || len(p.Conditions) == 0 {
+				return fmt.Sprintf("for %s the route says %+v", parent, p)
+			}
+			for _, c := range p.Conditions {
+				if c.ObservedGeneration != route.Generation {
+					return fmt.Sprintf("for %s, %s says generation %d of %d", parent, c.Type, c.ObservedGeneration, route.Generation)
+				}
+			}
+		}
+		return ""
+	}
 	eventually(t, "each proxy speaks for its own Gateway", func() string {
 		for _, parent := range []string{"web", "side"} {
 			p := entry(ControllerName, parent)
@@ -310,29 +325,12 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		}
 		return strings.Join(names, ",")
 	}
+	// A write that lost a conflict is retried after a back-off, and the route
+	// is quiet until then: only its generation says the proxies are done.
+	eventually(t, "each proxy has caught up with the route", caughtUp)
 	// Every proxy looks again, at something that changes nothing for the
 	// route. Each leaves the list as it found it: one that put its own
 	// entries last would have the other do the same, on every pass.
-	// A write that lost a conflict is retried after a back-off, and the route
-	// is quiet until then: stability alone cannot tell that from done.
-	eventually(t, "each proxy has caught up with the route", func() string {
-		_ = order()
-		for _, p := range route.Status.Parents {
-			if string(p.ControllerName) != ControllerName {
-				continue
-			}
-			for _, c := range p.Conditions {
-				if c.ObservedGeneration != route.Generation {
-					return fmt.Sprintf("for %s, %s says generation %d of %d", p.ParentRef.Name, c.Type, c.ObservedGeneration, route.Generation)
-				}
-			}
-		}
-		return ""
-	})
-	quiet(t, "the route's status settles after the foreign entry", func() string {
-		_ = order()
-		return route.ResourceVersion
-	})
 	listed, version := order(), route.ResourceVersion
 	for i := range 3 {
 		change(t, k8s, far, func() { far.Annotations = map[string]string{"looked-at": strconv.Itoa(i)} })
