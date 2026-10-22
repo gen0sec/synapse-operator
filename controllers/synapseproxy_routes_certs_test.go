@@ -101,7 +101,7 @@ func TestProjectCertsToSecret_StaysUnderTheSizeOfASecret(t *testing.T) {
 		name := fmt.Sprintf("tls-%02d", i)
 		host := fmt.Sprintf("host-%02d.example.com", i)
 		objs = append(objs, tlsSecret("default", name, strings.Repeat("c", each), strings.Repeat("k", each)))
-		m.addCert(host, host, "default", name)
+		m.addCert(host, host, "default", name, nil)
 	}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
 	out := types.NamespacedName{Namespace: "synapse-os", Name: "edge-certs"}

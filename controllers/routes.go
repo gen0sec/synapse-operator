@@ -143,7 +143,10 @@ type annSettings struct {
 	// non-empty, addRoute writes a redirect-only route block.
 	redirectStatus   *uint64
 	redirectLocation string
-	sticky           bool
+	// redirectCodeRefused is a redirect code Synapse does not serve, as
+	// written; the route keeps the default status.
+	redirectCodeRefused string
+	sticky              bool
 	// useRegex mirrors nginx `nginx.ingress.kubernetes.io/use-regex: "true"`:
 	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
 	// regex routes rather than longest-prefix paths.
@@ -156,6 +159,9 @@ type certProjection struct {
 	stem string // file-stem == synapse cert name (usually the host)
 	ns   string // Secret namespace
 	name string // Secret name
+	// from is the object that references the Secret, the one an event about
+	// the certificate is recorded on.
+	from client.Object
 }
 
 type renderModel struct {
@@ -382,12 +388,12 @@ func hostKeyProblem(name string) string {
 // for projection as <stem>.crt/<stem>.key and (when host != "")
 // binds the host to that cert name in upstreams.yaml. First-writer-
 // wins per stem and per host so output is deterministic.
-func (m *renderModel) addCert(host, stem, ns, name string) {
+func (m *renderModel) addCert(host, stem, ns, name string, from client.Object) {
 	if stem == "" || ns == "" || name == "" {
 		return
 	}
 	if _, ok := m.certProjections[stem]; !ok {
-		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name}
+		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name, from: from}
 	}
 	if host != "" {
 		if _, ok := m.hostCert[host]; !ok {
@@ -693,6 +699,17 @@ func parseBool(s string) *bool {
 	return &v
 }
 
+// validRedirectStatus reports whether Synapse serves code as a redirect. It
+// reads the status as a u16 and refuses the whole file over a value it
+// cannot hold.
+func validRedirectStatus(code uint64) bool {
+	switch code {
+	case 301, 302, 303, 307, 308:
+		return true
+	}
+	return false
+}
+
 func parseUint(s string) *uint64 {
 	if n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err == nil {
 		return &n
@@ -868,13 +885,17 @@ func parseAnnotations(ann map[string]string) annSettings {
 		} else if v, ok := ann[nginxPrefix+codeKey]; ok {
 			codeStr = v
 		}
+		var refused string
 		if codeStr != "" {
-			if n := parseUint(codeStr); n != nil {
+			if n := parseUint(codeStr); n != nil && validRedirectStatus(*n) {
 				status = *n
+			} else {
+				refused = codeStr
 			}
 		}
 		s.redirectLocation = loc
 		s.redirectStatus = &status
+		s.redirectCodeRefused = refused
 	}
 	// temporal first so permanent can clobber it (permanent wins on tie)
 	pickRedirect("temporal-redirect", "temporal-redirect-code", 302)
