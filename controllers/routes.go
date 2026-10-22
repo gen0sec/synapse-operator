@@ -583,16 +583,32 @@ func canonicalRegex(re string) (string, error) {
 // A character outside ASCII that is simply to be matched is fine: it is the
 // same bytes on both sides.
 func asciiRegex(parsed *syntax.Regexp, written, source string) error {
-	var folded func(re *syntax.Regexp) bool
-	folded = func(re *syntax.Regexp) bool {
-		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 &&
-			slices.ContainsFunc(re.Rune, func(r rune) bool { return r > unicode.MaxASCII }) {
-			return true
+	// Under (?i) every rune of a literal keeps FoldCase, letter or not. A rune
+	// that cannot be printed and has no other case is left to the scan below,
+	// which names it as it does without (?i).
+	var folded func(re *syntax.Regexp) (found, letter bool)
+	folded = func(re *syntax.Regexp) (found, letter bool) {
+		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
+			for _, r := range re.Rune {
+				switch {
+				case r <= unicode.MaxASCII:
+				case unicode.SimpleFold(r) != r:
+					return true, true
+				case unicode.IsPrint(r):
+					found = true
+				}
+			}
 		}
-		return slices.ContainsFunc(re.Sub, folded)
+		for _, sub := range re.Sub {
+			f, l := folded(sub)
+			found, letter = found || f, letter || l
+		}
+		return found, letter
 	}
-	if folded(parsed) {
+	if found, letter := folded(parsed); letter {
 		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	} else if found {
+		return fmt.Errorf("a character outside ASCII cannot be matched without regard to case")
 	}
 	inClass := false
 	for i := 0; i < len(written); {

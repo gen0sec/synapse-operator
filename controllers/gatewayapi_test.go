@@ -1051,11 +1051,16 @@ func TestCanonicalRegex(t *testing.T) {
 // whether it was typed or written so. The reason names which it was.
 func TestCanonicalRegex_NonPrintableReason(t *testing.T) {
 	for re, want := range map[string]string{
-		"/a\u00a0b":    "a character outside ASCII that cannot be printed",
-		"/a\u00a0b|/c": "a character outside ASCII that cannot be printed",
-		`/x\x{a0}y`:    "a character outside ASCII cannot be written by its number",
-		`/x\x{80}y`:    "a character outside ASCII cannot be written by its number",
-		`/x\x{2028}y`:  "a character outside ASCII cannot be written by its number",
+		"/a\u00a0b":     "a character outside ASCII that cannot be printed",
+		"/a\u00a0b|/c":  "a character outside ASCII that cannot be printed",
+		`/x\x{a0}y`:     "a character outside ASCII cannot be written by its number",
+		`/x\x{80}y`:     "a character outside ASCII cannot be written by its number",
+		`/x\x{2028}y`:   "a character outside ASCII cannot be written by its number",
+		"/a |/b\u00a0":  "a character outside ASCII that cannot be printed",
+		"(?i)/a\u00a0b": "a character outside ASCII that cannot be printed",
+		"(?i)/a\u200bb": "a character outside ASCII that cannot be printed",
+		"(?i)/é":        "a letter outside ASCII cannot be matched without regard to case",
+		"(?i)/€":        "a character outside ASCII cannot be matched without regard to case",
 	} {
 		_, err := canonicalRegex(re)
 		if err == nil || err.Error() != want {
