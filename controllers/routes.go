@@ -638,7 +638,135 @@ func asciiRegex(parsed *syntax.Regexp, written, source string) error {
 		}
 		i += size
 	}
+	if hidden(source) {
+		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	}
 	return nil
+}
+
+// The markers stand in for the letters that Go's parser would write as ASCII
+// ones: U+017F and U+212A. They are in the private use area, so they have no
+// case of their own, and there are two so that the parser merges and factors
+// the swapped text as it does the source.
+const (
+	markerLongS  = '\ue000'
+	markerKelvin = '\ue001'
+)
+
+func isMarker(r rune) bool { return r == markerLongS || r == markerKelvin }
+
+// hidden reports whether source holds a case-folded literal of U+017F (long s)
+// or U+212A (Kelvin sign). The parser writes a folded literal as the lowest
+// rune of its fold orbit, so `(?i)ſ` comes back as `(?i:S)` and the written
+// form no longer shows the letter. The source is parsed again with the
+// letter replaced by a rune that has no case; a folded literal that holds it
+// is one that was hidden. It runs after the scan of the written form, so a
+// class the user wrote has been refused by then, and one that holds the
+// marker was made by merging literals, as in `(?i)s|ſ`.
+//
+// The letter is tracked in every form Go's parseEscape turns into a rune:
+//   - typed, also inside \Q...\E, where an escape is plain text;
+//   - \x{17f} with any number of digits, any case;
+//   - \x7f-style two digits, which cannot reach it, and octal \0 to \777,
+//     where \577 is U+017F;
+//   - \\, which is a backslash and so hides what follows from the escapes.
+//
+// A swap that no longer parses is refused: the letter was in a range.
+func hidden(source string) bool {
+	var b strings.Builder
+	changed, quoted := false, false
+	for i := 0; i < len(source); {
+		rest := source[i:]
+		r, size := utf8.DecodeRuneInString(rest)
+		switch {
+		case quoted && strings.HasPrefix(rest, `\E`):
+			quoted, size = false, 2
+		case quoted:
+		case strings.HasPrefix(rest, `\Q`):
+			quoted, size = true, 2
+		case r == '\\':
+			if v, n, ok := escapeRune(rest); ok {
+				size, r = n, v
+			} else {
+				_, n := utf8.DecodeRuneInString(rest[1:])
+				size += n
+			}
+		}
+		switch r {
+		case 0x17f:
+			r = markerLongS
+		case 0x212a:
+			r = markerKelvin
+		}
+		if isMarker(r) {
+			changed = true
+			b.WriteRune(r)
+		} else {
+			b.WriteString(rest[:size])
+		}
+		i += size
+	}
+	if !changed {
+		return false
+	}
+	parsed, err := syntax.Parse(b.String(), syntax.Perl)
+	if err != nil {
+		return true
+	}
+	var walk func(re *syntax.Regexp) bool
+	walk = func(re *syntax.Regexp) bool {
+		switch re.Op {
+		case syntax.OpLiteral:
+			if re.Flags&syntax.FoldCase != 0 && slices.ContainsFunc(re.Rune, isMarker) {
+				return true
+			}
+		case syntax.OpCharClass:
+			for i := 0; i+1 < len(re.Rune); i += 2 {
+				if re.Rune[i] == re.Rune[i+1] && isMarker(re.Rune[i]) {
+					return true
+				}
+			}
+		}
+		return slices.ContainsFunc(re.Sub, walk)
+	}
+	return walk(parsed)
+}
+
+// escapeRune reads the numeric escape at the start of s the way Go's
+// parseEscape does: \0 and up to two more octal digits, \1 to \7 followed by
+// an octal digit and up to one more, \xNN, and \x{...}. It gives the rune
+// and the length of the escape, or false if s does not start with one.
+func escapeRune(s string) (rune, int, bool) {
+	if len(s) < 2 {
+		return 0, 0, false
+	}
+	isOct := func(i int) bool { return i < len(s) && s[i] >= '0' && s[i] <= '7' }
+	switch c := s[1]; {
+	case c == '0' || c >= '1' && c <= '7' && isOct(2):
+		r, n := rune(c-'0'), 2
+		for ; n < 4 && isOct(n); n++ {
+			r = r*8 + rune(s[n]-'0')
+		}
+		return r, n, true
+	case c == 'x' && strings.HasPrefix(s, `\x{`):
+		var r rune
+		n := 3
+		for ; n < len(s) && s[n] != '}'; n++ {
+			v, err := strconv.ParseUint(s[n:n+1], 16, 8)
+			if err != nil || r > unicode.MaxRune {
+				return 0, 0, false
+			}
+			r = r*16 + rune(v)
+		}
+		if n == len(s) || n == 3 || r > unicode.MaxRune {
+			return 0, 0, false
+		}
+		return r, n + 1, true
+	case c == 'x' && len(s) >= 4:
+		v, err := strconv.ParseUint(s[2:4], 16, 8)
+		return rune(v), 4, err == nil
+	}
+	return 0, 0, false
 }
 
 // addRegexRoute records a regex path route: it is matched by `match_expr`

@@ -1072,6 +1072,33 @@ func TestCanonicalRegex_NonPrintableReason(t *testing.T) {
 	}
 }
 
+// The parser writes a case-folded literal as the lowest rune of its fold
+// orbit, so (?i)ſ and (?i)K are written (?i:S) and (?i:K). They are still
+// letters outside ASCII, and are refused as such.
+func TestCanonicalRegex_FoldedToASCIIIsStillNonASCII(t *testing.T) {
+	const letter = "a letter outside ASCII cannot be matched without regard to case"
+	for _, re := range []string{
+		"(?i)/\u017f", "(?i)/\u212a", "(?i)/a\u017fb", "(?i:\u017f)",
+		`(?i)/\x{17f}`, `(?i)/\x{212A}`, `(?i)/a\x{017f}b`, `(?i)/\577`, `(?i)/a\577b`, `(?i)/\x{0212a}`,
+		"(?i)\u017f[^\\x{80}-\\x{17e}\u017f-\\x{1000}\\x{1001}-\\x{10ffff}]", "(?i)s|\u017f", "(?i)\u017f|s", "(?i)(?:\u017f|s)", "(?i)\\Q\u017f\\E", "(?i)/a\u017f+",
+	} {
+		_, err := canonicalRegex(re)
+		if err == nil || err.Error() != letter {
+			t.Errorf("canonicalRegex(%q) error = %v; want %q", re, err, letter)
+		}
+	}
+	if _, err := canonicalRegex("(?i)[\u017f]"); err == nil || err.Error() != "a character class cannot hold a character outside ASCII" {
+		t.Errorf("canonicalRegex((?i)[ſ]) error = %v; want the class refusal it has always had", err)
+	}
+	for _, re := range []string{
+		"(?i)/s", "(?i)/k", "(?i)/S", `(?i)/\x{73}`, "/\u017f", "(?i)a(?-i)\u017f", `(?i)/\57`, `(?i)\0577`, `(?i)/\x{2f}`, `(?i)/\\577`, "(?i)/s(?-i)\u017f", `(?i)\\x{17f}`, `(?i)\Q\x{17f}\E`, "\u017f\u017f|\u212ax", "\u017fx|\u212a\u017f",
+	} {
+		if _, err := canonicalRegex(re); err != nil {
+			t.Errorf("canonicalRegex(%q) = %v; want it accepted", re, err)
+		}
+	}
+}
+
 func TestGateway_ARegularExpressionTooLargeIsRefused(t *testing.T) {
 	// A class is written out as the ranges it stands for, and \pL is tens of
 	// kilobytes of them, in every route that has to exclude this one.
