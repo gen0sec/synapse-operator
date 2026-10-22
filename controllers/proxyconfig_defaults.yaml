@@ -40,7 +40,7 @@ platform:
 
 proxy:
   # The certificate served when no other matches the requested name.
-  default_certificate: default
+  default_certificate: _default
   # HTTP/2 without TLS on the HTTP listeners.
   h2c: true
   captcha:

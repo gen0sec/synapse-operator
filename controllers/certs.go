@@ -3,11 +3,22 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -41,13 +52,118 @@ const ingressCertsManagedLabel = "synapse.gen0sec.com/ingress-certs"
 // certStem picks the file-stem (== synapse cert name) for a host's
 // Secret. A concrete host binds 1:1 (enables the strong name_map
 // exact-match + upstreams_cert_map paths). Wildcard / no-host certs
-// get a Secret-derived stem and rely on synapse's wildcard SAN match
+// get a Secret-derived stem, "<ns>_<secret>": "_" cannot appear in a
+// namespace or Secret name, so two stems never collide ("-" joined ns
+// "a" + Secret "b-c" and ns "a-b" + Secret "c" into one). They rely
+// on synapse's wildcard SAN match
 // (host == "" ⇒ caller must not set a per-host upstreams binding).
 func certStem(host, ns, secret string) (stem string, hostBound bool) {
 	if host != "" && !strings.HasPrefix(host, "*.") {
-		return sanitizeStem(host), true
+		hostBound = true
+		stem = sanitizeStem(host)
+		if reservedCertStems[stem] {
+			stem = sanitizeStem(ns + "_" + secret)
+		}
+	} else {
+		stem = sanitizeStem(ns + "_" + secret)
 	}
-	return sanitizeStem(ns + "-" + secret), false
+	return fitStem(stem), hostBound
+}
+
+// reservedCertStems are the file stems Synapse does not take at face value.
+// For fullchain, cert and chain, cert_logical_name takes the parent
+// directory's name instead. "default" was the operator's default_certificate
+// before defaultCertStem, and a spec.config or --ingress-mode config may still
+// name it; a host of that name would then become the certificate for every
+// name no other certificate matches. defaultCertStem is the operator's own.
+var reservedCertStems = map[string]bool{"fullchain": true, "cert": true, "chain": true, "default": true, defaultCertStem: true}
+
+// defaultCertStem is the stem of the certificate the operator generates
+// itself. No host can have it: a DNS name does not start with "_", and
+// "<namespace>_<secret>" starts with a namespace.
+const defaultCertStem = "_default"
+
+const (
+	defaultCertCN       = "synapse-default"
+	defaultCertValidity = 365 * 24 * time.Hour
+	// defaultCertRenewBefore is how close to its expiry the default
+	// certificate is replaced.
+	defaultCertRenewBefore = 30 * 24 * time.Hour
+	// defaultCertReserve is room kept in the certificates Secret for the
+	// default certificate and its key (about 1 KiB of PEM).
+	defaultCertReserve = 2000
+)
+
+func (r *IngressReconciler) now() time.Time {
+	if r.Clock != nil {
+		return r.Clock()
+	}
+	return time.Now()
+}
+
+// defaultCertificate returns the operator's own certificate: the one given if
+// it is a usable pair with more than defaultCertRenewBefore left, otherwise a
+// new self-signed one. Synapse serves it for every name no other certificate
+// matches (proxy.default_certificate), so that name never falls to a tenant's
+// certificate, which is what Synapse does when the named one is missing.
+func defaultCertificate(crt, key []byte, now time.Time) (newCrt, newKey []byte, err error) {
+	if usableDefaultCert(crt, key, now) {
+		return crt, key, nil
+	}
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
+	if err != nil {
+		return nil, nil, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: defaultCertCN},
+		// An hour back, so a node whose clock is a little behind accepts it.
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(defaultCertValidity),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), nil
+}
+
+func usableDefaultCert(crt, key []byte, now time.Time) bool {
+	pair, err := tls.X509KeyPair(crt, key)
+	if err != nil || len(pair.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return false
+	}
+	return leaf.NotAfter.Sub(now) >= defaultCertRenewBefore
+}
+
+// maxCertStem is the longest stem whose <stem>.crt is a valid Secret key and
+// file name.
+const maxCertStem = validation.DNS1123SubdomainMaxLength - len(".crt")
+
+// fitStem shortens a stem longer than maxCertStem to its head and a hash of
+// the whole. A collision of the 64-bit hash is not handled.
+func fitStem(stem string) string {
+	if len(stem) <= maxCertStem {
+		return stem
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return stem[:maxCertStem-17] + "_" + hex.EncodeToString(sum[:])[:16]
 }
 
 func sanitizeStem(s string) string {
@@ -93,11 +209,20 @@ func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (cha
 		for _, stem := range stems {
 			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
 		}
+		defaultNotWritten(logger, fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
 		mCerts.Set(0)
-		return false, 0, len(stems), nil
+		return false, 0, len(stems) + 1, nil
 	}
 
 	want := map[string]struct{}{} // stems successfully projected
+	dch, dfailed := r.projectDefaultCert(logger)
+	changed = dch
+	if dfailed {
+		failed++
+	}
+	if !dfailed || certPairExists(r.CertsOutDir, defaultCertStem) {
+		want[defaultCertStem] = struct{}{} // the last good pair keeps serving
+	}
 	for _, stem := range stems {
 		cp := m.certProjections[stem]
 		var sec corev1.Secret
@@ -136,8 +261,13 @@ func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (cha
 		changed = true
 		logger.Info("pruned stale operator-managed cert files", "count", pruned)
 	}
-	mCerts.Set(float64(len(want)))
-	return changed, len(want), failed, nil
+	// The default certificate is the operator's, not a projected Secret.
+	n := len(want)
+	if _, ok := want[defaultCertStem]; ok {
+		n--
+	}
+	mCerts.Set(float64(n))
+	return changed, n, failed, nil
 }
 
 func certPairExists(dir, stem string) bool {
@@ -202,8 +332,16 @@ func writeCertPair(dir, stem string, crt, key []byte) (bool, error) {
 // Kubernetes atomic-update marker (synapse-utils tools.rs
 // reload_relevant_path): creating the file triggers a rescan even
 // though the rename that follows is invisible to it. The name does not end
-// in .crt or .key, so the loader never reads it, and prune removes it.
-func certTempName(stem, ext string) string { return ".." + stem + ext + ".tmp" }
+// in .crt or .key, so the loader never reads it, and prune removes it. A stem
+// too long to stage under its own name is staged under a hash of it.
+func certTempName(stem, ext string) string {
+	name := ".." + stem + ext + ".tmp"
+	if len(name) <= 255 { // a file name limit; the longest stem is 249
+		return name
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return ".." + hex.EncodeToString(sum[:8]) + ext + ".tmp"
+}
 
 // certNotWritten records a certificate that could not be written to
 // CertsOutDir. kept says whether a pair from an earlier render is still on
@@ -218,6 +356,36 @@ func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection
 	mCertErrors.Inc()
 	r.emit(cp.from, corev1.EventTypeWarning, "CertificateNotWritten",
 		"certificate %s from Secret %s/%s could not be written: %v", cp.stem, cp.ns, cp.name, err)
+}
+
+// defaultNotWritten records the default certificate as not written. It has no
+// referencing object, so there is no Event. kept says whether a pair from an
+// earlier render is still on disk.
+func defaultNotWritten(logger logr.Logger, err error, kept bool) {
+	outcome := "hosts without a certificate get none"
+	if kept {
+		outcome = "the previous pair stays in place"
+	}
+	logger.Error(err, "default TLS cert not written ("+outcome+")", "stem", defaultCertStem)
+	mCertErrors.Inc()
+}
+
+// projectDefaultCert keeps <defaultCertStem>.crt/.key in CertsOutDir, a pair
+// that is generated again only when defaultCertificate says so. Like a
+// tenant's certificate it is not allowed to fail the render: on an error the
+// pair on disk stays, and failed tells the caller to retry.
+func (r *IngressReconciler) projectDefaultCert(logger logr.Logger) (changed, failed bool) {
+	curCrt, _ := os.ReadFile(filepath.Join(r.CertsOutDir, defaultCertStem+".crt"))
+	curKey, _ := os.ReadFile(filepath.Join(r.CertsOutDir, defaultCertStem+".key"))
+	crt, key, err := defaultCertificate(curCrt, curKey, r.now())
+	if err == nil {
+		changed, err = writeCertPair(r.CertsOutDir, defaultCertStem, crt, key)
+	}
+	if err != nil {
+		defaultNotWritten(logger, err, certPairExists(r.CertsOutDir, defaultCertStem))
+		return false, true
+	}
+	return changed, false
 }
 
 // maxCertsSecretBytes is how much certificate material goes into the output
@@ -247,7 +415,7 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 	sort.Strings(stems)
 
 	data := map[string][]byte{}
-	size := 0
+	size := defaultCertReserve
 	for _, stem := range stems {
 		cp := m.certProjections[stem]
 		// A Secret that the API server refuses takes every certificate with
@@ -302,8 +470,20 @@ func (r *IngressReconciler) projectCertsToSecret(ctx context.Context, m *renderM
 		}
 		out.Labels[ingressCertsManagedLabel] = "true"
 		out.Type = corev1.SecretTypeOpaque
-		if !bytesMapEqual(out.Data, data) {
-			out.Data = data
+		// The Data is replaced wholesale, so the default certificate is
+		// carried over from the current one here.
+		crt, key, err := defaultCertificate(out.Data[defaultCertStem+".crt"], out.Data[defaultCertStem+".key"], r.now())
+		if err != nil {
+			return fmt.Errorf("default certificate: %w", err)
+		}
+		full := make(map[string][]byte, len(data)+2)
+		for k, v := range data {
+			full[k] = v
+		}
+		full[defaultCertStem+".crt"] = crt
+		full[defaultCertStem+".key"] = key
+		if !bytesMapEqual(out.Data, full) {
+			out.Data = full
 			changed = true
 		}
 		return nil

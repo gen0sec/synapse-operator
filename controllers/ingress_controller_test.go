@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -411,7 +412,7 @@ func TestPublishStatus(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing).
 		WithStatusSubresource(&networkingv1.Ingress{}).Build()
 	r := &IngressReconciler{Client: c}
-	r.publishStatus(context.Background(), []*networkingv1.Ingress{ing})
+	r.publishStatus(context.Background(), []*networkingv1.Ingress{ing}, nil)
 	if len(ing.Status.LoadBalancer.Ingress) != 0 {
 		t.Fatal("no StatusAddresses ⇒ must not publish")
 	}
@@ -420,7 +421,7 @@ func TestPublishStatus(t *testing.T) {
 	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(ing2).
 		WithStatusSubresource(&networkingv1.Ingress{}).Build()
 	r2 := &IngressReconciler{Client: c2, StatusAddresses: []string{"203.0.113.7", "lb.example.com"}}
-	r2.publishStatus(context.Background(), []*networkingv1.Ingress{ing2})
+	r2.publishStatus(context.Background(), []*networkingv1.Ingress{ing2}, nil)
 	got := ing2.Status.LoadBalancer.Ingress
 	if len(got) != 2 || got[0].IP != "203.0.113.7" || got[0].Hostname != "" ||
 		got[1].Hostname != "lb.example.com" || got[1].IP != "" {
@@ -1158,6 +1159,62 @@ func TestParseAnnotations_Redirect(t *testing.T) {
 	}
 }
 
+// Synapse reads a redirect status as a u16 and refuses the whole file over
+// a value it cannot hold, so only the codes it serves are kept.
+func TestParseAnnotations_RedirectCodeRange(t *testing.T) {
+	for _, kind := range []struct {
+		key  string
+		want uint64
+	}{{"permanent-redirect", 301}, {"temporal-redirect", 302}} {
+		for _, prefix := range []string{annPrefix, nginxPrefix} {
+			for _, bad := range []string{"70000", "65536", "200", "404", "0", "-1", "abc"} {
+				a := parseAnnotations(map[string]string{
+					prefix + kind.key:           "/to",
+					prefix + kind.key + "-code": bad,
+				})
+				if a.redirectStatus == nil || *a.redirectStatus != kind.want {
+					t.Errorf("%s%s-code %q: status %v, want the default %d", prefix, kind.key, bad, a.redirectStatus, kind.want)
+				}
+				if a.redirectCodeRefused != bad {
+					t.Errorf("%s%s-code %q: refused value %q", prefix, kind.key, bad, a.redirectCodeRefused)
+				}
+			}
+			for _, good := range []uint64{301, 302, 303, 307, 308} {
+				a := parseAnnotations(map[string]string{
+					prefix + kind.key:           "/to",
+					prefix + kind.key + "-code": strconv.FormatUint(good, 10),
+				})
+				if a.redirectStatus == nil || *a.redirectStatus != good || a.redirectCodeRefused != "" {
+					t.Errorf("%s%s-code %d: status %v, refused %q", prefix, kind.key, good, a.redirectStatus, a.redirectCodeRefused)
+				}
+			}
+		}
+	}
+}
+
+// When both redirects are set, the permanent one wins, and the refused value
+// is the winner's own.
+func TestParseAnnotations_RedirectCodeRefusedBelongsToTheWinner(t *testing.T) {
+	a := parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":       "/t",
+		annPrefix + "temporal-redirect-code":  "abc",
+		annPrefix + "permanent-redirect":      "/p",
+		annPrefix + "permanent-redirect-code": "308",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 308 || a.redirectCodeRefused != "" {
+		t.Errorf("temporal abc + permanent 308: status %v, refused %q", a.redirectStatus, a.redirectCodeRefused)
+	}
+	a = parseAnnotations(map[string]string{
+		annPrefix + "temporal-redirect":       "/t",
+		annPrefix + "temporal-redirect-code":  "307",
+		annPrefix + "permanent-redirect":      "/p",
+		annPrefix + "permanent-redirect-code": "70000",
+	})
+	if a.redirectStatus == nil || *a.redirectStatus != 301 || a.redirectCodeRefused != "70000" {
+		t.Errorf("temporal 307 + permanent 70000: status %v, refused %q", a.redirectStatus, a.redirectCodeRefused)
+	}
+}
+
 // renderUpstreams emits a redirect: block on the route when set, both
 // in v1 emission and v2 emission. Verified separately for each.
 func TestRenderUpstreams_RedirectEmitted(t *testing.T) {
@@ -1217,5 +1274,46 @@ func TestRenderUpstreams_MaxBodySizeEmitted(t *testing.T) {
 	out2 := renderUpstreams(m2)
 	if strings.Contains(out2, "max_body_size") {
 		t.Fatalf("unannotated route emitted max_body_size:\n%s", out2)
+	}
+}
+
+// An Ingress the proxy serves none of publishes no address, and loses one it
+// had; one it serves in part keeps its address.
+func TestPublishStatus_RefusedIngressLosesItsAddress(t *testing.T) {
+	had := []networkingv1.IngressLoadBalancerIngress{{IP: "203.0.113.7"}}
+	mk := func(name string) *networkingv1.Ingress {
+		i := &networkingv1.Ingress{}
+		i.Name, i.Namespace = name, "default"
+		i.Status.LoadBalancer.Ingress = had
+		return i
+	}
+	served, refused := mk("served"), mk("refused")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(served, refused).
+		WithStatusSubresource(&networkingv1.Ingress{}).Build()
+	r := &IngressReconciler{Client: c, StatusAddresses: []string{"203.0.113.7"}}
+	r.publishStatus(context.Background(), []*networkingv1.Ingress{served}, []*networkingv1.Ingress{refused})
+	get := func(name string) []networkingv1.IngressLoadBalancerIngress {
+		var got networkingv1.Ingress
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status.LoadBalancer.Ingress
+	}
+	if got := get("served"); len(got) != 1 || got[0].IP != "203.0.113.7" {
+		t.Errorf("served status = %+v, want its address kept", got)
+	}
+	if got := get("refused"); len(got) != 0 {
+		t.Errorf("refused status = %+v, want no address", got)
+	}
+
+	// A non-leader writes nothing, refused or not.
+	r.IsLeader = func() bool { return false }
+	other := mk("other")
+	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(other).
+		WithStatusSubresource(&networkingv1.Ingress{}).Build()
+	r.Client = c2
+	r.publishStatus(context.Background(), nil, []*networkingv1.Ingress{other})
+	if len(other.Status.LoadBalancer.Ingress) != 1 {
+		t.Errorf("a non-leader cleared a status: %+v", other.Status.LoadBalancer.Ingress)
 	}
 }
