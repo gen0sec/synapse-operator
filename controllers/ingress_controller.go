@@ -176,13 +176,17 @@ func (r *IngressReconciler) usesConfigMapOutput() bool {
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
-	changed, n, h, err := r.render(ctx)
+	var certsFailed int
+	changed, n, h, err := r.renderCounting(ctx, &certsFailed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if changed {
 		logger.Info("rendered synapse upstreams",
 			"ingresses", n, "hosts", h, "path", r.UpstreamsOutPath)
+	}
+	if certsFailed > 0 {
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -203,6 +207,13 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
+	return r.renderCounting(ctx, new(int))
+}
+
+// renderCounting is render that also reports in *certsFailed how many
+// certificates it could not write. The caller owns the count, so renders that
+// run at the same time cannot hide each other's failures.
+func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int) (bool, int, int, error) {
 	mRenderTotal.Inc()
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
@@ -279,14 +290,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			}
 			if len(hosts) == 0 {
 				stem, _ := certStem("", ing.Namespace, t.SecretName)
-				m.addCert("", stem, ing.Namespace, t.SecretName)
+				m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				continue
 			}
 			for _, h := range hosts {
 				if stem, bound := certStem(h, ing.Namespace, t.SecretName); bound {
-					m.addCert(h, stem, ing.Namespace, t.SecretName)
+					m.addCert(h, stem, ing.Namespace, t.SecretName, ing)
 				} else {
-					m.addCert("", stem, ing.Namespace, t.SecretName)
+					m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				}
 			}
 		}
@@ -450,9 +461,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			mRenderErrTotal.Inc()
 			return false, matched, len(m.hosts), fmt.Errorf("project certs to secret: %w", cerr)
 		}
-	} else if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
+	} else if _, _, failed, cerr := r.writeCerts(ctx, m); cerr != nil {
 		mRenderErrTotal.Inc()
 		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
+	} else {
+		*certsFailed = failed
 	}
 
 	hosts, routes := 0, 0
@@ -693,7 +706,7 @@ const acmeChallengePrefix = "/.well-known/acme-challenge"
 // (synapse-utils filewatch.rs `is_reload_event`) matches
 // Modify(Name) alongside Modify(Data)/Create/Remove, so a rename IS
 // seen. (The CERT watcher is the one that ignores renames — see
-// writeFileIfChanged in certs.go.) The reload is additionally driven
+// certTempName in certs.go.) The reload is additionally driven
 // explicitly by SIGHUP (see signalReload), which makes the re-read
 // deterministic and bypasses the watcher's content-digest gate.
 func writeIfChanged(path, content string) (bool, error) {

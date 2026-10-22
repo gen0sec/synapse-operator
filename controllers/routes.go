@@ -159,6 +159,9 @@ type certProjection struct {
 	stem string // file-stem == synapse cert name (usually the host)
 	ns   string // Secret namespace
 	name string // Secret name
+	// from is the object that references the Secret, the one an event about
+	// the certificate is recorded on.
+	from client.Object
 }
 
 type renderModel struct {
@@ -385,12 +388,12 @@ func hostKeyProblem(name string) string {
 // for projection as <stem>.crt/<stem>.key and (when host != "")
 // binds the host to that cert name in upstreams.yaml. First-writer-
 // wins per stem and per host so output is deterministic.
-func (m *renderModel) addCert(host, stem, ns, name string) {
+func (m *renderModel) addCert(host, stem, ns, name string, from client.Object) {
 	if stem == "" || ns == "" || name == "" {
 		return
 	}
 	if _, ok := m.certProjections[stem]; !ok {
-		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name}
+		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name, from: from}
 	}
 	if host != "" {
 		if _, ok := m.hostCert[host]; !ok {

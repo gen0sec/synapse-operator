@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,15 +66,21 @@ func sanitizeStem(s string) string {
 // prunes operator-managed cert files no longer referenced. Returns
 // (changed, projected, err). CertsOutDir == "" disables multi-cert
 // (legacy single static-mount behavior). A missing / non-TLS Secret
-// is skipped (logged + metric) without failing the whole render.
+// is skipped (logged + metric) without failing the whole render, and so
+// is a certificate that cannot be written: a stem that has a pair on disk
+// keeps it, one that has not is left out.
 func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (bool, int, error) {
+	changed, n, _, err := r.writeCerts(ctx, m)
+	return changed, n, err
+}
+
+// writeCerts is projectCerts that also returns how many certificates it
+// could not write, for the caller to retry on.
+func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (changed bool, projected, failed int, err error) {
 	if r.CertsOutDir == "" {
-		return false, 0, nil
+		return false, 0, 0, nil
 	}
 	logger := ctrl.LoggerFrom(ctx).WithName("certs")
-	if err := os.MkdirAll(r.CertsOutDir, 0o755); err != nil {
-		return false, 0, fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err)
-	}
 
 	// Deterministic order so logs/behavior are reproducible.
 	stems := make([]string, 0, len(m.certProjections))
@@ -82,7 +89,14 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 	}
 	sort.Strings(stems)
 
-	changed := false
+	if err := os.MkdirAll(r.CertsOutDir, 0o755); err != nil {
+		for _, stem := range stems {
+			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
+		}
+		mCerts.Set(0)
+		return false, 0, len(stems), nil
+	}
+
 	want := map[string]struct{}{} // stems successfully projected
 	for _, stem := range stems {
 		cp := m.certProjections[stem]
@@ -101,18 +115,17 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 			mCertErrors.Inc()
 			continue
 		}
-		// Write key BEFORE crt: synapse's dir scan keys on <stem>.crt
-		// and only pairs when <stem>.key already exists, so the crt
-		// write is the last step that makes the pair loadable.
-		kch, err := writeFileIfChanged(filepath.Join(r.CertsOutDir, stem+".key"), key, 0o600)
+		pch, err := writeCertPair(r.CertsOutDir, stem, crt, key)
 		if err != nil {
-			return changed, len(want), fmt.Errorf("write %s.key: %w", stem, err)
+			kept := certPairExists(r.CertsOutDir, stem)
+			r.certNotWritten(logger, cp, err, kept)
+			failed++
+			if kept {
+				want[stem] = struct{}{} // the last good pair keeps serving
+			}
+			continue
 		}
-		cch, err := writeFileIfChanged(filepath.Join(r.CertsOutDir, stem+".crt"), crt, 0o644)
-		if err != nil {
-			return changed, len(want), fmt.Errorf("write %s.crt: %w", stem, err)
-		}
-		if kch || cch {
+		if pch {
 			changed = true
 			logger.Info("projected TLS cert", "stem", stem, "secret", cp.ns+"/"+cp.name)
 		}
@@ -124,7 +137,87 @@ func (r *IngressReconciler) projectCerts(ctx context.Context, m *renderModel) (b
 		logger.Info("pruned stale operator-managed cert files", "count", pruned)
 	}
 	mCerts.Set(float64(len(want)))
-	return changed, len(want), nil
+	return changed, len(want), failed, nil
+}
+
+func certPairExists(dir, stem string) bool {
+	for _, ext := range []string{".key", ".crt"} {
+		if fi, err := os.Stat(filepath.Join(dir, stem+ext)); err != nil || !fi.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+// writeCertPair makes <stem>.key and <stem>.crt hold key and crt. Both are
+// staged first and renamed into place after, so a failure to write leaves the
+// pair that was there. A file whose content is already right is not touched.
+// A rename that fails after the key moved puts the old key back, or removes
+// the new one when there was none.
+func writeCertPair(dir, stem string, crt, key []byte) (bool, error) {
+	type file struct {
+		ext     string
+		content []byte
+		mode    os.FileMode
+	}
+	// Key BEFORE crt: synapse's dir scan keys on <stem>.crt and only pairs
+	// when <stem>.key exists, so the crt rename is what makes the pair loadable.
+	var todo []file
+	for _, f := range []file{{".key", key, 0o600}, {".crt", crt, 0o644}} {
+		if cur, err := os.ReadFile(filepath.Join(dir, stem+f.ext)); err == nil && string(cur) == string(f.content) {
+			continue
+		}
+		todo = append(todo, f)
+	}
+	if len(todo) == 0 {
+		return false, nil
+	}
+	for _, f := range todo {
+		defer os.Remove(filepath.Join(dir, certTempName(stem, f.ext)))
+	}
+	for _, f := range todo {
+		if err := os.WriteFile(filepath.Join(dir, certTempName(stem, f.ext)), f.content, f.mode); err != nil {
+			return false, fmt.Errorf("stage %s%s: %w", stem, f.ext, err)
+		}
+	}
+	oldKey, oldKeyErr := os.ReadFile(filepath.Join(dir, stem+".key"))
+	for i, f := range todo {
+		if err := os.Rename(filepath.Join(dir, certTempName(stem, f.ext)), filepath.Join(dir, stem+f.ext)); err != nil {
+			if i > 0 { // the key was moved, the certificate was not
+				keyPath := filepath.Join(dir, stem+".key")
+				if oldKeyErr != nil {
+					os.Remove(keyPath)
+				} else if os.WriteFile(filepath.Join(dir, certTempName(stem, ".key")), oldKey, 0o600) == nil {
+					os.Rename(filepath.Join(dir, certTempName(stem, ".key")), keyPath)
+				}
+			}
+			return false, fmt.Errorf("write %s%s: %w", stem, f.ext, err)
+		}
+	}
+	return true, nil
+}
+
+// certTempName is where a certificate file is staged before it is renamed
+// into place. The ".." prefix is what synapse's cert watcher treats as a
+// Kubernetes atomic-update marker (synapse-utils tools.rs
+// reload_relevant_path): creating the file triggers a rescan even
+// though the rename that follows is invisible to it. The name does not end
+// in .crt or .key, so the loader never reads it, and prune removes it.
+func certTempName(stem, ext string) string { return ".." + stem + ext + ".tmp" }
+
+// certNotWritten records a certificate that could not be written to
+// CertsOutDir. kept says whether a pair from an earlier render is still on
+// disk and keeps serving; if not, the host falls back to the default.
+func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection, err error, kept bool) {
+	outcome := "host will fall back to default"
+	if kept {
+		outcome = "the previous pair stays in place"
+	}
+	logger.Error(err, "TLS cert not written; skipping ("+outcome+")",
+		"secret", cp.ns+"/"+cp.name, "stem", cp.stem)
+	mCertErrors.Inc()
+	r.emit(cp.from, corev1.EventTypeWarning, "CertificateNotWritten",
+		"certificate %s from Secret %s/%s could not be written: %v", cp.stem, cp.ns, cp.name, err)
 }
 
 // maxCertsSecretBytes is how much certificate material goes into the output
@@ -246,34 +339,6 @@ func bytesMapEqual(a, b map[string][]byte) bool {
 		}
 	}
 	return true
-}
-
-// writeFileIfChanged writes content IN PLACE (no tmp+rename) only when
-// it differs. In-place is REQUIRED here, not a shortcut: synapse's
-// cert watcher (synapse-utils tools.rs `watch_folder`) only re-scans on
-// inotify Create / Modify(Data) / Remove and IGNORES rename/MOVED_TO.
-// (The UPSTREAMS filewatch does NOT share this limitation — its
-// is_reload_event matches Modify(Name) too, which is why
-// writeIfChanged in ingress_controller.go can write atomically.)
-// An atomic
-// tmp+rename lands as Modify(Name) and would be invisible at runtime —
-// the cert would never load until a process restart. A plain create
-// fires Create; an overwrite fires Modify(Data); a prune fires Remove
-// — all honored. Partial-write safety is the watcher's own job: it
-// sleeps 500ms after an event before re-scanning ("so both .crt and
-// .key are fully written") and only pairs files that parse, so a torn
-// read is simply retried on the next event while existing SslContexts
-// keep serving (no 502 — unlike the upstreams torn-read case). Writing
-// only on a real content change avoids needless inotify churn /
-// Certificates rebuilds.
-func writeFileIfChanged(path string, content []byte, mode os.FileMode) (bool, error) {
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == string(content) {
-		return false, nil
-	}
-	if err := os.WriteFile(path, content, mode); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // pruneCerts removes <stem>.crt/<stem>.key (and stray .tmp) for stems

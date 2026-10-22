@@ -85,9 +85,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					ns = string(*cr.Namespace)
 				}
 				if stem, bound := certStem(host, ns, string(cr.Name)); bound {
-					m.addCert(host, stem, ns, string(cr.Name))
+					m.addCert(host, stem, ns, string(cr.Name), gw)
 				} else {
-					m.addCert("", stem, ns, string(cr.Name))
+					m.addCert("", stem, ns, string(cr.Name), gw)
 				}
 			}
 		}

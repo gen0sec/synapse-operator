@@ -496,9 +496,9 @@ func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel
 	}
 	for _, c := range certificates {
 		if stem, hostBound := certStem(host, c.namespace, c.name); hostBound {
-			m.addCert(host, stem, c.namespace, c.name)
+			m.addCert(host, stem, c.namespace, c.name, gw)
 		} else {
-			m.addCert("", stem, c.namespace, c.name)
+			m.addCert("", stem, c.namespace, c.name, gw)
 		}
 	}
 	return finish(gwv1.ListenerReasonAccepted, "served by the proxy", false)
