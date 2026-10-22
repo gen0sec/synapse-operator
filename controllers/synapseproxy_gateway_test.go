@@ -281,6 +281,22 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		}
 		return nil
 	}
+	// caughtUp says whether both proxies have written their entry for the
+	// route as it is now.
+	caughtUp := func() string {
+		for _, parent := range []string{"web", "side"} {
+			p := entry(ControllerName, parent)
+			if p == nil || len(p.Conditions) == 0 {
+				return fmt.Sprintf("for %s the route says %+v", parent, p)
+			}
+			for _, c := range p.Conditions {
+				if c.ObservedGeneration != route.Generation {
+					return fmt.Sprintf("for %s, %s says generation %d of %d", parent, c.Type, c.ObservedGeneration, route.Generation)
+				}
+			}
+		}
+		return ""
+	}
 	eventually(t, "each proxy speaks for its own Gateway", func() string {
 		for _, parent := range []string{"web", "side"} {
 			p := entry(ControllerName, parent)
@@ -309,6 +325,9 @@ func TestProxyGateway_FollowsItsInputs(t *testing.T) {
 		}
 		return strings.Join(names, ",")
 	}
+	// A write that lost a conflict is retried after a back-off, and the route
+	// is quiet until then: only its generation says the proxies are done.
+	eventually(t, "each proxy has caught up with the route", caughtUp)
 	// Every proxy looks again, at something that changes nothing for the
 	// route. Each leaves the list as it found it: one that put its own
 	// entries last would have the other do the same, on every pass.
