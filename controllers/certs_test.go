@@ -51,7 +51,7 @@ func TestProjectCerts_UpgradeRenamesHostlessStem(t *testing.T) {
 	r := &IngressReconciler{Client: c, CertsOutDir: dir}
 	stem, _ := certStem("", "a", "b-c")
 	m := newRenderModel()
-	m.addCert("", stem, "a", "b-c")
+	m.addCert("", stem, "a", "b-c", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("project: n=%d err=%v", n, err)
 	}
@@ -76,7 +76,7 @@ func TestProjectCertsToSecret_UpgradeDropsOldHostlessKey(t *testing.T) {
 	r := &IngressReconciler{Client: c, CertsOutSecret: out}
 	stem, _ := certStem("", "a", "b-c")
 	m := newRenderModel()
-	m.addCert("", stem, "a", "b-c")
+	m.addCert("", stem, "a", "b-c", nil)
 	if _, _, err := r.projectCertsToSecret(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestProjectCerts_LongHostDoesNotFailTheRender(t *testing.T) {
 	host := longHost('b')
 	stem, _ := certStem(host, "default", "g0s-tls")
 	m := newRenderModel()
-	m.addCert(host, stem, "default", "g0s-tls")
+	m.addCert(host, stem, "default", "g0s-tls", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("project: n=%d err=%v", n, err)
 	}
@@ -438,7 +438,7 @@ func TestProjectCertsToSecret_LongHostIsStored(t *testing.T) {
 	host := longHost('b')
 	stem, _ := certStem(host, "default", "g0s-tls")
 	m := newRenderModel()
-	m.addCert(host, stem, "default", "g0s-tls")
+	m.addCert(host, stem, "default", "g0s-tls", nil)
 	if _, n, err := r.projectCertsToSecret(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("project: n=%d err=%v", n, err)
 	}
