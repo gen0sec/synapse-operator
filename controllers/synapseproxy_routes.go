@@ -113,7 +113,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		ResolveBackendClusterIPs: true,
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
-		HostOwnership:            true,
+		HostOwnership:            proxy.Spec.HostOwnership != "None",
 		HostClaims:               proxyHostClaimsName(&proxy),
 		LedgerReader:             r.Reader,
 		RecordClaims:             true,
