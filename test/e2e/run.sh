@@ -6,6 +6,7 @@
 #                       with a tag other than latest. Required. It is copied
 #                       into the cluster from the local Docker, and pulled
 #                       into that first if it is not there.
+#   E2E_RUN=REGEXP      run only the tests whose names match (go test -run)
 #   E2E_KEEP=1          leave the cluster running afterwards
 #   E2E_K3S_IMAGE       the k3s image; cluster.sh has the default
 #   E2E_CLUSTER         the name of the cluster's container
@@ -21,6 +22,7 @@ root="$(cd "$here/../.." && pwd)"
 export E2E_BACKEND_IMAGE="synapse-operator-e2e-backend:local"
 # The image config/manager.yaml runs.
 operator_image="synapse-operator:local"
+export E2E_OPERATOR_IMAGE="$operator_image"
 
 # The cluster has no credentials for a registry, so it can only run an image
 # by the name it was copied in under. Kubernetes pulls one tagged latest, or
@@ -59,6 +61,8 @@ diagnostics() {
     k get events --all-namespaces --sort-by=.lastTimestamp | tail -n 60
     echo "--- operator"
     k --namespace synapse-os logs deployment/synapse-operator --tail=200
+    echo "--- sidecar pod"
+    k --namespace e2e-edge logs deployment/sidecar --all-containers --prefix --tail=200
     k get pods --all-namespaces --selector synapse.gen0sec.com/proxy \
       --output 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' |
       while read -r namespace pod; do
@@ -127,4 +131,4 @@ export E2E_HTTP_ADDR E2E_HTTPS_ADDR
 cd "$root"
 # Well under the time a CI job is given, so that a run that hangs ends here,
 # with a stack and the cluster's state, and not when the job is cancelled.
-go test -tags e2e -count=1 -v -timeout 20m ./test/e2e/...
+go test -tags e2e -count=1 -v -timeout 20m -run "${E2E_RUN:-.}" ./test/e2e/...
