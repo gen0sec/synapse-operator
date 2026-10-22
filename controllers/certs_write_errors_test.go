@@ -138,8 +138,8 @@ func TestProjectCerts_CertsDirUnavailableStillWritesRoutes(t *testing.T) {
 	)
 
 	wantHosts(t, out, []string{"a.example.com", "b.example.com"}, nil)
-	if got := counterValue(t, mCertErrors); got != before+2 {
-		t.Errorf("certificate error counter went from %v to %v, want +2", before, got)
+	if got := counterValue(t, mCertErrors); got != before+3 {
+		t.Errorf("certificate error counter went from %v to %v, want +3", before, got)
 	}
 	if got := gaugeValue(t, mCerts); got != 0 {
 		t.Errorf("certificate gauge = %v, want 0", got)
@@ -423,5 +423,66 @@ func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
 	crt2, key2 := readDefault(t, dir)
 	if string(crt2) != string(crt) || string(key2) != string(key) {
 		t.Error("the default pair did not survive the failed rewrite")
+	}
+}
+
+// With no certificate to project, the default one is all that a certificates
+// directory that cannot be made fails, and it is retried.
+func TestReconcile_RequeuesWhileTheCertsDirIsUnavailableWithNoTLSIngress(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "certs")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &IngressReconciler{
+		IngressClassName: "synapse",
+		CertsOutDir:      notADir,
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "upstreams.yaml"),
+		ClusterDomain:    "cluster.local",
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	before := counterValue(t, mCertErrors)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+	if got := counterValue(t, mCertErrors); got != before+1 {
+		t.Errorf("certificate error counter went from %v to %v, want +1", before, got)
+	}
+}
+
+// A default certificate that cannot be written and has no pair on disk is
+// absent, and is not counted as a projected certificate.
+func TestProjectCerts_ADefaultThatFailsWithNoPairIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, certTempName(defaultCertStem, ".crt")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Half a pair is no pair: it is pruned, not kept.
+	if err := os.WriteFile(filepath.Join(dir, defaultCertStem+".crt"), []byte("half"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &IngressReconciler{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).
+			WithObjects(tlsSecret("default", "web-tls", "CRT-web", "KEY-web")).Build(),
+		CertsOutDir: dir,
+	}
+	m := newRenderModel()
+	m.addCert("web.example.com", "web.example.com", "default", "web-tls", nil)
+
+	_, n, failed, err := r.writeCerts(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || failed != 1 {
+		t.Errorf("projected = %d, failed = %d; want 1 and 1", n, failed)
+	}
+	for _, ext := range []string{".crt", ".key"} {
+		if exists(filepath.Join(dir, defaultCertStem+ext)) {
+			t.Errorf("%s%s exists, want none", defaultCertStem, ext)
+		}
 	}
 }

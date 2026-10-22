@@ -209,8 +209,9 @@ func (r *IngressReconciler) writeCerts(ctx context.Context, m *renderModel) (cha
 		for _, stem := range stems {
 			r.certNotWritten(logger, m.certProjections[stem], fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
 		}
+		defaultNotWritten(logger, fmt.Errorf("certs dir %s: %w", r.CertsOutDir, err), false)
 		mCerts.Set(0)
-		return false, 0, len(stems), nil
+		return false, 0, len(stems) + 1, nil
 	}
 
 	want := map[string]struct{}{} // stems successfully projected
@@ -357,6 +358,18 @@ func (r *IngressReconciler) certNotWritten(logger logr.Logger, cp certProjection
 		"certificate %s from Secret %s/%s could not be written: %v", cp.stem, cp.ns, cp.name, err)
 }
 
+// defaultNotWritten records the default certificate as not written. It has no
+// referencing object, so there is no Event. kept says whether a pair from an
+// earlier render is still on disk.
+func defaultNotWritten(logger logr.Logger, err error, kept bool) {
+	outcome := "hosts without a certificate get none"
+	if kept {
+		outcome = "the previous pair stays in place"
+	}
+	logger.Error(err, "default TLS cert not written ("+outcome+")", "stem", defaultCertStem)
+	mCertErrors.Inc()
+}
+
 // projectDefaultCert keeps <defaultCertStem>.crt/.key in CertsOutDir, a pair
 // that is generated again only when defaultCertificate says so. Like a
 // tenant's certificate it is not allowed to fail the render: on an error the
@@ -369,12 +382,7 @@ func (r *IngressReconciler) projectDefaultCert(logger logr.Logger) (changed, fai
 		changed, err = writeCertPair(r.CertsOutDir, defaultCertStem, crt, key)
 	}
 	if err != nil {
-		outcome := "hosts without a certificate get none"
-		if certPairExists(r.CertsOutDir, defaultCertStem) {
-			outcome = "the previous pair stays in place"
-		}
-		logger.Error(err, "default TLS cert not written ("+outcome+")", "stem", defaultCertStem)
-		mCertErrors.Inc()
+		defaultNotWritten(logger, err, certPairExists(r.CertsOutDir, defaultCertStem))
 		return false, true
 	}
 	return changed, false
