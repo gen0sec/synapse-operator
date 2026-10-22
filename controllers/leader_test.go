@@ -77,7 +77,7 @@ func TestRenderGateways_NonLeaderSkipsStatusButStillRenders(t *testing.T) {
 	ing := &networkingv1.Ingress{}
 	ing.Name, ing.Namespace = "g0s", "default"
 	rNo := &IngressReconciler{Client: c, StatusAddresses: []string{"203.0.113.9"}, IsLeader: func() bool { return false }}
-	rNo.publishStatus(context.Background(), []*networkingv1.Ingress{ing})
+	rNo.publishStatus(context.Background(), []*networkingv1.Ingress{ing}, nil)
 	if len(ing.Status.LoadBalancer.Ingress) != 0 {
 		t.Fatalf("non-leader must NOT publish Ingress status, got %+v", ing.Status.LoadBalancer.Ingress)
 	}
