@@ -102,6 +102,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		ResolveBackendClusterIPs: true,
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
+		HostOwnership:            proxy.Spec.HostOwnership != "None",
 	}
 	var (
 		gatewayIn     gatewayInputs

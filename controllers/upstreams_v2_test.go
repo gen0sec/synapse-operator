@@ -880,3 +880,33 @@ func TestRenderUpstreamsV2_HeaderRules(t *testing.T) {
 		t.Errorf("transforms for a route that has none:\n%s", rendered)
 	}
 }
+
+// A host that has no paths says `paths: {}`. A bare `paths:` is null, which
+// Synapse refuses, and the file with it.
+func TestRenderUpstreams_AHostWithoutRoutesSaysPathsEmpty(t *testing.T) {
+	m := newRenderModel()
+	m.hosts["held.example.com"] = map[string]*routeCfg{}
+	var doc struct {
+		Upstreams map[string]struct {
+			Paths map[string]any `json:"paths"`
+		} `json:"upstreams"`
+	}
+	out := renderUpstreams(m)
+	if err := yaml.UnmarshalStrict([]byte(out), &doc); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	h, ok := doc.Upstreams["held.example.com"]
+	if !ok || h.Paths == nil || len(h.Paths) != 0 {
+		t.Errorf("held.example.com = %+v (present %v), want paths to be an empty map:\n%s", h, ok, out)
+	}
+}
+
+func TestRenderUpstreamsV2_AHostWithoutRoutesSaysPathsEmpty(t *testing.T) {
+	m := newRenderModel()
+	m.hosts["held.example.com"] = map[string]*routeCfg{}
+	out := renderUpstreamsV2(m)
+	h, ok := parseV2(t, out).Hosts["held.example.com"]
+	if !ok || h.Paths == nil || len(h.Paths) != 0 {
+		t.Errorf("held.example.com = %+v (present %v), want paths to be an empty map:\n%s", h, ok, out)
+	}
+}

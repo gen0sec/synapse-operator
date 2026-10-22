@@ -330,15 +330,32 @@ func TestWriteCertPair_PutsTheOldKeyBackWhenTheCertificateCannotBeMoved(t *testi
 // (synapse-utils tools.rs reload_relevant_path), so a staged file has to be
 // the first kind, and must not be the second, which the loader would read.
 func TestCertTempName_IsWhatSynapseWatcherReactsToAndLoaderIgnores(t *testing.T) {
-	for _, ext := range []string{".crt", ".key"} {
-		name := certTempName("shop.example.com", ext)
-		if !strings.HasPrefix(name, "..") {
-			t.Errorf("%q does not start with .., so creating it does not trigger a reload", name)
+	stems := []string{"shop.example.com", strings.Repeat("a", 16), strings.Repeat("a", 245), strings.Repeat("a", 246), strings.Repeat("a", maxCertStem)}
+	for _, stem := range stems {
+		for _, ext := range []string{".crt", ".key"} {
+			checkCertTempName(t, stem, ext)
 		}
-		for _, loaded := range []string{".crt", ".key", ".pem"} {
-			if strings.HasSuffix(name, loaded) {
-				t.Errorf("%q ends in %s, the loader would read it", name, loaded)
-			}
+	}
+	if name := certTempName(strings.Repeat("a", 245), ".crt"); !strings.Contains(name, strings.Repeat("a", 245)) {
+		t.Errorf("a 245-char stem fits under its own name, got %q", name)
+	}
+	if a, b := certTempName(strings.Repeat("a", 246), ".crt"), certTempName(strings.Repeat("a", 245)+"b", ".crt"); a == b {
+		t.Errorf("two long stems staged under one name %q", a)
+	}
+}
+
+func checkCertTempName(t *testing.T, stem, ext string) {
+	t.Helper()
+	name := certTempName(stem, ext)
+	if len(name) > 255 {
+		t.Errorf("staged name for a %d-char stem is %d bytes, over a file name's 255", len(stem), len(name))
+	}
+	if !strings.HasPrefix(name, "..") {
+		t.Errorf("%q does not start with .., so creating it does not trigger a reload", name)
+	}
+	for _, loaded := range []string{".crt", ".key", ".pem"} {
+		if strings.HasSuffix(name, loaded) {
+			t.Errorf("%q ends in %s, the loader would read it", name, loaded)
 		}
 	}
 }
