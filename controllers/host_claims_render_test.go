@@ -504,8 +504,8 @@ func TestOwnership_AnAliasCannotForgeALedgerLine(t *testing.T) {
 	if strings.Contains(cm.Data["claims"], "y.example.com") {
 		t.Errorf("the ledger holds the forged host:\n%s", cm.Data["claims"])
 	}
-	if got := eventsOf(g.events, "InvalidHostname"); len(got) == 0 {
-		t.Error("the invalid host was not said")
+	if got := eventsOf(g.events, "InvalidServerAlias"); len(got) == 0 {
+		t.Error("the invalid alias was not said")
 	}
 }
 
