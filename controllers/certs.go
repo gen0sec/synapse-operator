@@ -236,8 +236,16 @@ func writeCertPair(dir, stem string, crt, key []byte) (bool, error) {
 // Kubernetes atomic-update marker (synapse-utils tools.rs
 // reload_relevant_path): creating the file triggers a rescan even
 // though the rename that follows is invisible to it. The name does not end
-// in .crt or .key, so the loader never reads it, and prune removes it.
-func certTempName(stem, ext string) string { return ".." + stem + ext + ".tmp" }
+// in .crt or .key, so the loader never reads it, and prune removes it. A stem
+// too long to stage under its own name is staged under a hash of it.
+func certTempName(stem, ext string) string {
+	name := ".." + stem + ext + ".tmp"
+	if len(name) <= 255 { // a file name limit; the longest stem is 249
+		return name
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return ".." + hex.EncodeToString(sum[:8]) + ext + ".tmp"
+}
 
 // certNotWritten records a certificate that could not be written to
 // CertsOutDir. kept says whether a pair from an earlier render is still on
