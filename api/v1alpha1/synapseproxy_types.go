@@ -158,6 +158,17 @@ type SynapseProxySpec struct {
 	// +optional
 	Platform *PlatformSpec `json:"platform,omitempty"`
 
+	// HostOwnership decides who owns a host name among the namespaces whose
+	// Ingresses this proxy serves. With Namespace, a host goes to the
+	// namespace whose Ingress named it first, and another namespace's use of
+	// it is refused. With None, namespaces share hosts as they did before
+	// ownership existed: any Ingress may add routes to any host.
+	//
+	// +optional
+	// +kubebuilder:default=Namespace
+	// +kubebuilder:validation:Enum=Namespace;None
+	HostOwnership string `json:"hostOwnership,omitempty"`
+
 	// Config holds Synapse settings the fields above do not model, in the
 	// shape of Synapse's own configuration file. A key that a field above or
 	// the operator itself sets is refused, not overridden.

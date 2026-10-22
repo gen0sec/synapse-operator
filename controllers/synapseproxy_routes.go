@@ -113,7 +113,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		ResolveBackendClusterIPs: true,
 		StatusAddresses:          addresses,
 		Recorder:                 r.Recorder,
-		HostOwnership:            true,
+		HostOwnership:            proxy.Spec.HostOwnership != "None",
 		HostClaims:               proxyHostClaimsName(&proxy),
 		LedgerReader:             r.Reader,
 		RecordClaims:             true,
@@ -129,6 +129,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if gatewayIn, lookups, err = r.gatewayInputs(ctx, &proxy); err != nil {
 			return ctrl.Result{}, err
 		}
+		render.ExtraClaims = gatewayIn.claims
 		render.RenderExtra = func(_ context.Context, m *renderModel) error {
 			gatewayStatus = translateGateways(gatewayIn, m)
 			// Rendered from a lookup that failed, the routes would lack a

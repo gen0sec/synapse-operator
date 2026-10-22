@@ -247,15 +247,17 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 	// What a route's rules come to is known once every route's matches on
 	// a host are seen together, so the routes are gone through twice.
 	type attached struct {
-		rt        *gwv1.HTTPRoute
-		parents   []gwv1.RouteParentStatus
-		accepted  []int
-		hosts     int
-		conflicts []string
+		rt       *gwv1.HTTPRoute
+		parents  []gwv1.RouteParentStatus
+		accepted []int
+		hosts    int
+		// conflicts are, per parent, the hosts left out of it and why.
+		conflicts [][]string
 		partial   []string
 		rules     ruleSet
 	}
 	var all []attached
+	foreign := map[string]bool{}
 	// In any order: the matches are put in theirs when they are emitted.
 	var matches []gwMatch
 	for i := range in.routes {
@@ -264,14 +266,29 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		hosts := map[string]bool{}
 		var accepted []int
 		var partial []string
+		var conflicts [][]string
 		for _, ref := range rt.Spec.ParentRefs {
 			gwKey, ok := parentGateway(rt, ref)
 			if !ok || gateways[gwKey] == nil {
 				continue
 			}
-			attach := in.attach(rt, ref, listeners[gwKey])
+			attach := in.attach(rt, ref, listeners[gwKey], func(host, listener string) string {
+				switch {
+				case taken[host]:
+					return conflictIngress
+				case !m.owners.allows(host, gwKey.Namespace):
+					return conflictNamespace
+				case rt.Namespace != gwKey.Namespace && m.owners.namesMoreSpecifically(gwKey.Namespace, host, listener):
+					return conflictNamed
+				}
+				return ""
+			})
+			conflicts = append(conflicts, attach.conflicts)
 			for host := range attach.hosts {
 				hosts[host] = true
+				if rt.Namespace != gwKey.Namespace {
+					foreign[hostKey(host)] = true
+				}
 			}
 			if attach.reason == "" {
 				accepted = append(accepted, len(parents))
@@ -290,19 +307,12 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 			continue
 		}
 
-		// Hosts an Ingress already routes are not this route's to take.
-		var conflicts []string
-		for _, host := range sortedKeys(hosts) {
-			if taken[host] {
-				conflicts = append(conflicts, host)
-				delete(hosts, host)
-			}
-		}
 		rules := in.rules(rt, sortedKeys(hosts))
 		matches = append(matches, rules.matches...)
 		all = append(all, attached{rt: rt, parents: parents, accepted: accepted, hosts: len(hosts), conflicts: conflicts, partial: partial, rules: rules})
 	}
 	served := emitGatewayMatches(m, matches)
+	m.foreignWild = foreign
 
 	for _, a := range all {
 		rt, parents, rules := a.rt, a.parents, a.rules
@@ -311,17 +321,11 @@ func translateGateways(in gatewayInputs, m *renderModel) gatewayStatuses {
 		for _, n := range a.accepted {
 			p := &parents[n]
 			switch {
-			case a.hosts == 0:
-				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, reasonHostnameConflict,
-					"already routed by an Ingress: "+strings.Join(a.conflicts, ", "), rt.Generation)
 			case served[key] == 0 && len(notes) > 0:
 				p.Conditions[0] = condition(string(gwv1.RouteConditionAccepted), false, string(gwv1.RouteReasonUnsupportedValue),
 					strings.Join(notes, "; "), rt.Generation)
-			case len(notes) > 0 || len(a.conflicts) > 0:
-				said := notes
-				if len(a.conflicts) > 0 {
-					said = append(slices.Clone(said), "already routed by an Ingress: "+strings.Join(a.conflicts, ", "))
-				}
+			case len(notes) > 0 || len(a.conflicts[n]) > 0:
+				said := slices.Concat(notes, a.conflicts[n])
 				p.Conditions = append(p.Conditions, condition(string(gwv1.RouteConditionPartiallyInvalid), true,
 					string(gwv1.RouteReasonUnsupportedValue), "not programmed: "+strings.Join(said, "; "), rt.Generation))
 			}
@@ -449,6 +453,11 @@ func (in gatewayInputs) listener(gw *gwv1.Gateway, l *gwListener, m *renderModel
 	if spec.Protocol == gwv1.HTTPSProtocolType && asksForClientCertificates(gw) {
 		return finish(gwv1.ListenerReasonUnsupportedValue,
 			"the Gateway asks for client certificates (spec.tls.frontend), and the proxy validates none", false)
+	}
+	// A host that belongs to another namespace is not this listener's: it
+	// serves nothing, and its certificates are not added.
+	if spec.Hostname != nil && !m.owners.allows(string(*spec.Hostname), gw.Namespace) {
+		return finish(gwv1.ListenerReasonHostnameConflict, "the hostname belongs to another namespace", false)
 	}
 	// Reported, and no more: the HTTPRoutes it also allows still attach.
 	if kinds := allowedKinds(spec); kinds != "" {
@@ -588,11 +597,22 @@ type attachment struct {
 	reason, message string
 	// note is what of the attachment is not served, when part of it is.
 	note string
+	// conflicts say which hosts were left out, and why, one entry for each
+	// reason.
+	conflicts []string
 }
+
+const (
+	conflictIngress   = "already routed by an Ingress"
+	conflictNamespace = "held by another namespace"
+	conflictNamed     = "named more specifically in the Gateway's namespace"
+)
 
 // attach works out which listeners of a Gateway a route attaches to through
 // one parentRef, counts it on each, and returns the hosts it gets from them.
-func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all []*gwListener) attachment {
+// conflict says why a host, reached through a listener of that hostname, may
+// not be taken, or returns "". Such a host is left out.
+func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all []*gwListener, conflict func(host, listener string) string) attachment {
 	var named, allowed []*gwListener
 	for _, l := range all {
 		if ref.SectionName != nil && *ref.SectionName != l.spec.Name {
@@ -615,6 +635,7 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 	}
 
 	a := attachment{hosts: map[string]bool{}}
+	left := map[string][]string{}
 	everyHost := false
 	for _, l := range allowed {
 		var hosts []string
@@ -632,11 +653,25 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 				}
 			}
 		}
-		if len(hosts) > 0 {
+		var kept []string
+		for _, h := range hosts {
+			if why := conflict(h, l.hostname); why != "" {
+				left[why] = append(left[why], h)
+				continue
+			}
+			kept = append(kept, h)
+		}
+		if len(kept) > 0 {
 			l.attached++
 		}
-		for _, h := range hosts {
+		for _, h := range kept {
 			a.hosts[h] = true
+		}
+	}
+	for _, why := range []string{conflictIngress, conflictNamespace, conflictNamed} {
+		if hosts := left[why]; len(hosts) > 0 {
+			slices.Sort(hosts)
+			a.conflicts = append(a.conflicts, why+": "+strings.Join(slices.Compact(hosts), ", "))
 		}
 	}
 	const noHost = "neither the route nor its listener names a host, and Synapse routes by host name"
@@ -644,6 +679,9 @@ func (in gatewayInputs) attach(rt *gwv1.HTTPRoute, ref gwv1.ParentReference, all
 	case len(a.hosts) > 0 && everyHost:
 		a.note = "not served on a listener that names no host: " + noHost
 	case len(a.hosts) > 0:
+	case len(a.conflicts) > 0:
+		a.reason = reasonHostnameConflict
+		a.message = strings.Join(a.conflicts, "; ")
 	case everyHost:
 		a.reason = string(gwv1.RouteReasonUnsupportedValue)
 		a.message = noHost
