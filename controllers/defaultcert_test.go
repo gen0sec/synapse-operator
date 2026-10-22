@@ -160,7 +160,7 @@ func TestProjectCerts_PruneKeepsTheDefaultCertificate(t *testing.T) {
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY")).Build()
 	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: func() time.Time { return t0 }}
 	m := newRenderModel()
-	m.addCert("x.example.com", "x.example.com", "a", "b")
+	m.addCert("x.example.com", "x.example.com", "a", "b", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
@@ -188,7 +188,7 @@ func TestProjectCertsToSecret_ReplaceKeepsTheDefaultCertificate(t *testing.T) {
 	}
 
 	m := newRenderModel()
-	m.addCert("x.example.com", "x.example.com", "a", "b")
+	m.addCert("x.example.com", "x.example.com", "a", "b", nil)
 	if _, n, err := r.projectCertsToSecret(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v (the default is not a tenant certificate)", n, err)
 	}
@@ -253,8 +253,8 @@ func TestDefaultCert_NoTenantCertificateIsTheDefault(t *testing.T) {
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY"), tlsSecret("c", "d", "CRT2", "KEY2")).Build()
 	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return t0 }}
 	m := newRenderModel()
-	m.addCert("", "a_b", "a", "b")
-	m.addCert("", "c_d", "c", "d")
+	m.addCert("", "a_b", "a", "b", nil)
+	m.addCert("", "c_d", "c", "d", nil)
 	if _, n, err := r.projectCertsToSecret(context.Background(), m); err != nil || n != 2 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
