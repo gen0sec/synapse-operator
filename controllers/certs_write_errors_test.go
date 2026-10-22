@@ -393,7 +393,7 @@ func TestReconcile_RequeuesWhileTheCertsDirIsUnavailable(t *testing.T) {
 func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
 	dir := t.TempDir()
 	routes := filepath.Join(t.TempDir(), "upstreams.yaml")
-	now := t0
+	now := certT0
 	r := &IngressReconciler{
 		IngressClassName: "synapse",
 		CertsOutDir:      dir,
@@ -415,7 +415,7 @@ func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
 	}
 
 	// Due for renewal, and the new certificate cannot be staged.
-	now = t0.Add(defaultCertValidity - defaultCertRenewBefore/2)
+	now = certT0.Add(defaultCertValidity - defaultCertRenewBefore/2)
 	if err := os.Mkdir(filepath.Join(dir, certTempName(defaultCertStem, ".crt")), 0o755); err != nil {
 		t.Fatal(err)
 	}

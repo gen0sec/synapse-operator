@@ -19,7 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-var t0 = time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+var certT0 = time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
 
 func clockAt(t *time.Time) func() time.Time { return func() time.Time { return *t } }
 
@@ -69,7 +69,7 @@ func TestDefaultCert_StemSurvivesTheNamingRules(t *testing.T) {
 
 func TestProjectCerts_GeneratesTheDefaultCertificateOnceAndReusesIt(t *testing.T) {
 	dir := t.TempDir()
-	now := t0
+	now := certT0
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
 	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: clockAt(&now)}
 
@@ -134,18 +134,18 @@ func TestProjectCerts_RegeneratesTheDefaultCertificateOnlyWhenItMust(t *testing.
 		{"missing crt", time.Hour, func(d string) { _ = os.Remove(filepath.Join(d, defaultCertStem+".crt")) }, true},
 		{"key of another certificate", time.Hour, func(d string) {
 			other := t.TempDir()
-			_, k := good(t, other, t0)
+			_, k := good(t, other, certT0)
 			_ = os.WriteFile(filepath.Join(d, defaultCertStem+".key"), k, 0o600)
 		}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			crt, _ := good(t, dir, t0)
+			crt, _ := good(t, dir, certT0)
 			if tc.break_ != nil {
 				tc.break_(dir)
 			}
-			crt2, key2 := good(t, dir, t0.Add(tc.later))
+			crt2, key2 := good(t, dir, certT0.Add(tc.later))
 			parseDefaultCert(t, crt2, key2)
 			if regen := string(crt2) != string(crt); regen != tc.regen {
 				t.Fatalf("regenerated=%v, want %v", regen, tc.regen)
@@ -158,7 +158,7 @@ func TestProjectCerts_PruneKeepsTheDefaultCertificate(t *testing.T) {
 	dir := t.TempDir()
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY")).Build()
-	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: func() time.Time { return t0 }}
+	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: func() time.Time { return certT0 }}
 	m := newRenderModel()
 	m.addCert("x.example.com", "x.example.com", "a", "b", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
@@ -177,7 +177,7 @@ func TestProjectCertsToSecret_ReplaceKeepsTheDefaultCertificate(t *testing.T) {
 	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY")).Build()
-	now := t0
+	now := certT0
 	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: clockAt(&now)}
 	get := func() corev1.Secret {
 		var s corev1.Secret
@@ -218,7 +218,7 @@ func TestProjectCertsToSecret_ReplaceKeepsTheDefaultCertificate(t *testing.T) {
 	}
 
 	// Near expiry it is replaced.
-	now = t0.Add(340 * 24 * time.Hour)
+	now = certT0.Add(340 * 24 * time.Hour)
 	if _, _, err := r.projectCertsToSecret(context.Background(), newRenderModel()); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestProjectCertsToSecret_UnparseableDefaultIsReplaced(t *testing.T) {
 	old.Labels = map[string]string{ingressCertsManagedLabel: "true"}
 	old.Data = map[string][]byte{defaultCertStem + ".crt": []byte("junk"), defaultCertStem + ".key": []byte("junk")}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(old).Build()
-	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return t0 }}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return certT0 }}
 	if _, _, err := r.projectCertsToSecret(context.Background(), newRenderModel()); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestDefaultCert_NoTenantCertificateIsTheDefault(t *testing.T) {
 	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY"), tlsSecret("c", "d", "CRT2", "KEY2")).Build()
-	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return t0 }}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return certT0 }}
 	m := newRenderModel()
 	m.addCert("", "a_b", "a", "b", nil)
 	m.addCert("", "c_d", "c", "d", nil)

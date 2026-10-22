@@ -90,6 +90,11 @@ func renderOlderMode(t *testing.T, objs []client.Object) string {
 	}
 	var files []string
 	for _, e := range entries {
+		// The operator's own default pair is generated afresh for each
+		// render; defaultcert_test.go pins it.
+		if strings.HasPrefix(e.Name(), defaultCertStem+".") {
+			continue
+		}
 		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			t.Fatal(err)
