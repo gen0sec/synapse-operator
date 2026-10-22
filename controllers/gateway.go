@@ -151,7 +151,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)
 			for _, w := range warns {
-				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
+				logger.Info("HTTPRoute match feature not representable in synapse (best-effort)",
 					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
 				mUnsupportedMatch.Inc()
 				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", "%s", w)
@@ -201,7 +201,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 // headerFilters maps HTTPRoute Request/ResponseHeaderModifier filters
 // to synapse request_headers/response_headers injection lines
 // ("Name: value"). Header `remove` and `URLRewrite`/`RequestMirror`
-// have no equivalent in synapse's v1 per-path schema and are left
+// have no equivalent in synapse's per-path schema and are left
 // unmodified (not silently faked).
 func headerFilters(filters []gwv1.HTTPRouteFilter) (req, resp []string) {
 	conv := func(f *gwv1.HTTPHeaderFilter) []string {
@@ -288,7 +288,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 	for _, mt := range rule.Matches {
 		if len(mt.Headers) > 0 || mt.Method != nil || len(mt.QueryParams) > 0 {
 			warnings = append(warnings,
-				"header/method/queryParam match conditions are ignored (synapse v1 routes on host+path only)")
+				"header/method/queryParam match conditions are ignored (synapse routes on host+path only)")
 		}
 		pv := "/"
 		pt := gwv1.PathMatchPathPrefix
@@ -307,7 +307,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 			continue
 		case gwv1.PathMatchExact:
 			warnings = append(warnings,
-				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse v1 matches longest-prefix)", pv))
+				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse matches longest-prefix)", pv))
 		}
 		paths = append(paths, pv)
 	}

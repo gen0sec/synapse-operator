@@ -223,7 +223,6 @@ func TestRoutes_ProjectsCertificatesAcrossNamespaces(t *testing.T) {
 // proxyFloor is the routes file of a proxy that has nothing to route.
 func proxyFloor() string {
 	m := newRenderModel()
-	m.sameAsV1 = true
 	return renderUpstreamsV2(m)
 }
 
@@ -255,7 +254,7 @@ func TestRoutes_AreAV2File(t *testing.T) {
 	if route.SSLEnabled == nil || *route.SSLEnabled {
 		t.Errorf("how its backend is reached is not said: %+v", route.SSLEnabled)
 	}
-	if got := doc.Timeouts.Read; got == nil || *got != v1ReadTimeoutSeconds {
+	if got := doc.Timeouts.Read; got == nil || *got != defaultReadTimeoutSeconds {
 		t.Errorf("the file's read timeout is %v", got)
 	}
 	// A route chosen by an expression, which a v1 file was needed for.

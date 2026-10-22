@@ -60,7 +60,7 @@ var (
 	})
 	mUnsupportedMatch = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_unsupported_match_total",
-		Help: "Total Ingress/HTTPRoute match features not representable in synapse v1.",
+		Help: "Total Ingress/HTTPRoute match features not representable in synapse.",
 	})
 	mBackendUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_backend_unresolved_total",
