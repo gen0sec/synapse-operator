@@ -3,7 +3,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,13 +20,6 @@ const (
 	hostClaimsLabel = "synapse.gen0sec.com/host-claims"
 	hostClaimsKey   = "claims"
 )
-
-func (r *IngressReconciler) now() time.Time {
-	if r.Clock != nil {
-		return r.Clock()
-	}
-	return time.Now()
-}
 
 // loadLedger reads the ledger live. A ledger that is not there is empty, and
 // says so. One that is there but not controlled by OwnerRef is somebody

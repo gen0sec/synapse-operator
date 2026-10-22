@@ -22,7 +22,7 @@ proxy:
     cache_ttl: 300
     token_ttl: 7200
   certificates: /etc/synapse/certs
-  default_certificate: default
+  default_certificate: _default
   h2c: false
   internal_services:
     enabled: true
