@@ -17,13 +17,13 @@ import (
 )
 
 // A host name may be 253 characters long, and so may a Secret key, but the
-// key is the host name plus ".crt". The API server refuses that Secret, and
-// one Ingress with such a host used to stop every later render for the
-// proxy: no new route, no renewed certificate, for anybody.
+// key is the host name plus ".crt". The stem is shortened to fit, so the
+// certificate of such a host is stored, and the routes file names it by the
+// same stem. Another Ingress's certificate is stored beside it.
 //
 // This runs against the real API server, because the fake client stores
 // whatever it is given.
-func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T) {
+func TestRoutes_LongHostCertificateIsStoredUnderAShortenedKey(t *testing.T) {
 	ctx := context.Background()
 	k8s, err := client.New(apiServer(t), client.Options{Scheme: proxyTestScheme(t)})
 	if err != nil {
@@ -44,9 +44,9 @@ func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T)
 	create(classFor(ns, edge))
 
 	label := strings.Repeat("a", 63)
-	longHost := label + "." + label + "." + label + "." + strings.Repeat("b", 57) + ".io"
-	if len(longHost) != 252 {
-		t.Fatalf("host is %d characters", len(longHost))
+	hostLong := label + "." + label + "." + label + "." + strings.Repeat("b", 57) + ".io"
+	if len(hostLong) != 252 {
+		t.Fatalf("host is %d characters", len(hostLong))
 	}
 	ingress := func(name, host string) *networkingv1.Ingress {
 		ing := routedIngress(name, ptr(ns), host)
@@ -58,7 +58,7 @@ func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T)
 		create(tls)
 		return ing
 	}
-	create(ingress("long", longHost))
+	create(ingress("long", hostLong))
 	create(ingress("shop", "shop.example.com"))
 
 	r := &SynapseRouteReconciler{Client: k8s, ClusterDomain: "cluster.local"}
@@ -70,8 +70,8 @@ func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T)
 	if err := k8s.Get(ctx, types.NamespacedName{Namespace: ns, Name: "edge-upstreams"}, &routes); err != nil {
 		t.Fatalf("no routes were rendered: %v", err)
 	}
-	// Both hosts are routed; only the certificate of one is missing.
-	wantHosts(t, routes.Data[UpstreamsKey], []string{"shop.example.com", longHost}, nil)
+	// Both hosts are routed.
+	wantHosts(t, routes.Data[UpstreamsKey], []string{"shop.example.com", hostLong}, nil)
 
 	var certs corev1.Secret
 	if err := k8s.Get(ctx, types.NamespacedName{Namespace: ns, Name: "edge-certs"}, &certs); err != nil {
@@ -80,8 +80,13 @@ func TestRoutes_OneCertificateThatCannotBeStoredDoesNotStopTheRest(t *testing.T)
 	if string(certs.Data["shop.example.com.crt"]) != "CRT-shop" || string(certs.Data["shop.example.com.key"]) != "KEY-shop" {
 		t.Errorf("the other certificate was not projected; keys %v", keysOf(certs.Data))
 	}
-	if len(certs.Data) != 2 {
-		t.Errorf("certs Secret holds %d keys, want the two of the certificate that fits", len(certs.Data))
+	// A long host's stem is shortened to fit a key, so its certificate is stored too.
+	longStem, _ := certStem(hostLong, ns, "long-tls")
+	if want := fmt.Sprintf("%q:\n    tls:\n      terminate:\n        cert: %q\n", hostLong, longStem); !strings.Contains(routes.Data[UpstreamsKey], want) {
+		t.Errorf("the routes file does not bind the long host to the stored stem %q:\n%s", longStem, routes.Data[UpstreamsKey])
+	}
+	if string(certs.Data[longStem+".crt"]) != "CRT-long" || len(certs.Data) != 4 {
+		t.Errorf("certs Secret holds %d keys (%v), want both certificates", len(certs.Data), keysOf(certs.Data))
 	}
 }
 
