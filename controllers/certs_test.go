@@ -51,7 +51,7 @@ func TestProjectCerts_UpgradeRenamesHostlessStem(t *testing.T) {
 	r := &IngressReconciler{Client: c, CertsOutDir: dir}
 	stem, _ := certStem("", "a", "b-c")
 	m := newRenderModel()
-	m.addCert("", stem, "a", "b-c")
+	m.addCert("", stem, "a", "b-c", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
 		t.Fatalf("project: n=%d err=%v", n, err)
 	}
@@ -76,7 +76,7 @@ func TestProjectCertsToSecret_UpgradeDropsOldHostlessKey(t *testing.T) {
 	r := &IngressReconciler{Client: c, CertsOutSecret: out}
 	stem, _ := certStem("", "a", "b-c")
 	m := newRenderModel()
-	m.addCert("", stem, "a", "b-c")
+	m.addCert("", stem, "a", "b-c", nil)
 	if _, _, err := r.projectCertsToSecret(context.Background(), m); err != nil {
 		t.Fatal(err)
 	}
