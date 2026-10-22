@@ -369,3 +369,59 @@ func TestReconcile_RequeuesWhileTheCertsDirIsUnavailable(t *testing.T) {
 		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
 	}
 }
+
+// The default certificate is written like a tenant's: when its rotation cannot
+// be written the render goes on, the failure is counted and retried, and the
+// pair that was there keeps serving.
+func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
+	dir := t.TempDir()
+	routes := filepath.Join(t.TempDir(), "upstreams.yaml")
+	now := t0
+	r := &IngressReconciler{
+		IngressClassName: "synapse",
+		CertsOutDir:      dir,
+		UpstreamsOutPath: routes,
+		ClusterDomain:    "cluster.local",
+		Now:              func() time.Time { return now },
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		[]client.Object{
+			tlsIngress("web", "web.example.com", "web-tls"),
+			tlsSecret("default", "web-tls", "CRT-web", "KEY-web"),
+		}...).Build()
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	crt, key := readDefault(t, dir)
+	if err := os.Remove(routes); err != nil {
+		t.Fatal(err)
+	}
+
+	// Due for renewal, and the new certificate cannot be staged.
+	now = t0.Add(defaultCertValidity - defaultCertRenewBefore/2)
+	if err := os.Mkdir(filepath.Join(dir, certTempName(defaultCertStem, ".crt")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := counterValue(t, mCertErrors)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{})
+	if err != nil {
+		t.Fatalf("a default certificate that cannot be written failed the render: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+	if got := counterValue(t, mCertErrors); got != before+1 {
+		t.Errorf("certificate error counter went from %v to %v", before, got)
+	}
+	if !exists(routes) {
+		t.Error("the routes file was not written")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "web.example.com.crt")); string(b) != "CRT-web" {
+		t.Errorf("the tenant certificate is %q", b)
+	}
+	crt2, key2 := readDefault(t, dir)
+	if string(crt2) != string(crt) || string(key2) != string(key) {
+		t.Error("the default pair did not survive the failed rewrite")
+	}
+}
