@@ -18,14 +18,77 @@ func TestCertStem(t *testing.T) {
 	if s, b := certStem("foo.example.com", "ns", "sec"); s != "foo.example.com" || !b {
 		t.Fatalf("concrete host ⇒ host-bound: %q %v", s, b)
 	}
-	if s, b := certStem("*.example.com", "ns", "sec"); b || s != "ns-sec" {
+	if s, b := certStem("*.example.com", "ns", "sec"); b || s != "ns_sec" {
 		t.Fatalf("wildcard ⇒ secret-derived, not host-bound: %q %v", s, b)
 	}
-	if s, b := certStem("", "ns", "sec"); b || s != "ns-sec" {
+	if s, b := certStem("", "ns", "sec"); b || s != "ns_sec" {
 		t.Fatalf("no host ⇒ secret-derived, not host-bound: %q %v", s, b)
 	}
 	if s, _ := certStem("a/b c*d", "n", "s"); s != "a_b_c_d" {
 		t.Fatalf("sanitize odd chars: %q", s)
+	}
+	// "_" cannot appear in a namespace or Secret name, so the separator
+	// keeps ns "a" + Secret "b-c" apart from ns "a-b" + Secret "c", which
+	// "-" joined into the same stem.
+	s1, _ := certStem("", "a", "b-c")
+	s2, _ := certStem("", "a-b", "c")
+	if s1 == s2 || s1 != "a_b-c" || s2 != "a-b_c" {
+		t.Fatalf("hostless stems must not collide: %q vs %q", s1, s2)
+	}
+}
+
+// A hostless cert written under the old "ns-secret" name is replaced by
+// the "ns_secret" name on the first render after an upgrade.
+func TestProjectCerts_UpgradeRenamesHostlessStem(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"a-b-c.crt", "a-b-c.key"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(tlsSecret("a", "b-c", "CRT", "KEY")).Build()
+	r := &IngressReconciler{Client: c, CertsOutDir: dir}
+	stem, _ := certStem("", "a", "b-c")
+	m := newRenderModel()
+	m.addCert("", stem, "a", "b-c", nil)
+	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
+		t.Fatalf("project: n=%d err=%v", n, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "a_b-c.crt")); string(b) != "CRT" {
+		t.Fatalf("new crt=%q", b)
+	}
+	for _, n := range []string{"a-b-c.crt", "a-b-c.key"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); !os.IsNotExist(err) {
+			t.Fatalf("old %s must be pruned: %v", n, err)
+		}
+	}
+}
+
+func TestProjectCertsToSecret_UpgradeDropsOldHostlessKey(t *testing.T) {
+	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
+	old := &corev1.Secret{}
+	old.Namespace, old.Name = out.Namespace, out.Name
+	old.Labels = map[string]string{ingressCertsManagedLabel: "true"}
+	old.Data = map[string][]byte{"a-b-c.crt": []byte("old"), "a-b-c.key": []byte("old")}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(old, tlsSecret("a", "b-c", "CRT", "KEY")).Build()
+	r := &IngressReconciler{Client: c, CertsOutSecret: out}
+	stem, _ := certStem("", "a", "b-c")
+	m := newRenderModel()
+	m.addCert("", stem, "a", "b-c", nil)
+	if _, _, err := r.projectCertsToSecret(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	var got corev1.Secret
+	if err := c.Get(context.Background(), out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data["a_b-c.crt"]) != "CRT" {
+		t.Fatalf("new key missing: %v", got.Data)
+	}
+	if _, ok := got.Data["a-b-c.crt"]; ok {
+		t.Fatalf("old key must be gone after one render: %v", got.Data)
 	}
 }
 
