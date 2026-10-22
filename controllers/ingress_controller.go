@@ -273,6 +273,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				"server-alias %s cannot be used as a host: %s; this alias is ignored", alias, problem)
 			return true
 		})
+		r.reportRedirectCode(ctx, ing, a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -585,6 +586,17 @@ func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 // status. nil gate ⇒ always leader (unchanged single-writer behavior).
 func (r *IngressReconciler) leader() bool {
 	return r.IsLeader == nil || r.IsLeader()
+}
+
+// reportRedirectCode tells obj that its redirect code was refused, when it was.
+func (r *IngressReconciler) reportRedirectCode(ctx context.Context, obj client.Object, a annSettings) {
+	if a.redirectCodeRefused == "" {
+		return
+	}
+	ctrl.LoggerFrom(ctx).Info("redirect code ignored: not one Synapse serves",
+		"code", a.redirectCodeRefused, "object", obj.GetNamespace()+"/"+obj.GetName())
+	r.emit(obj, corev1.EventTypeWarning, "InvalidRedirectCode",
+		"redirect code %q is not one of 301, 302, 303, 307, 308; the redirect uses its default", a.redirectCodeRefused)
 }
 
 // emit records a Kubernetes Event on obj (no-op when there is no
