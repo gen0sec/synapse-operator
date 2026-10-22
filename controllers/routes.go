@@ -197,6 +197,10 @@ type renderModel struct {
 	// owners says which namespace holds each host. nil means no host is
 	// held, and every gate that reads it lets everything through.
 	owners *hostOwners
+	// foreignWild are the hosts, by hostKey, that any route of a namespace
+	// other than its Gateway's brings in. A name the Gateway's namespace
+	// names is held against them, even when its own routes bring them in too.
+	foreignWild map[string]bool
 }
 
 func newRenderModel() *renderModel {
