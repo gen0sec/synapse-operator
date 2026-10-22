@@ -481,11 +481,6 @@ func workloadSet(pods []corev1.Pod) map[string]struct{} {
 	return out
 }
 
-// workloadsMatching returns the set of workload names in ns whose pods match sel.
-func workloadsMatching(pods []corev1.Pod, ns string, sel labels.Selector) map[string]struct{} {
-	return workloadSet(podsMatching(pods, ns, sel))
-}
-
 // portStrings renders the rule's ports. Empty -> any (`*`); a numeric port ->
 // its number; a NAMED port -> the containerPort number(s) it resolves to on the
 // destination pods (so the edge is constrained to the real port, not widened);

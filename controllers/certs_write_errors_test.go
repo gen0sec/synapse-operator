@@ -138,8 +138,8 @@ func TestProjectCerts_CertsDirUnavailableStillWritesRoutes(t *testing.T) {
 	)
 
 	wantHosts(t, out, []string{"a.example.com", "b.example.com"}, nil)
-	if got := counterValue(t, mCertErrors); got != before+2 {
-		t.Errorf("certificate error counter went from %v to %v, want +2", before, got)
+	if got := counterValue(t, mCertErrors); got != before+3 {
+		t.Errorf("certificate error counter went from %v to %v, want +3", before, got)
 	}
 	if got := gaugeValue(t, mCerts); got != 0 {
 		t.Errorf("certificate gauge = %v, want 0", got)
@@ -252,8 +252,10 @@ func TestProjectCerts_ANewCertificateThatFailsIsAbsent(t *testing.T) {
 	)
 
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 0 {
-		t.Errorf("certificates directory holds %d entries, want none: %v", len(entries), entries)
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), defaultCertStem+".") {
+			t.Errorf("certificates directory holds %q, want only the default pair", e.Name())
+		}
 	}
 }
 
@@ -328,15 +330,32 @@ func TestWriteCertPair_PutsTheOldKeyBackWhenTheCertificateCannotBeMoved(t *testi
 // (synapse-utils tools.rs reload_relevant_path), so a staged file has to be
 // the first kind, and must not be the second, which the loader would read.
 func TestCertTempName_IsWhatSynapseWatcherReactsToAndLoaderIgnores(t *testing.T) {
-	for _, ext := range []string{".crt", ".key"} {
-		name := certTempName("shop.example.com", ext)
-		if !strings.HasPrefix(name, "..") {
-			t.Errorf("%q does not start with .., so creating it does not trigger a reload", name)
+	stems := []string{"shop.example.com", strings.Repeat("a", 16), strings.Repeat("a", 245), strings.Repeat("a", 246), strings.Repeat("a", maxCertStem)}
+	for _, stem := range stems {
+		for _, ext := range []string{".crt", ".key"} {
+			checkCertTempName(t, stem, ext)
 		}
-		for _, loaded := range []string{".crt", ".key", ".pem"} {
-			if strings.HasSuffix(name, loaded) {
-				t.Errorf("%q ends in %s, the loader would read it", name, loaded)
-			}
+	}
+	if name := certTempName(strings.Repeat("a", 245), ".crt"); !strings.Contains(name, strings.Repeat("a", 245)) {
+		t.Errorf("a 245-char stem fits under its own name, got %q", name)
+	}
+	if a, b := certTempName(strings.Repeat("a", 246), ".crt"), certTempName(strings.Repeat("a", 245)+"b", ".crt"); a == b {
+		t.Errorf("two long stems staged under one name %q", a)
+	}
+}
+
+func checkCertTempName(t *testing.T, stem, ext string) {
+	t.Helper()
+	name := certTempName(stem, ext)
+	if len(name) > 255 {
+		t.Errorf("staged name for a %d-char stem is %d bytes, over a file name's 255", len(stem), len(name))
+	}
+	if !strings.HasPrefix(name, "..") {
+		t.Errorf("%q does not start with .., so creating it does not trigger a reload", name)
+	}
+	for _, loaded := range []string{".crt", ".key", ".pem"} {
+		if strings.HasSuffix(name, loaded) {
+			t.Errorf("%q ends in %s, the loader would read it", name, loaded)
 		}
 	}
 }
@@ -365,5 +384,122 @@ func TestReconcile_RequeuesWhileTheCertsDirIsUnavailable(t *testing.T) {
 	}
 	if res.RequeueAfter != time.Minute {
 		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+}
+
+// The default certificate is written like a tenant's: when its rotation cannot
+// be written the render goes on, the failure is counted and retried, and the
+// pair that was there keeps serving.
+func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
+	dir := t.TempDir()
+	routes := filepath.Join(t.TempDir(), "upstreams.yaml")
+	now := certT0
+	r := &IngressReconciler{
+		IngressClassName: "synapse",
+		CertsOutDir:      dir,
+		UpstreamsOutPath: routes,
+		ClusterDomain:    "cluster.local",
+		Clock:            func() time.Time { return now },
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		[]client.Object{
+			tlsIngress("web", "web.example.com", "web-tls"),
+			tlsSecret("default", "web-tls", "CRT-web", "KEY-web"),
+		}...).Build()
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	crt, key := readDefault(t, dir)
+	if err := os.Remove(routes); err != nil {
+		t.Fatal(err)
+	}
+
+	// Due for renewal, and the new certificate cannot be staged.
+	now = certT0.Add(defaultCertValidity - defaultCertRenewBefore/2)
+	if err := os.Mkdir(filepath.Join(dir, certTempName(defaultCertStem, ".crt")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := counterValue(t, mCertErrors)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{})
+	if err != nil {
+		t.Fatalf("a default certificate that cannot be written failed the render: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+	if got := counterValue(t, mCertErrors); got != before+1 {
+		t.Errorf("certificate error counter went from %v to %v", before, got)
+	}
+	if !exists(routes) {
+		t.Error("the routes file was not written")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "web.example.com.crt")); string(b) != "CRT-web" {
+		t.Errorf("the tenant certificate is %q", b)
+	}
+	crt2, key2 := readDefault(t, dir)
+	if string(crt2) != string(crt) || string(key2) != string(key) {
+		t.Error("the default pair did not survive the failed rewrite")
+	}
+}
+
+// With no certificate to project, the default one is all that a certificates
+// directory that cannot be made fails, and it is retried.
+func TestReconcile_RequeuesWhileTheCertsDirIsUnavailableWithNoTLSIngress(t *testing.T) {
+	notADir := filepath.Join(t.TempDir(), "certs")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &IngressReconciler{
+		IngressClassName: "synapse",
+		CertsOutDir:      notADir,
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "upstreams.yaml"),
+		ClusterDomain:    "cluster.local",
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	before := counterValue(t, mCertErrors)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want a minute", res.RequeueAfter)
+	}
+	if got := counterValue(t, mCertErrors); got != before+1 {
+		t.Errorf("certificate error counter went from %v to %v, want +1", before, got)
+	}
+}
+
+// A default certificate that cannot be written and has no pair on disk is
+// absent, and is not counted as a projected certificate.
+func TestProjectCerts_ADefaultThatFailsWithNoPairIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, certTempName(defaultCertStem, ".crt")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Half a pair is no pair: it is pruned, not kept.
+	if err := os.WriteFile(filepath.Join(dir, defaultCertStem+".crt"), []byte("half"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &IngressReconciler{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).
+			WithObjects(tlsSecret("default", "web-tls", "CRT-web", "KEY-web")).Build(),
+		CertsOutDir: dir,
+	}
+	m := newRenderModel()
+	m.addCert("web.example.com", "web.example.com", "default", "web-tls", nil)
+
+	_, n, failed, err := r.writeCerts(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || failed != 1 {
+		t.Errorf("projected = %d, failed = %d; want 1 and 1", n, failed)
+	}
+	for _, ext := range []string{".crt", ".key"} {
+		if exists(filepath.Join(dir, defaultCertStem+ext)) {
+			t.Errorf("%s%s exists, want none", defaultCertStem, ext)
+		}
 	}
 }

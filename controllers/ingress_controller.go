@@ -301,6 +301,14 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 		m.owners = resolveHostOwners(claims)
 	}
+	var served, refusedIngs []*networkingv1.Ingress
+	for _, ing := range matchedIngs {
+		if m.fullyRefused(ing) {
+			refusedIngs = append(refusedIngs, ing)
+		} else {
+			served = append(served, ing)
+		}
+	}
 
 	for _, o := range ours {
 		ing, a := o.ing, o.a
@@ -320,6 +328,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 			return true
 		})
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
+		r.reportRedirectCode(ctx, ing, a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -553,17 +562,34 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		if r.SignalReload && !r.usesConfigMapOutput() {
 			r.signalReload(ctx)
 		}
-		for _, ing := range matchedIngs {
+		for _, ing := range served {
 			r.emit(ing, corev1.EventTypeNormal, "Programmed",
 				"programmed into synapse upstreams (%d hosts, %d routes)", hosts, routes)
 		}
 	}
-	r.publishStatus(ctx, matchedIngs)
+	r.publishStatus(ctx, served, refusedIngs)
 
 	if r.ready.CompareAndSwap(false, true) && r.OwnerRef == nil {
 		mReady.Set(1)
 	}
 	return changed, matched, hosts, nil
+}
+
+// fullyRefused reports whether ing names a host in its rules and the
+// namespace of ing may use none of them. Such an Ingress has no route in the
+// file; one that keeps any host is served.
+func (m *renderModel) fullyRefused(ing *networkingv1.Ingress) bool {
+	named := false
+	for _, rule := range ing.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		named = true
+		if m.owners.allows(rule.Host, ing.Namespace) {
+			return false
+		}
+	}
+	return named
 }
 
 // hostAllowed reports whether the namespace of ing may use host. A host it
@@ -653,6 +679,17 @@ func (r *IngressReconciler) leader() bool {
 	return r.IsLeader == nil || r.IsLeader()
 }
 
+// reportRedirectCode tells obj that its redirect code was refused, when it was.
+func (r *IngressReconciler) reportRedirectCode(ctx context.Context, obj client.Object, a annSettings) {
+	if a.redirectCodeRefused == "" {
+		return
+	}
+	ctrl.LoggerFrom(ctx).Info("redirect code ignored: not one Synapse serves",
+		"code", a.redirectCodeRefused, "object", obj.GetNamespace()+"/"+obj.GetName())
+	r.emit(obj, corev1.EventTypeWarning, "InvalidRedirectCode",
+		"redirect code %q is not one of 301, 302, 303, 307, 308; the redirect uses its default", a.redirectCodeRefused)
+}
+
 // canonicalRegexPath returns the regex path as Synapse's engine will read it.
 // An expression it cannot compile is reported as UnsupportedMatch on obj and
 // not returned: one such expression makes Synapse refuse the whole file.
@@ -679,10 +716,11 @@ func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt strin
 	r.Recorder.Eventf(obj, etype, reason, msgFmt, args...)
 }
 
-// publishStatus writes StatusAddresses onto each matched Ingress's
-// .status.loadBalancer.ingress (idempotent: only patches on change).
-// No-op when StatusAddresses is empty.
-func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkingv1.Ingress) {
+// publishStatus writes StatusAddresses onto each served Ingress's
+// .status.loadBalancer.ingress (idempotent: only patches on change). An
+// Ingress in refused has none of its hosts served, so it shows no address, and
+// loses one it had. No-op when StatusAddresses is empty.
+func (r *IngressReconciler) publishStatus(ctx context.Context, ings, refused []*networkingv1.Ingress) {
 	if len(r.StatusAddresses) == 0 || !r.leader() {
 		return
 	}
@@ -699,14 +737,20 @@ func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkin
 		}
 	}
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
-	for _, ing := range ings {
+	set := func(ing *networkingv1.Ingress, want []networkingv1.IngressLoadBalancerIngress) {
 		if apiequality.Semantic.DeepEqual(ing.Status.LoadBalancer.Ingress, want) {
-			continue
+			return
 		}
 		ing.Status.LoadBalancer.Ingress = want
 		if err := r.Status().Update(ctx, ing); err != nil {
 			logger.Error(err, "publish Ingress status", "ingress", ing.Namespace+"/"+ing.Name)
 		}
+	}
+	for _, ing := range ings {
+		set(ing, want)
+	}
+	for _, ing := range refused {
+		set(ing, nil)
 	}
 }
 
