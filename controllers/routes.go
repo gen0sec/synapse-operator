@@ -42,14 +42,10 @@ import (
 //   temporal-redirect    url         -> redirect { status: 302, location }
 //   temporal-redirect-code  u16      -> override 302 (e.g. 307)
 //
-// ssl-passthrough switches the emitted file from v1 to v2 schema for
-// the WHOLE FILE (the v1 schema has no passthrough representation; the
-// v2 parser is schema-version-strict). Every other Ingress in the
-// cluster is then re-rendered in v2 form too. The v1 → v2 fidelity
-// for terminate hosts depends on synapse-utils carrying per-route
-// ssl_enabled, http2_enabled, disable_access_log, and max_body_size
-// in its v2 RawRoute (synapse PR feat(upstreams_v2): per-route v1-
-// compat knobs).
+// The file is always the v2 schema. Terminate hosts keep per-route
+// ssl_enabled, http2_enabled, disable_access_log, and max_body_size, which
+// synapse-utils carries in its v2 RawRoute (synapse PR feat(upstreams_v2):
+// per-route v1-compat knobs).
 //
 // Sizes for proxy-body-size accept nginx-style suffixes: "50m" = 50MiB,
 // "1g" = 1GiB, "1024k" = 1024KiB, bare bytes (e.g. "1048576"). Synapse
@@ -57,11 +53,10 @@ import (
 // the cap returns 413 Payload Too Large. nginx-compat key
 // `nginx.ingress.kubernetes.io/proxy-body-size` is accepted as a fallback.
 //
-// All map onto fields the synapse legacy v1 upstreams schema already
-// supports (synapse-utils structs.rs). HTTPRoute backendRef weights
-// and Request/ResponseHeaderModifier filters are translated too;
-// URLRewrite has no equivalent in the v1 per-path schema and is left
-// unmodified (not silently faked).
+// All map onto fields of the synapse v2 upstreams schema (synapse-utils
+// structs.rs). HTTPRoute backendRef weights and Request/ResponseHeaderModifier
+// filters are translated too; URLRewrite has no equivalent in the per-path
+// schema and is left unmodified (not silently faked).
 
 const (
 	annPrefix   = "synapse.gen0sec.com/"
@@ -90,13 +85,8 @@ type routeCfg struct {
 	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
-	// noHeaders has a v1 file say that the route has no header lists,
-	// where saying nothing takes those of the nearest path above it. A v2
-	// route's headers are its own without that.
-	noHeaders bool
 	// Headers the route adds a value to, as "Name: value" lines, and
-	// names of headers it removes. Only the v2 schema has these; the v1
-	// writer leaves them out.
+	// names of headers it removes.
 	reqAdd, respAdd       []string
 	reqRemove, respRemove []string
 	// redirect, when set, makes this route a 3xx short-circuit. Status is
@@ -135,7 +125,7 @@ type annSettings struct {
 	serverAliases []string
 	// passthrough, when true, makes every rule host on this Ingress an
 	// SNI-routed TCP passthrough host (synapse terminates nothing for
-	// these hosts). Triggers v2 schema emission for the whole file.
+	// these hosts).
 	passthrough bool
 	// redirectStatus + redirectLocation drive the per-route redirect
 	// short-circuit. Populated by parseAnnotations from
@@ -173,10 +163,8 @@ type renderModel struct {
 	// certProjections is the set of Secrets to write into the
 	// certificates dir (keyed by stem, first-writer-wins).
 	certProjections map[string]certProjection
-	// passthroughHosts maps SNI → upstream "addr:port". A non-empty
-	// map triggers v2 schema emission for the whole file (v1 has no
-	// passthrough representation). FIRST-WRITER-WINS against both
-	// terminate hosts in `hosts` and other passthrough entries.
+	// passthroughHosts maps SNI → upstream "addr:port". FIRST-WRITER-WINS
+	// against both terminate hosts in `hosts` and other passthrough entries.
 	passthroughHosts map[string]string
 	sticky           bool
 	// solvers are the paths of cert-manager's HTTP-01 solvers, by host,
@@ -188,12 +176,6 @@ type renderModel struct {
 	// from, each with the name it answers for: who is told when a solver
 	// cannot be served.
 	solverSources []solverSource
-	// sameAsV1 has the v2 writer say what Synapse made of the v1 file the
-	// same routes used to be written in, where the two schemas do not
-	// mean the same by saying nothing: see renderUpstreamsV2. A
-	// SynapseProxy's routes are written so. The older modes, which write
-	// a v2 file only beside a passthrough host, write it as they did.
-	sameAsV1 bool
 	// owners says which namespace holds each host. nil means no host is
 	// held, and every gate that reads it lets everything through.
 	owners *hostOwners
@@ -268,9 +250,8 @@ func (m *renderModel) solverHost(name string) (host string, ok bool) {
 // sameOrCovering is the key of hosts that is name in another spelling, or
 // else the wildcard with the longest suffix that covers name; "" when there
 // is neither. Of several spellings it is the first in order, so that it is
-// the same one each time. The host `*`, which in a v1 file serves every
-// name that has no other, covers any name and is the shortest wildcard
-// there is.
+// the same one each time. The host `*` covers any name and is the shortest
+// wildcard there is.
 func sameOrCovering[V any](name string, hosts map[string]V) string {
 	asked := strings.TrimRight(name, ".")
 	same, wildcard, longest := "", "", 0
@@ -348,15 +329,8 @@ func (m *renderModel) solverHosts(hostKeys []string, solved map[string]map[strin
 // after the host's expressions. On a host that has any, it is an expression
 // too, and the first of them.
 //
-// A solver is reached in plain HTTP, which is said so, whichever schema it
-// is written in; and with no headers of its host's, which a v1 file has to
-// be told.
-//
-// byPath is for a v1 file, where a request's headers are found by its path
-// and not by the route that was chosen: the directory is then a plain path
-// as well, to the same solver, so that the challenge finds lists that say
-// it has none and not those of `/`.
-func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string, byPath bool) map[string]*routeCfg {
+// A solver is reached in plain HTTP, which is said so.
+func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[string]*routeCfg {
 	out := map[string]*routeCfg{}
 	expressions := slices.ContainsFunc(sortedKeys(paths), func(p string) bool { return paths[p].matchExpr != "" })
 	for p, addr := range solved {
@@ -364,11 +338,8 @@ func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string, byPat
 			continue
 		}
 		plain := false
-		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain, noHeaders: true}
+		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain}
 		if p == acmeChallengePrefix && expressions {
-			if byPath {
-				out[p] = &routeCfg{servers: rc.servers, ssl: &plain, noHeaders: true}
-			}
 			rc.matchExpr = fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
 				wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/"))
 			p = solverDirKey
@@ -410,8 +381,7 @@ func hostCharsOK(name string) bool {
 }
 
 // hostCharProblem says a name has characters a host name cannot have; ""
-// when it has none. A v1 file without host ownership takes `*` as the host
-// of every name that has no other, so it stops here.
+// when it has none.
 func hostCharProblem(name string) string {
 	if !hostCharsOK(name) {
 		return "it has characters a host name cannot have"
@@ -721,7 +691,7 @@ func (m *renderModel) addExprRoute(host, label, expr string, servers []backend, 
 // addPassthroughHost claims `host` as an SNI-routed TCP passthrough
 // upstream. FIRST-WRITER-WINS: returns false if any terminate route
 // already exists for the host, or another passthrough is already
-// registered. Triggers v2 schema emission for the whole file.
+// registered.
 func (m *renderModel) addPassthroughHost(host, upstream string) bool {
 	if host == "" || upstream == "" {
 		return false
@@ -896,8 +866,7 @@ func parseAnnotations(ann map[string]string) annSettings {
 		s.serverAliases = csv(v)
 	}
 	// ssl-passthrough: route TLS connections straight to a TCP upstream
-	// without termination. Triggers v2 schema emission. synapse-compat
-	// key first, then nginx-compat.
+	// without termination. synapse-compat key first, then nginx-compat.
 	if v, ok := get("ssl-passthrough"); ok {
 		if b := parseBool(v); b != nil {
 			s.passthrough = *b
@@ -953,129 +922,6 @@ func parseAnnotations(ann map[string]string) annSettings {
 	return s
 }
 
-// renderUpstreams emits the synapse legacy v1 schema. A cert-manager
-// solver is a path of the host that serves its name, in plain HTTP: Synapse
-// tries internal paths before any host, so one entry there would send every
-// challenge to one solver. Deterministic ordering keeps output stable so
-// writeIfChanged avoids spurious reloads.
-func renderUpstreams(m *renderModel) string {
-	var b strings.Builder
-	b.WriteString("# Generated by synapse-operator ingress controller. Do not edit.\n")
-	if m.sticky {
-		b.WriteString("sticky_sessions: true\n")
-	}
-	b.WriteString("upstreams:\n")
-	hostKeys := make([]string, 0, len(m.hosts))
-	for h := range m.hosts {
-		hostKeys = append(hostKeys, h)
-	}
-	solved := m.solverRoutes()
-	hostKeys = m.solverHosts(hostKeys, solved)
-	sort.Strings(hostKeys)
-	for _, h := range hostKeys {
-		fmt.Fprintf(&b, "  %q:\n", h)
-		if stem := m.hostCert[h]; stem != "" {
-			fmt.Fprintf(&b, "    certificate: %q\n", stem)
-		}
-		paths := m.hosts[h]
-		solvers := solverRoutesFor(paths, solved[h], true)
-		pathKeys := make([]string, 0, len(paths)+len(solvers))
-		for p := range paths {
-			pathKeys = append(pathKeys, p)
-		}
-		for p := range solvers {
-			pathKeys = append(pathKeys, p)
-		}
-		sort.Strings(pathKeys)
-		if len(pathKeys) == 0 {
-			// A bare `paths:` is null, which Synapse refuses.
-			b.WriteString("    paths: {}\n")
-			continue
-		}
-		b.WriteString("    paths:\n")
-		for _, p := range pathKeys {
-			rc := paths[p]
-			if rc == nil {
-				rc = solvers[p]
-			}
-			fmt.Fprintf(&b, "      %q:\n        servers:\n", p)
-			for _, sv := range rc.servers {
-				if sv.weight > 0 {
-					fmt.Fprintf(&b, "          - { address: %q, weight: %d }\n", sv.addr, sv.weight)
-				} else {
-					fmt.Fprintf(&b, "          - %q\n", sv.addr)
-				}
-			}
-			if rc.matchExpr != "" {
-				fmt.Fprintf(&b, "        match_expr: %q\n", rc.matchExpr)
-			}
-			// ssl_enabled: explicit annotation wins; default false
-			// (plain HTTP to backend — unchanged prior behavior).
-			ssl := false
-			if rc.ssl != nil {
-				ssl = *rc.ssl
-			}
-			fmt.Fprintf(&b, "        ssl_enabled: %t\n", ssl)
-			if rc.http2 != nil {
-				fmt.Fprintf(&b, "        http2_enabled: %t\n", *rc.http2)
-			}
-			if rc.forceHTTPS != nil {
-				fmt.Fprintf(&b, "        https_proxy_enabled: %t\n", *rc.forceHTTPS)
-			}
-			if rc.healthcheck != nil {
-				fmt.Fprintf(&b, "        healthcheck: %t\n", *rc.healthcheck)
-			}
-			if rc.disableAccessLog != nil {
-				fmt.Fprintf(&b, "        disable_access_log: %t\n", *rc.disableAccessLog)
-			}
-			if rc.connectTimeout != nil {
-				fmt.Fprintf(&b, "        connection_timeout: %d\n", *rc.connectTimeout)
-			}
-			if rc.readTimeout != nil {
-				fmt.Fprintf(&b, "        read_timeout: %d\n", *rc.readTimeout)
-			}
-			if rc.writeTimeout != nil {
-				fmt.Fprintf(&b, "        write_timeout: %d\n", *rc.writeTimeout)
-			}
-			if rc.idleTimeout != nil {
-				fmt.Fprintf(&b, "        idle_timeout: %d\n", *rc.idleTimeout)
-			}
-			if rc.maxBodySize != nil {
-				fmt.Fprintf(&b, "        max_body_size: %d\n", *rc.maxBodySize)
-			}
-			if rc.redirectStatus != nil && rc.redirectLocation != "" {
-				fmt.Fprintf(&b, "        redirect:\n          status: %d\n          location: %q\n",
-					*rc.redirectStatus, rc.redirectLocation)
-			}
-			writeHeaderLists(&b, rc)
-		}
-	}
-	return b.String()
-}
-
-// writeHeaderLists writes a v1 route's two header lists.
-//
-// A route with request headers also says what its response headers are,
-// none included. Synapse reads one that has request headers and not a word
-// on response headers as the older single list, and sends the same headers
-// back to the client: a credential set for the backend would go out in
-// every response.
-func writeHeaderLists(b *strings.Builder, rc *routeCfg) {
-	write := func(key string, hs []string, always bool) {
-		switch {
-		case len(hs) > 0:
-			fmt.Fprintf(b, "        %s:\n", key)
-			for _, h := range hs {
-				fmt.Fprintf(b, "          - %q\n", h)
-			}
-		case always:
-			fmt.Fprintf(b, "        %s: []\n", key)
-		}
-	}
-	write("request_headers", rc.reqHeaders, rc.noHeaders)
-	write("response_headers", rc.respHeaders, rc.noHeaders || len(rc.reqHeaders) > 0)
-}
-
 // plainPathKey is the key a plain path is stored under: without a trailing
 // slash, except the root. See addRoute.
 func plainPathKey(path string) string {
@@ -1087,48 +933,36 @@ func plainPathKey(path string) string {
 	return path
 }
 
-// renderUpstreamsV2 emits the v2 synapse upstreams schema. It is what a
-// SynapseProxy's routes are written in: the v2 schema has what the Gateway
-// API needs of the proxy, and the v1 schema does not. The older modes use
-// v2 when at least one host is SNI passthrough — v1 has no passthrough
-// representation, so the whole file switches to v2.
-// Terminate hosts are emitted with full per-route fidelity (ssl_enabled,
-// http2_enabled, disable_access_log, max_body_size, force_https, timeouts,
-// headers), which requires synapse's RawRoute to carry those four knobs
-// (see synapse feat(upstreams_v2): per-route v1-compat knobs).
+// renderUpstreamsV2 emits the v2 synapse upstreams schema, in which every
+// mode writes its routes. Terminate hosts are emitted with full per-route
+// fidelity (ssl_enabled, http2_enabled, disable_access_log, max_body_size,
+// force_https, timeouts, headers), which requires synapse's RawRoute to
+// carry those four knobs (see synapse feat(upstreams_v2): per-route
+// v1-compat knobs).
 //
-// The two schemas do not mean the same by saying nothing. With
-// renderModel.sameAsV1 the file says what Synapse made of the v1 file:
+// Saying nothing does not mean the same in every version of the schema, so
+// the file says what it means:
 //
 //   - how a backend is reached: plain HTTP unless the route asks for TLS.
-//     Unsaid, a v2 route goes by the backend's port.
+//     Unsaid, a route goes by the backend's port.
 //   - whether it is probed: unless the route says not to, and then with
-//     the global settings. That is a v2 route without `health_check:`;
-//     one that is not probed says `type: none`.
-//   - how long a backend may take to send: 120 seconds. A v2 file that
-//     sets no read timeout gives a route 60.
-//   - what a backend is told about the client: nothing. A v2 file has the
-//     client's fingerprints sent on in request headers unless it says no.
+//     the global settings. That is a route without `health_check:`; one
+//     that is not probed says `type: none`.
+//   - how long a backend may take to send: 120 seconds. Unsaid, a route
+//     gets 60.
+//   - what a backend is told about the client: nothing. Unsaid, the
+//     client's fingerprints are sent on in request headers.
 //
-// One thing is not carried over. In a v1 file a path without a list of
-// headers takes the one of the nearest path above it that has one. In a v2
-// file a route's headers are its own, each way.
+// A route's headers are its own, each way: a path without a list of
+// headers does not take the one of the path above it.
 func renderUpstreamsV2(m *renderModel) string {
 	var b strings.Builder
 	b.WriteString("# Generated by synapse-operator ingress controller. Do not edit.\n")
 	b.WriteString("version: 2\n")
-	if m.sameAsV1 {
-		fmt.Fprintf(&b, "timeouts:\n  read: %d\n", v1ReadTimeoutSeconds)
-	}
-
-	if m.sameAsV1 || m.sticky {
-		b.WriteString("proxy:\n")
-		if m.sameAsV1 {
-			b.WriteString("  fingerprints:\n    forward: false\n")
-		}
-		if m.sticky {
-			b.WriteString("  sticky_sessions:\n    enabled: true\n")
-		}
+	fmt.Fprintf(&b, "timeouts:\n  read: %d\n", defaultReadTimeoutSeconds)
+	b.WriteString("proxy:\n  fingerprints:\n    forward: false\n")
+	if m.sticky {
+		b.WriteString("  sticky_sessions:\n    enabled: true\n")
 	}
 
 	// Stable iteration: terminate hosts first (sorted), then passthrough
@@ -1173,7 +1007,7 @@ func renderUpstreamsV2(m *renderModel) string {
 		for p := range paths {
 			pathKeys = append(pathKeys, p)
 		}
-		solvers := solverRoutesFor(paths, solved[h], false)
+		solvers := solverRoutesFor(paths, solved[h])
 		for p := range solvers {
 			pathKeys = append(pathKeys, p)
 		}
@@ -1189,24 +1023,24 @@ func renderUpstreamsV2(m *renderModel) string {
 				rc = solvers[p]
 			}
 			fmt.Fprintf(&b, "      %q:\n", p)
-			writeRouteV2(&b, rc, m.sameAsV1)
+			writeRouteV2(&b, rc)
 		}
 	}
 	return b.String()
 }
 
-// v1ReadTimeoutSeconds is how long a backend may take to send, for a route
-// of a v1 file that does not say.
-const v1ReadTimeoutSeconds = 120
+// defaultReadTimeoutSeconds is how long a backend may take to send, for a
+// route that does not say.
+const defaultReadTimeoutSeconds = 120
 
 // writeRouteV2 emits one v2 route block. Field ordering and indentation
 // match the v2 schema (synapse-utils RawRoute) — anything else fails
-// the deny_unknown_fields parser. sameAsV1 is renderModel.sameAsV1.
-func writeRouteV2(b *strings.Builder, rc *routeCfg, sameAsV1 bool) {
-	// A route of a v1 file is probed unless it says `healthcheck: false`.
-	// Synapse does not probe a route chosen by an expression at all, and
-	// refuses a file that says how to.
-	unprobed := sameAsV1 && rc.matchExpr == "" && rc.healthcheck != nil && !*rc.healthcheck
+// the deny_unknown_fields parser.
+func writeRouteV2(b *strings.Builder, rc *routeCfg) {
+	// A route is probed unless it says `healthcheck: false`. Synapse does
+	// not probe a route chosen by an expression at all, and refuses a file
+	// that says how to.
+	unprobed := rc.matchExpr == "" && rc.healthcheck != nil && !*rc.healthcheck
 	if len(rc.servers) == 1 && rc.servers[0].weight == 0 {
 		fmt.Fprintf(b, "        upstream: %q\n", rc.servers[0].addr)
 	} else {
@@ -1225,12 +1059,11 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg, sameAsV1 bool) {
 	switch {
 	case unprobed:
 		// A backend that is never probed is reached by its port, whatever
-		// the route says of TLS: in a v1 file as well. A v2 file that
-		// says otherwise beside `type: none` is refused, so nothing is
-		// said.
+		// the route says of TLS. A v2 file that says otherwise beside
+		// `type: none` is refused, so nothing is said.
 	case rc.ssl != nil:
 		fmt.Fprintf(b, "        ssl_enabled: %t\n", *rc.ssl)
-	case sameAsV1:
+	default:
 		b.WriteString("        ssl_enabled: false\n")
 	}
 	if rc.http2 != nil {
@@ -1239,18 +1072,8 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg, sameAsV1 bool) {
 	if rc.forceHTTPS != nil && *rc.forceHTTPS {
 		b.WriteString("        force_https: true\n")
 	}
-	switch {
-	case unprobed:
+	if unprobed {
 		b.WriteString("        health_check:\n          type: none\n")
-	case sameAsV1:
-		// Probed with the global settings, which is what `healthcheck:
-		// true` asked for in a v1 file, and what saying nothing does.
-	case rc.healthcheck != nil && *rc.healthcheck && rc.matchExpr == "":
-		// v2 requires a structured health_check. v1 had only a boolean,
-		// so fall back to the simplest type: TCP. Operators that need
-		// HTTP health checks can hand-edit upstreams.yaml or extend
-		// the annotation set later.
-		b.WriteString("        health_check:\n          type: tcp\n")
 	}
 	if rc.disableAccessLog != nil {
 		fmt.Fprintf(b, "        disable_access_log: %t\n", *rc.disableAccessLog)

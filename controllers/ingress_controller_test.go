@@ -22,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
-	"sigs.k8s.io/yaml"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -45,28 +44,6 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 func ptr[T any](v T) *T { return &v }
 
-// v1File is as much of the legacy upstreams file as the solver tests read.
-type v1File struct {
-	InternalPaths map[string]any `json:"internal_paths"`
-	Upstreams     map[string]struct {
-		Certificate string `json:"certificate"`
-		Paths       map[string]struct {
-			Servers    []any  `json:"servers"`
-			MatchExpr  string `json:"match_expr"`
-			SSLEnabled *bool  `json:"ssl_enabled"`
-		} `json:"paths"`
-	} `json:"upstreams"`
-}
-
-func parseV1(t *testing.T, rendered string) v1File {
-	t.Helper()
-	var doc v1File
-	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
-		t.Fatalf("rendered file: %v\n%s", err, rendered)
-	}
-	return doc
-}
-
 // Synapse tries internal paths before any host, so one entry for the whole
 // challenge directory sends every challenge to one solver. Each solver is
 // the path of the host that serves its name instead, and the file has no
@@ -84,25 +61,25 @@ func TestRenderUpstreams_EverySolverIsARouteOfItsHost(t *testing.T) {
 	const kept = "/.well-known/acme-challenge/kept"
 	m.hosts["b.example.com"][kept] = &routeCfg{servers: web}
 	m.addSolver("b.example.com", kept, "solver-c:8089")
-	out := renderUpstreams(m)
-	doc := parseV1(t, out)
-	if len(doc.InternalPaths) != 0 || strings.Contains(out, "internal_paths:") {
-		t.Fatalf("the file has internal_paths:\n%s", out)
+	out := renderUpstreamsV2(m)
+	doc := parseV2(t, out)
+	if len(doc.Internal) != 0 || strings.Contains(out, "internal_paths:") {
+		t.Fatalf("the file has internal paths:\n%s", out)
 	}
-	if route := doc.Upstreams["b.example.com"].Paths[kept]; len(route.Servers) != 1 || route.Servers[0] != web[0].addr {
+	if route := doc.Hosts["b.example.com"].Paths[kept]; route.Upstream != web[0].addr {
 		t.Errorf("the host's own route for %s is %+v\n%s", kept, route, out)
 	}
 	if n := strings.Count(out, fmt.Sprintf("%q:", kept)); n != 1 {
 		t.Errorf("%s is written %d times\n%s", kept, n, out)
 	}
-	delete(doc.Upstreams["b.example.com"].Paths, kept)
+	delete(doc.Hosts["b.example.com"].Paths, kept)
 	for host, want := range map[string]struct{ token, addr string }{
 		"a.example.com": {"/.well-known/acme-challenge/tokA", "solver-a:8089"},
 		"b.example.com": {"/.well-known/acme-challenge/tokB", "solver-b:8089"},
 	} {
-		paths := doc.Upstreams[host].Paths
+		paths := doc.Hosts[host].Paths
 		route, ok := paths[want.token]
-		if !ok || len(route.Servers) != 1 || route.Servers[0] != want.addr || route.MatchExpr != "" {
+		if !ok || route.Upstream != want.addr || route.MatchExpr != "" {
 			t.Errorf("%s: the solver's route is %+v\n%s", host, route, out)
 		}
 		if route.SSLEnabled == nil || *route.SSLEnabled {
@@ -114,24 +91,29 @@ func TestRenderUpstreams_EverySolverIsARouteOfItsHost(t *testing.T) {
 	}
 }
 
-// In a v1 file a path that says nothing of headers takes the lists of the
-// nearest path above it. A solver says that it has none, or what its host
-// sets for `/`, a credential for the backend it may be, would go to the
-// solver's pod.
+// What its host sets for `/`, a credential for the backend it may be, must
+// not go to the solver's pod: a route's headers are its own.
 func TestRenderUpstreams_ASolverTakesNoHeadersFromItsHost(t *testing.T) {
 	const token = "/.well-known/acme-challenge/tok"
 	m := newRenderModel()
 	m.addRoute("a.example.com", "/", []backend{{addr: "app:80"}},
 		annSettings{reqHeaders: []string{"Authorization: Bearer x"}, respHeaders: []string{"X-Frame-Options: DENY"}}, nil, nil)
 	m.addSolver("a.example.com", token, "solver:8089")
-	out := renderUpstreams(m)
-	want := fmt.Sprintf("      %q:\n        servers:\n          - \"solver:8089\"\n        ssl_enabled: false\n        request_headers: []\n        response_headers: []\n", token)
-	if !strings.Contains(out, want) {
-		t.Errorf("the solver's route does not say it has no headers:\n%s", out)
+	out := renderUpstreamsV2(m)
+	paths := parseV2(t, out).Hosts["a.example.com"].Paths
+	solver, ok := paths[token]
+	if !ok || solver.Upstream != "solver:8089" {
+		t.Fatalf("no route for the solver: %+v\n%s", solver, out)
+	}
+	if len(solver.Headers.Request) != 0 || len(solver.Headers.Response) != 0 {
+		t.Errorf("the solver's route has headers: %+v\n%s", solver.Headers, out)
+	}
+	if root := paths["/"]; len(root.Headers.Request) != 1 || len(root.Headers.Response) != 1 {
+		t.Errorf("the host's route lost its headers: %+v\n%s", root.Headers, out)
 	}
 }
 
-// In a v1 file the host `*` serves every name that has no other. A solver
+// The host `*` serves every name that has no other. A solver
 // for such a name is a path of `*`: a host written for it would take the
 // name's other requests from there.
 func TestRenderUpstreams_ASolverDoesNotTakeItsNameFromTheDefaultHost(t *testing.T) {
@@ -150,12 +132,12 @@ func TestRenderUpstreams_ASolverDoesNotTakeItsNameFromTheDefaultHost(t *testing.
 			t.Fatalf("x.example.com is served as %q", host)
 		}
 	}
-	out := renderUpstreams(m)
-	doc := parseV1(t, out)
-	if _, own := doc.Upstreams["other.test"]; own || len(doc.Upstreams) != 2 {
+	out := renderUpstreamsV2(m)
+	doc := parseV2(t, out)
+	if _, own := doc.Hosts["other.test"]; own || len(doc.Hosts) != 2 {
 		t.Errorf("a host is written for the solver beside the default host:\n%s", out)
 	}
-	if route := doc.Upstreams["*"].Paths[token]; len(route.Servers) != 1 || route.Servers[0] != "solver-1:8089" {
+	if route := doc.Hosts["*"].Paths[token]; route.Upstream != "solver-1:8089" {
 		t.Errorf("the default host's route for the challenge is %+v\n%s", route, out)
 	}
 }
@@ -169,15 +151,15 @@ func TestRenderUpstreams_ASolverOnlyNameAndAWildcardsName(t *testing.T) {
 	const token = "/.well-known/acme-challenge/tok"
 	m.addSolver("only.test", token, "solver-1:8089")
 	m.addSolver("x.example.com", token, "solver-2:8089")
-	out := renderUpstreams(m)
-	doc := parseV1(t, out)
-	if got := sortedKeys(doc.Upstreams); !slices.Equal(got, []string{"*.example.com", "only.test"}) {
+	out := renderUpstreamsV2(m)
+	doc := parseV2(t, out)
+	if got := sortedKeys(doc.Hosts); !slices.Equal(got, []string{"*.example.com", "only.test"}) {
 		t.Fatalf("the hosts are %q\n%s", got, out)
 	}
-	if r, ok := doc.Upstreams["only.test"].Paths[token]; !ok || r.Servers[0] != "solver-1:8089" || r.SSLEnabled == nil || *r.SSLEnabled {
+	if r, ok := doc.Hosts["only.test"].Paths[token]; !ok || r.Upstream != "solver-1:8089" || r.SSLEnabled == nil || *r.SSLEnabled {
 		t.Errorf("only.test: %+v\n%s", r, out)
 	}
-	if r, ok := doc.Upstreams["*.example.com"].Paths[token]; !ok || r.Servers[0] != "solver-2:8089" {
+	if r, ok := doc.Hosts["*.example.com"].Paths[token]; !ok || r.Upstream != "solver-2:8089" {
 		t.Errorf("*.example.com: %+v\n%s", r, out)
 	}
 	if _, taken := m.hosts["only.test"]; taken {
@@ -193,10 +175,10 @@ func TestRenderUpstreams_AWholeDirectorySolverOnAHostWithARegexRoute(t *testing.
 	m.addRoute("api.example.com", "/", []backend{{addr: "web:80"}}, annSettings{}, nil, nil)
 	m.addRegexRoute("api.example.com", `/v\d+/items`, []backend{{addr: "items:80"}}, annSettings{}, nil, nil)
 	m.addSolver("api.example.com", "/.well-known/acme-challenge/", "solver:8089")
-	out := renderUpstreams(m)
-	paths := parseV1(t, out).Upstreams["api.example.com"].Paths
+	out := renderUpstreamsV2(m)
+	paths := parseV2(t, out).Hosts["api.example.com"].Paths
 	route, ok := paths[solverDirKey]
-	if !ok || route.Servers[0] != "solver:8089" || route.SSLEnabled == nil || *route.SSLEnabled {
+	if !ok || route.Upstream != "solver:8089" || route.SSLEnabled == nil || *route.SSLEnabled {
 		t.Fatalf("no solver route under %q: %+v\n%s", solverDirKey, route, out)
 	}
 	for _, want := range []string{`http.request.path eq "/.well-known/acme-challenge"`, `^/\.well-known/acme-challenge/`} {
@@ -204,30 +186,16 @@ func TestRenderUpstreams_AWholeDirectorySolverOnAHostWithARegexRoute(t *testing.
 			t.Errorf("match_expr %q lacks %s", route.MatchExpr, want)
 		}
 	}
-	// And a plain path beside it. A v1 file's headers are found by the
-	// request's path, whichever route was chosen: without a path of its
-	// own that says it has none, the challenge would take those of `/`.
-	plain, ok := paths["/.well-known/acme-challenge"]
-	if !ok || plain.MatchExpr != "" || len(plain.Servers) != 1 || plain.Servers[0] != "solver:8089" {
-		t.Errorf("the directory is not a plain path to the solver as well: %+v\n%s", plain, out)
-	}
-	if n := strings.Count(out, "        request_headers: []\n        response_headers: []\n"); n != 2 {
-		t.Errorf("%d routes say they have no headers, want the solver's two:\n%s", n, out)
-	}
-	if len(paths) != 4 {
-		t.Errorf("%d routes, want 4:\n%s", len(paths), out)
-	}
-	// A v2 file's headers are the route's own: no second route there.
-	v2 := parseV2(t, renderUpstreamsV2(m)).Hosts["api.example.com"].Paths
-	if _, plain := v2["/.well-known/acme-challenge"]; plain || len(v2) != 3 {
-		t.Errorf("a v2 file has %d routes for the host, want 3", len(v2))
+	// A route's headers are its own: no plain path beside it.
+	if _, plain := paths["/.well-known/acme-challenge"]; plain || len(paths) != 3 {
+		t.Errorf("the host has %d routes, want 3 and no plain path for the directory:\n%s", len(paths), out)
 	}
 }
 
 func TestRenderUpstreams_NoSolverNoInternalPaths(t *testing.T) {
 	m := newRenderModel()
 	m.addRoute("a.example.com", "/", []backend{{addr: "b:80"}}, annSettings{}, nil, nil)
-	if strings.Contains(renderUpstreams(m), "internal_paths:") {
+	if strings.Contains(renderUpstreamsV2(m), "internal_paths:") {
 		t.Fatal("no solver => no internal_paths block")
 	}
 }
@@ -239,15 +207,15 @@ func TestRenderUpstreams_Deterministic(t *testing.T) {
 		m.addRoute("b.example.com", "/x", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
 		m.addRoute("b.example.com", "/a", []backend{{addr: "a:1"}}, annSettings{}, nil, nil)
 		m.addRoute("a.example.com", "/", []backend{{addr: "y:2"}}, annSettings{}, nil, nil)
-		return renderUpstreams(m)
+		return renderUpstreamsV2(m)
 	}
 	if build() != build() {
-		t.Fatal("renderUpstreams not deterministic (would cause spurious synapse reloads)")
+		t.Fatal("renderUpstreamsV2 not deterministic (would cause spurious synapse reloads)")
 	}
 }
 
 // Annotation-driven upstream settings + weighted servers must surface
-// in the rendered legacy v1 schema.
+// in the rendered v2 schema.
 func TestRenderUpstreams_AnnotationsAndWeights(t *testing.T) {
 	m := newRenderModel()
 	tru := true
@@ -256,21 +224,24 @@ func TestRenderUpstreams_AnnotationsAndWeights(t *testing.T) {
 		[]backend{{addr: "a:80", weight: 3}, {addr: "b:80", weight: 1}},
 		annSettings{ssl: &tru, http2: &tru, connectTimeout: &ct,
 			reqHeaders: []string{"X-A: 1"}, sticky: true}, nil, []string{"X-Resp: y"})
-	out := renderUpstreams(m)
-	for _, want := range []string{
-		"sticky_sessions: true",
-		`{ address: "a:80", weight: 3 }`,
-		`{ address: "b:80", weight: 1 }`,
-		"ssl_enabled: true",
-		"http2_enabled: true",
-		"connection_timeout: 7",
-		"request_headers:",
-		`- "X-A: 1"`,
-		"response_headers:",
-		`- "X-Resp: y"`,
-	} {
+	out := renderUpstreamsV2(m)
+	doc := parseV2(t, out)
+	if !doc.Proxy.StickySessions.Enabled {
+		t.Errorf("sticky sessions are not on:\n%s", out)
+	}
+	rt := doc.Hosts["app.example.com"].Paths["/"]
+	if rt.SSLEnabled == nil || !*rt.SSLEnabled || rt.HTTP2 == nil || !*rt.HTTP2 {
+		t.Errorf("ssl/http2: %+v\n%s", rt, out)
+	}
+	if rt.Timeouts.Connect == nil || *rt.Timeouts.Connect != 7 {
+		t.Errorf("connect timeout: %+v\n%s", rt.Timeouts, out)
+	}
+	if !slices.Equal(rt.Headers.Request, []string{"X-A: 1"}) || !slices.Equal(rt.Headers.Response, []string{"X-Resp: y"}) {
+		t.Errorf("headers: %+v\n%s", rt.Headers, out)
+	}
+	for _, want := range []string{`{ addr: "a:80", weight: 3 }`, `{ addr: "b:80", weight: 1 }`} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("missing %q in:\n%s", want, out)
+			t.Errorf("missing %q in:\n%s", want, out)
 		}
 	}
 }
@@ -580,7 +551,7 @@ func TestAddRoute_StripsTrailingSlash(t *testing.T) {
 	if _, ok := m.hosts["h"]["/docs/x/swagger/"]; ok {
 		t.Fatal("slashed key must not be stored")
 	}
-	s := renderUpstreams(m)
+	s := renderUpstreamsV2(m)
 	if !strings.Contains(s, `"/docs/x/swagger":`) || strings.Contains(s, `"/docs/x/swagger/":`) {
 		t.Fatalf("rendered key must be de-slashed:\n%s", s)
 	}
@@ -973,7 +944,7 @@ func TestParseAnnotations_ServerAlias(t *testing.T) {
 	}
 }
 
-// renderUpstreams emits each alias host as its own block with the same
+// renderUpstreamsV2 emits each alias host as its own block with the same
 // settings as the primary host. Verified by addRoute over alias hosts.
 func TestRenderUpstreams_ServerAliasDuplicatesRoute(t *testing.T) {
 	m := newRenderModel()
@@ -986,12 +957,12 @@ func TestRenderUpstreams_ServerAliasDuplicatesRoute(t *testing.T) {
 		m.addRoute(alias, "/",
 			[]backend{{addr: "be:80"}}, a, nil, nil)
 	}
-	out := renderUpstreams(m)
+	out := renderUpstreamsV2(m)
 	for _, want := range []string{
 		`"example.com":`,
 		`"www.example.com":`,
 		`"alt.example.com":`,
-		`- "be:80"`,
+		`upstream: "be:80"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)
@@ -1215,44 +1186,27 @@ func TestParseAnnotations_RedirectCodeRefusedBelongsToTheWinner(t *testing.T) {
 	}
 }
 
-// renderUpstreams emits a redirect: block on the route when set, both
-// in v1 emission and v2 emission. Verified separately for each.
+// renderUpstreamsV2 emits a redirect: block on the route when set.
 func TestRenderUpstreams_RedirectEmitted(t *testing.T) {
 	st := uint64(301)
 	m := newRenderModel()
+	m.addPassthroughHost("pt.example.com", "10.0.0.1:443")
 	m.addRoute("example.com", "/old",
 		[]backend{{addr: "be:80"}},
 		annSettings{redirectStatus: &st, redirectLocation: "/new"}, nil, nil)
-	out := renderUpstreams(m)
+	out := renderUpstreamsV2(m)
 	for _, want := range []string{
 		"redirect:",
 		"status: 301",
 		`location: "/new"`,
 	} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("v1 missing %q in:\n%s", want, out)
-		}
-	}
-
-	// v2 emission (forced by adding a passthrough host)
-	m2 := newRenderModel()
-	m2.addPassthroughHost("pt.example.com", "10.0.0.1:443")
-	m2.addRoute("example.com", "/old",
-		[]backend{{addr: "be:80"}},
-		annSettings{redirectStatus: &st, redirectLocation: "/new"}, nil, nil)
-	out2 := renderUpstreamsV2(m2)
-	for _, want := range []string{
-		"redirect:",
-		"status: 301",
-		`location: "/new"`,
-	} {
-		if !strings.Contains(out2, want) {
-			t.Fatalf("v2 missing %q in:\n%s", want, out2)
+			t.Fatalf("missing %q in:\n%s", want, out)
 		}
 	}
 }
 
-// renderUpstreams emits max_body_size: <bytes> when the route carries one,
+// renderUpstreamsV2 emits max_body_size: <bytes> when the route carries one,
 // and omits the line otherwise (no regression for unannotated routes).
 func TestRenderUpstreams_MaxBodySizeEmitted(t *testing.T) {
 	m := newRenderModel()
@@ -1260,7 +1214,7 @@ func TestRenderUpstreams_MaxBodySizeEmitted(t *testing.T) {
 	m.addRoute("app.example.com", "/",
 		[]backend{{addr: "a:80"}},
 		annSettings{maxBodySize: &cap}, nil, nil)
-	out := renderUpstreams(m)
+	out := renderUpstreamsV2(m)
 	if !strings.Contains(out, "max_body_size: 52428800") {
 		t.Fatalf("max_body_size line missing:\n%s", out)
 	}
@@ -1271,7 +1225,7 @@ func TestRenderUpstreams_MaxBodySizeEmitted(t *testing.T) {
 	m2.addRoute("plain.example.com", "/",
 		[]backend{{addr: "b:80"}},
 		annSettings{}, nil, nil)
-	out2 := renderUpstreams(m2)
+	out2 := renderUpstreamsV2(m2)
 	if strings.Contains(out2, "max_body_size") {
 		t.Fatalf("unannotated route emitted max_body_size:\n%s", out2)
 	}

@@ -126,6 +126,9 @@ func TestRender_TheOlderModesSayWhatTheV1FileSaid(t *testing.T) {
 		if want == "" && (route.SSLEnabled == nil || *route.SSLEnabled) {
 			t.Errorf("%s: ssl_enabled = %v, want false\n%s", host, route.SSLEnabled, rendered)
 		}
+		if want == "none" && route.SSLEnabled != nil {
+			t.Errorf("%s: ssl_enabled = %v beside type none, want it unsaid\n%s", host, *route.SSLEnabled, rendered)
+		}
 		got := ""
 		if route.HealthCheck != nil {
 			got = route.HealthCheck.Type

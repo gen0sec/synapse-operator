@@ -17,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
-	"sigs.k8s.io/yaml"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -1150,58 +1149,6 @@ func TestGateway_WhatCannotBeHonouredIsNotProgrammed(t *testing.T) {
 	}
 }
 
-// synapseHeaders returns the headers Synapse gives a request for path on
-// host, or its response, out of a rendered v1 file. By Synapse's rules, not
-// by what was meant: a route's headers are found by the request's path among
-// the path keys, walking up to the nearest one that has a list; a route with
-// request headers and no word on response headers has them sent back too.
-func synapseHeaders(t *testing.T, rendered, host, path string, response bool) []string {
-	t.Helper()
-	var doc struct {
-		Upstreams map[string]struct {
-			Paths map[string]map[string]any `json:"paths"`
-		} `json:"upstreams"`
-	}
-	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
-		t.Fatalf("rendered file does not parse: %v\n%s", err, rendered)
-	}
-	paths := doc.Upstreams[host].Paths
-	list := func(v any) (out []string, given bool) {
-		items, given := v.([]any)
-		for _, item := range items {
-			out = append(out, fmt.Sprint(item))
-		}
-		return out, given
-	}
-	entry := func(p string) ([]string, bool) {
-		cfg, ok := paths[p]
-		if !ok {
-			return nil, false
-		}
-		req, hasReq := list(cfg["request_headers"])
-		resp, hasResp := list(cfg["response_headers"])
-		switch {
-		case !response:
-			return req, hasReq
-		case !hasResp && len(req) > 0:
-			return req, true // the older single list: both ways
-		}
-		return resp, hasResp
-	}
-	for p := path; ; {
-		if hs, ok := entry(p); ok {
-			return hs
-		}
-		i := strings.LastIndex(p, "/")
-		if i <= 0 {
-			break
-		}
-		p = p[:i]
-	}
-	hs, _ := entry("/")
-	return hs
-}
-
 func setHeaders(rule gwv1.HTTPRouteRule, req, resp []gwv1.HTTPHeader) gwv1.HTTPRouteRule {
 	if req != nil {
 		rule.Filters = append(rule.Filters, gwv1.HTTPRouteFilter{Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
@@ -1229,8 +1176,6 @@ func TestGateway_HeadersARuleSets(t *testing.T) {
 	if c := routeCondition(t, st, "shop", "PartiallyInvalid"); c != nil {
 		t.Fatalf("all of it can be served, yet: %s", c.Message)
 	}
-	// As a proxy's routes are written: a v2 file.
-	m.sameAsV1 = true
 	routes := parseV2(t, renderUpstreamsV2(m)).Hosts["shop.example.com"].Paths
 	// A route's headers are its own, each way: the ones of the route that
 	// has the request, and of no route above it.
@@ -1272,37 +1217,35 @@ func TestGateway_HeadersARuleSets(t *testing.T) {
 	}
 }
 
-// The older modes write a v1 file for Ingresses, whose headers come from two
-// annotations. Synapse reads a v1 route with request headers and no word on
-// response headers as its older single list, and sends them back to the
-// client.
+// An Ingress route's headers come from two annotations and are its own, each
+// way: a request header is not sent back to the client, and a route without
+// a list does not take the one of the path above it.
 func TestRenderUpstreams_RequestHeadersAreNotSentBack(t *testing.T) {
 	m := newRenderModel()
 	servers := []backend{{addr: "x:1"}}
 	m.addRoute("h", "/", servers, annSettings{reqHeaders: []string{"Authorization: Bearer backend"}}, nil, nil)
 	m.addRoute("h", "/framed", servers, annSettings{respHeaders: []string{"X-Frame-Options: DENY"}}, nil, nil)
 	m.addRoute("h", "/bare", servers, annSettings{}, nil, nil)
-	rendered := renderUpstreams(m)
+	routes := parseV2(t, renderUpstreamsV2(m)).Hosts["h"].Paths
 	for _, c := range []struct {
 		path     string
 		response bool
 		want     []string
 	}{
-		{"/x", false, []string{"Authorization: Bearer backend"}},
-		{"/x", true, nil},
+		{"/", false, []string{"Authorization: Bearer backend"}},
+		{"/", true, nil},
 		{"/framed", true, []string{"X-Frame-Options: DENY"}},
-		// An Ingress route without a list still takes the one of the
-		// path above it, as it did.
-		{"/framed", false, []string{"Authorization: Bearer backend"}},
-		{"/bare", false, []string{"Authorization: Bearer backend"}},
+		{"/framed", false, nil},
+		{"/bare", false, nil},
 		{"/bare", true, nil},
 	} {
-		if got := synapseHeaders(t, rendered, "h", c.path, c.response); !reflect.DeepEqual(got, c.want) {
+		got := routes[c.path].Headers.Request
+		if c.response {
+			got = routes[c.path].Headers.Response
+		}
+		if !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s, response %v: Synapse sets %q, want %q", c.path, c.response, got, c.want)
 		}
-	}
-	if strings.Contains(rendered, "request_headers: []") {
-		t.Errorf("an Ingress route says it has no request headers, which ends what it took from the path above:\n%s", rendered)
 	}
 }
 
@@ -1463,7 +1406,6 @@ func TestGateway_HeadersOnAHostOfExpressions(t *testing.T) {
 	}
 	// In the file a proxy reads: on the route that has them, and on no
 	// other.
-	m.sameAsV1 = true
 	routes := parseV2(t, renderUpstreamsV2(m)).Hosts["shop.example.com"].Paths
 	if len(routes) != 3 {
 		t.Fatalf("%d routes, want 3", len(routes))
@@ -1995,7 +1937,7 @@ func TestGateway_TranslationIsAFunctionOfItsInputs(t *testing.T) {
 		r.Shuffle(len(w.in.gateways), func(i, j int) { w.in.gateways[i], w.in.gateways[j] = w.in.gateways[j], w.in.gateways[i] })
 		r.Shuffle(len(w.in.classes), func(i, j int) { w.in.classes[i], w.in.classes[j] = w.in.classes[j], w.in.classes[i] })
 		m, st := w.translate()
-		return renderUpstreams(m), st
+		return renderUpstreamsV2(m), st
 	}
 	wantYAML, wantStatus := build(1)
 	if !strings.Contains(wantYAML, "match_expr") || len(wantStatus.routes) != 6 {
