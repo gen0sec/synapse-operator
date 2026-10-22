@@ -106,6 +106,8 @@ type IngressReconciler struct {
 	// claims of what RenderExtra brings, so that they are resolved with
 	// the Ingresses'.
 	ExtraClaims func() []hostClaim
+	// Clock is where "now" comes from. nil ⇒ time.Now.
+	Clock func() time.Time
 
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway

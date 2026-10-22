@@ -311,7 +311,7 @@ func TestRenderProxyConfig_Defaults(t *testing.T) {
 	wantAt(t, tree, "platform.threat.path", "/var/lib/synapse")
 	wantAt(t, tree, "platform.geoip.country.url", "https://github.com/gen0sec/geoip-databases/raw/download/ipinfo_lite.mmdb")
 	wantAt(t, tree, "platform.geoip.country.path", "/var/lib/synapse/ipinfo_lite.mmdb")
-	wantAt(t, tree, "proxy.default_certificate", "default")
+	wantAt(t, tree, "proxy.default_certificate", "_default")
 	wantAt(t, tree, "proxy.h2c", true)
 	wantAt(t, tree, "proxy.captcha.token_ttl", float64(7200))
 	wantAt(t, tree, "proxy.captcha.cache_ttl", float64(300))
@@ -611,7 +611,7 @@ func TestRenderProxyConfig_RefusesANullOnASectionOfDefaults(t *testing.T) {
 	tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(rawConfig(`{"proxy": {"h2c": null}, "telemetry": null}`))})
 	wantAbsent(t, tree, "proxy.h2c")
 	wantAbsent(t, tree, "telemetry")
-	wantAt(t, tree, "proxy.default_certificate", "default")
+	wantAt(t, tree, "proxy.default_certificate", "_default")
 }
 
 func TestRenderProxyConfig_NullsInsideLists(t *testing.T) {

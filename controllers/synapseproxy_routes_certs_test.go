@@ -85,7 +85,7 @@ func TestRoutes_LongHostCertificateIsStoredUnderAShortenedKey(t *testing.T) {
 	if want := fmt.Sprintf("%q:\n    tls:\n      terminate:\n        cert: %q\n", hostLong, longStem); !strings.Contains(routes.Data[UpstreamsKey], want) {
 		t.Errorf("the routes file does not bind the long host to the stored stem %q:\n%s", longStem, routes.Data[UpstreamsKey])
 	}
-	if string(certs.Data[longStem+".crt"]) != "CRT-long" || len(certs.Data) != 4 {
+	if string(certs.Data[longStem+".crt"]) != "CRT-long" || len(certs.Data) != 4+2 { // two tenant certificates and the default
 		t.Errorf("certs Secret holds %d keys (%v), want both certificates", len(certs.Data), keysOf(certs.Data))
 	}
 }
@@ -115,6 +115,10 @@ func TestProjectCertsToSecret_StaysUnderTheSizeOfASecret(t *testing.T) {
 	if err := c.Get(context.Background(), out, &got); err != nil {
 		t.Fatal(err)
 	}
+	// The operator's own default certificate is in the Secret too.
+	if len(got.Data) != 2*n+2 {
+		t.Errorf("%d certificates stored in %d keys, want fewer than all of them, and the default", n, len(got.Data))
+	}
 	size := 0
 	for key, value := range got.Data {
 		size += len(key) + len(value)
@@ -122,8 +126,8 @@ func TestProjectCertsToSecret_StaysUnderTheSizeOfASecret(t *testing.T) {
 	if size > 1024*1024 {
 		t.Errorf("the Secret holds %d bytes, more than a Secret may", size)
 	}
-	if n == 40 || len(got.Data) != 2*n {
-		t.Errorf("%d certificates stored in %d keys, want fewer than all of them", n, len(got.Data))
+	if n == 40 {
+		t.Errorf("all %d certificates stored, want fewer", n)
 	}
 	// As many as fit: there is no room left for one more.
 	if entry := 2*each + 2*len("host-00.example.com") + len(".crt") + len(".key"); maxCertsSecretBytes-size >= entry {
