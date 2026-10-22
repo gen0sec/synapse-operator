@@ -10,6 +10,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
 
 const ownedHost = "owned.example.com"
@@ -26,7 +28,12 @@ func ownerIngress(ns, name, host, path string, created time.Time) *networkingv1.
 // renderOwned renders objs for a proxy whose class is "public".
 func renderOwned(t *testing.T, objs ...client.Object) (routes string, certs map[string][]byte, events *record.FakeRecorder) {
 	t.Helper()
-	proxy := testProxy("synapse-os", "edge")
+	return renderOwnedBy(t, testProxy("synapse-os", "edge"), objs...)
+}
+
+// renderOwnedBy is renderOwned for a proxy the caller has set up.
+func renderOwnedBy(t *testing.T, proxy *synapsev1alpha1.SynapseProxy, objs ...client.Object) (routes string, certs map[string][]byte, events *record.FakeRecorder) {
+	t.Helper()
 	r := newRouteReconciler(t, append([]client.Object{proxy, classFor("public", proxy)}, objs...)...)
 	events = record.NewFakeRecorder(64)
 	r.Recorder = events
@@ -370,4 +377,35 @@ func TestOwnership_ASolverOfAHeldNameUnderAForeignPassthroughWildcardIsAnswered(
 func broken(ing *networkingv1.Ingress) *networkingv1.Ingress {
 	ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
 	return ing
+}
+
+// None is the opt-out: the first writer no longer wins, so a newcomer's
+// routes are served next to the older Ingress's, as before ownership existed.
+func TestOwnership_ProxyWithHostOwnershipNoneLetsNamespacesShare(t *testing.T) {
+	proxy := testProxy("synapse-os", "edge")
+	proxy.Spec.HostOwnership = "None"
+	out, _, events := renderOwnedBy(t, proxy,
+		ownerIngress("zzz", "shop", ownedHost, "/", t0),
+		ownerIngress("aaa", "other", ownedHost, "/other", t0.Add(time.Hour)))
+	if !strings.Contains(out, "/other") {
+		t.Errorf("hostOwnership is None and the second namespace is refused:\n%s", out)
+	}
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 0 {
+		t.Errorf("events = %q, want no HostnameConflict", got)
+	}
+}
+
+// An unset field means Namespace. The fake client applies no CRD default, so
+// this is the value the API server leaves behind when nobody sets it.
+func TestOwnership_ProxyWithHostOwnershipUnsetOwnsHosts(t *testing.T) {
+	proxy := testProxy("synapse-os", "edge")
+	out, _, events := renderOwnedBy(t, proxy,
+		ownerIngress("zzz", "shop", ownedHost, "/", t0),
+		ownerIngress("aaa", "other", ownedHost, "/other", t0.Add(time.Hour)))
+	if strings.Contains(out, "/other") {
+		t.Errorf("hostOwnership is unset and the newcomer is served:\n%s", out)
+	}
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want one HostnameConflict", got)
+	}
 }

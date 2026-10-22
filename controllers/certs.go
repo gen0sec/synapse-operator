@@ -3,6 +3,8 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,9 +50,38 @@ const ingressCertsManagedLabel = "synapse.gen0sec.com/ingress-certs"
 // (host == "" ⇒ caller must not set a per-host upstreams binding).
 func certStem(host, ns, secret string) (stem string, hostBound bool) {
 	if host != "" && !strings.HasPrefix(host, "*.") {
-		return sanitizeStem(host), true
+		hostBound = true
+		stem = sanitizeStem(host)
+		if reservedCertStems[stem] {
+			stem = sanitizeStem(ns + "_" + secret)
+		}
+	} else {
+		stem = sanitizeStem(ns + "_" + secret)
 	}
-	return sanitizeStem(ns + "_" + secret), false
+	return fitStem(stem), hostBound
+}
+
+// reservedCertStems are the file stems Synapse does not take at face value.
+// For fullchain, cert and chain, cert_logical_name takes the parent
+// directory's name instead. "default" is what the proxy's default_certificate
+// (proxyconfig_defaults.yaml) picks by, so a host of that name would become
+// the certificate for every name no other certificate matches. That holds for
+// the operator's default config only: proxy.default_certificate is not an
+// owned key, so spec.config or the --ingress-mode config can name another.
+var reservedCertStems = map[string]bool{"fullchain": true, "cert": true, "chain": true, "default": true}
+
+// maxCertStem is the longest stem whose <stem>.crt is a valid Secret key and
+// file name.
+const maxCertStem = validation.DNS1123SubdomainMaxLength - len(".crt")
+
+// fitStem shortens a stem longer than maxCertStem to its head and a hash of
+// the whole. A collision of the 64-bit hash is not handled.
+func fitStem(stem string) string {
+	if len(stem) <= maxCertStem {
+		return stem
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return stem[:maxCertStem-17] + "_" + hex.EncodeToString(sum[:])[:16]
 }
 
 func sanitizeStem(s string) string {
@@ -205,8 +236,16 @@ func writeCertPair(dir, stem string, crt, key []byte) (bool, error) {
 // Kubernetes atomic-update marker (synapse-utils tools.rs
 // reload_relevant_path): creating the file triggers a rescan even
 // though the rename that follows is invisible to it. The name does not end
-// in .crt or .key, so the loader never reads it, and prune removes it.
-func certTempName(stem, ext string) string { return ".." + stem + ext + ".tmp" }
+// in .crt or .key, so the loader never reads it, and prune removes it. A stem
+// too long to stage under its own name is staged under a hash of it.
+func certTempName(stem, ext string) string {
+	name := ".." + stem + ext + ".tmp"
+	if len(name) <= 255 { // a file name limit; the longest stem is 249
+		return name
+	}
+	sum := sha256.Sum256([]byte(stem))
+	return ".." + hex.EncodeToString(sum[:8]) + ext + ".tmp"
+}
 
 // certNotWritten records a certificate that could not be written to
 // CertsOutDir. kept says whether a pair from an earlier render is still on
