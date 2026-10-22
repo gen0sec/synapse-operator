@@ -93,6 +93,9 @@ func TestSynapseProxy_MinimalIsAcceptedAndDefaulted(t *testing.T) {
 	if p.Spec.Replicas == nil || *p.Spec.Replicas != 1 {
 		t.Errorf("replicas = %v, want it defaulted to 1", p.Spec.Replicas)
 	}
+	if p.Spec.HostOwnership != "Namespace" {
+		t.Errorf("hostOwnership = %q, want it defaulted to Namespace", p.Spec.HostOwnership)
+	}
 }
 
 func TestSynapseProxy_FullSpecIsAccepted(t *testing.T) {
@@ -121,6 +124,15 @@ func TestSynapseProxy_FullSpecIsAccepted(t *testing.T) {
 	mustCreate(t, p)
 }
 
+func TestSynapseProxy_HostOwnershipNoneIsAccepted(t *testing.T) {
+	p := validProxy()
+	p.Spec.HostOwnership = "None"
+	mustCreate(t, p)
+	if p.Spec.HostOwnership != "None" {
+		t.Errorf("hostOwnership = %q, want None kept", p.Spec.HostOwnership)
+	}
+}
+
 func TestSynapseProxy_Rejects(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -133,6 +145,12 @@ func TestSynapseProxy_Rejects(t *testing.T) {
 		{"negative replicas",
 			func(p *v1alpha1.SynapseProxy) { n := int32(-1); p.Spec.Replicas = &n },
 			"spec.replicas in body should be greater than or equal to 0"},
+		{"an unknown hostOwnership",
+			func(p *v1alpha1.SynapseProxy) { p.Spec.HostOwnership = "Off" },
+			"spec.hostOwnership"},
+		{"a lower-case hostOwnership",
+			func(p *v1alpha1.SynapseProxy) { p.Spec.HostOwnership = "none" },
+			"spec.hostOwnership"},
 		{"no listeners",
 			func(p *v1alpha1.SynapseProxy) { p.Spec.Listeners = []v1alpha1.Listener{} },
 			"should have at least 1 items"},

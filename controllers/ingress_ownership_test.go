@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
 
 const ownedHost = "owned.example.com"
@@ -26,7 +31,12 @@ func ownerIngress(ns, name, host, path string, created time.Time) *networkingv1.
 // renderOwned renders objs for a proxy whose class is "public".
 func renderOwned(t *testing.T, objs ...client.Object) (routes string, certs map[string][]byte, events *record.FakeRecorder) {
 	t.Helper()
-	proxy := testProxy("synapse-os", "edge")
+	return renderOwnedBy(t, testProxy("synapse-os", "edge"), objs...)
+}
+
+// renderOwnedBy is renderOwned for a proxy the caller has set up.
+func renderOwnedBy(t *testing.T, proxy *synapsev1alpha1.SynapseProxy, objs ...client.Object) (routes string, certs map[string][]byte, events *record.FakeRecorder) {
+	t.Helper()
 	r := newRouteReconciler(t, append([]client.Object{proxy, classFor("public", proxy)}, objs...)...)
 	events = record.NewFakeRecorder(64)
 	r.Recorder = events
@@ -370,4 +380,135 @@ func TestOwnership_ASolverOfAHeldNameUnderAForeignPassthroughWildcardIsAnswered(
 func broken(ing *networkingv1.Ingress) *networkingv1.Ingress {
 	ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
 	return ing
+}
+
+// None is the opt-out: the first writer no longer wins, so a newcomer's
+// routes are served next to the older Ingress's, as before ownership existed.
+func TestOwnership_ProxyWithHostOwnershipNoneLetsNamespacesShare(t *testing.T) {
+	proxy := testProxy("synapse-os", "edge")
+	proxy.Spec.HostOwnership = "None"
+	out, _, events := renderOwnedBy(t, proxy,
+		ownerIngress("zzz", "shop", ownedHost, "/", t0),
+		ownerIngress("aaa", "other", ownedHost, "/other", t0.Add(time.Hour)))
+	if !strings.Contains(out, "/other") {
+		t.Errorf("hostOwnership is None and the second namespace is refused:\n%s", out)
+	}
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 0 {
+		t.Errorf("events = %q, want no HostnameConflict", got)
+	}
+}
+
+// An unset field means Namespace. The fake client applies no CRD default, so
+// this is the value the API server leaves behind when nobody sets it.
+func TestOwnership_ProxyWithHostOwnershipUnsetOwnsHosts(t *testing.T) {
+	proxy := testProxy("synapse-os", "edge")
+	out, _, events := renderOwnedBy(t, proxy,
+		ownerIngress("zzz", "shop", ownedHost, "/", t0),
+		ownerIngress("aaa", "other", ownedHost, "/other", t0.Add(time.Hour)))
+	if strings.Contains(out, "/other") {
+		t.Errorf("hostOwnership is unset and the newcomer is served:\n%s", out)
+	}
+	if got := eventsOf(events, "HostnameConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want one HostnameConflict", got)
+	}
+}
+
+// statusOf is the address an Ingress shows, read back from the cluster.
+func statusOf(t *testing.T, r *SynapseRouteReconciler, ing *networkingv1.Ingress) []networkingv1.IngressLoadBalancerIngress {
+	t.Helper()
+	var got networkingv1.Ingress
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(ing), &got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Status.LoadBalancer.Ingress
+}
+
+// The owner has the proxy's address. An Ingress that lost every host it names
+// has none, and loses one it had. One that lost only some has it.
+func TestRoutes_RefusedIngressHasNoAddress(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "synapse-os", Name: "edge"}}
+	svc.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(edge, synapsev1alpha1.GroupVersion.WithKind("SynapseProxy"))}
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}
+
+	owner := ownerIngress("zzz", "shop", ownedHost, "/", t0)
+	intruder := ownerIngress("aaa", "intruder", ownedHost, "/intruder", t0.Add(time.Hour))
+	intruder.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{{IP: "203.0.113.10"}}
+	mixed := ownerIngress("bbb", "mixed", ownedHost, "/", t0.Add(time.Hour))
+	free := mixed.Spec.Rules[0].DeepCopy()
+	free.Host = "bbb.example.com"
+	mixed.Spec.Rules = append(mixed.Spec.Rules, *free)
+
+	// Only the refused host is named by a rule; the rest of the Ingress is
+	// what the table pins: none of it makes the Ingress served.
+	refusedPlus := func(ns string, more func(*networkingv1.Ingress)) *networkingv1.Ingress {
+		ing := ownerIngress(ns, "plus", ownedHost, "/", t0.Add(time.Hour))
+		ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{{IP: "203.0.113.10"}}
+		more(ing)
+		return ing
+	}
+	hostless := refusedPlus("ccc", func(ing *networkingv1.Ingress) {
+		rule := ing.Spec.Rules[0].DeepCopy()
+		rule.Host = ""
+		ing.Spec.Rules = append(ing.Spec.Rules, *rule)
+	})
+	allowedTLS := refusedPlus("ddd", func(ing *networkingv1.Ingress) {
+		ing.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"ddd.example.com"}, SecretName: "ddd-tls"}}
+	})
+	allowedAlias := refusedPlus("eee", func(ing *networkingv1.Ingress) {
+		ing.Annotations = map[string]string{"synapse.gen0sec.com/server-alias": "eee.example.com"}
+	})
+	// A rule with no http serves nothing, but it names an allowed host: the
+	// Ingress is served in part and keeps its address.
+	noHTTP := refusedPlus("fff", func(ing *networkingv1.Ingress) {
+		rule := ing.Spec.Rules[0].DeepCopy()
+		rule.Host, rule.HTTP = "fff.example.com", nil
+		ing.Spec.Rules = append(ing.Spec.Rules, *rule)
+	})
+
+	r := newRouteReconciler(t, edge, classFor("public", edge), svc, owner, intruder, mixed,
+		hostless, allowedTLS, allowedAlias, noHTTP)
+	mustReconcileRoutes(t, r, edge)
+	for _, c := range []struct {
+		name string
+		ing  *networkingv1.Ingress
+		want int
+	}{{"owner", owner, 1}, {"newcomer", intruder, 0}, {"partly refused", mixed, 1},
+		{"refused host and a hostless rule", hostless, 0}, {"refused host and an allowed tls host", allowedTLS, 0},
+		{"refused host and an allowed server-alias", allowedAlias, 0}, {"allowed host without http", noHTTP, 1}} {
+		if got := statusOf(t, r, c.ing); len(got) != c.want {
+			t.Errorf("%s: status = %+v, want %d address(es)", c.name, got, c.want)
+		}
+	}
+}
+
+// With ownership off nothing is refused, so every Ingress keeps its address.
+func TestOwnership_OffEveryIngressKeepsItsAddress(t *testing.T) {
+	a, b := ingressIn("zzz", "shop", ownedHost, "/"), ingressIn("aaa", "other", ownedHost, "/other")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(a, b).
+		WithStatusSubresource(&networkingv1.Ingress{}).Build()
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", ClusterDomain: "cluster.local",
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "upstreams.yaml"), StatusAddresses: []string{"203.0.113.10"}}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, ing := range []*networkingv1.Ingress{a, b} {
+		var got networkingv1.Ingress
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(ing), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Status.LoadBalancer.Ingress) != 1 {
+			t.Errorf("%s/%s: status = %+v, want its address", ing.Namespace, ing.Name, got.Status.LoadBalancer.Ingress)
+		}
+	}
+}
+
+// The Programmed event says an Ingress is in the file. An Ingress that lost
+// every host is not: only the owner is told.
+func TestOwnership_RefusedIngressIsNotToldItIsProgrammed(t *testing.T) {
+	_, _, events := ownerAndNewcomer(t, ownerIngress("zzz", "shop", ownedHost, "/", t0),
+		ownerIngress("aaa", "intruder", ownedHost, "/intruder", t0.Add(time.Hour)))
+	if got := eventsOf(events, "Programmed"); len(got) != 1 {
+		t.Errorf("Programmed events = %q, want one (the owner's)", got)
+	}
 }
