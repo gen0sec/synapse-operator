@@ -41,13 +41,16 @@ const ingressCertsManagedLabel = "synapse.gen0sec.com/ingress-certs"
 // certStem picks the file-stem (== synapse cert name) for a host's
 // Secret. A concrete host binds 1:1 (enables the strong name_map
 // exact-match + upstreams_cert_map paths). Wildcard / no-host certs
-// get a Secret-derived stem and rely on synapse's wildcard SAN match
+// get a Secret-derived stem, "<ns>_<secret>": "_" cannot appear in a
+// namespace or Secret name, so two stems never collide ("-" joined ns
+// "a" + Secret "b-c" and ns "a-b" + Secret "c" into one). They rely
+// on synapse's wildcard SAN match
 // (host == "" ⇒ caller must not set a per-host upstreams binding).
 func certStem(host, ns, secret string) (stem string, hostBound bool) {
 	if host != "" && !strings.HasPrefix(host, "*.") {
 		return sanitizeStem(host), true
 	}
-	return sanitizeStem(ns + "-" + secret), false
+	return sanitizeStem(ns + "_" + secret), false
 }
 
 func sanitizeStem(s string) string {
