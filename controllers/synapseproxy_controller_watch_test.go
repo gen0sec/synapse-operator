@@ -253,7 +253,7 @@ func TestProxy_StartsWhenItsRoutesArrive(t *testing.T) {
 	e.edit(p, func(s *synapsev1alpha1.SynapseProxySpec) { s.Config = nil })
 	waitingFor("and so is the next one", "edge-upstreams")
 
-	e.create(&corev1.ConfigMap{ObjectMeta: owned("edge-upstreams"), Data: map[string]string{UpstreamsKey: renderUpstreams(newRenderModel())}})
+	e.create(&corev1.ConfigMap{ObjectMeta: owned("edge-upstreams"), Data: map[string]string{UpstreamsKey: proxyFloor()}})
 	waitingFor("the routes have arrived", "edge-certs")
 
 	e.create(&corev1.Secret{ObjectMeta: owned("edge-certs")})
