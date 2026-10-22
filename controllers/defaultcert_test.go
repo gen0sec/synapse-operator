@@ -71,7 +71,7 @@ func TestProjectCerts_GeneratesTheDefaultCertificateOnceAndReusesIt(t *testing.T
 	dir := t.TempDir()
 	now := certT0
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: clockAt(&now)}
+	r := &IngressReconciler{Client: c, CertsOutDir: dir, Clock: clockAt(&now)}
 
 	ch, n, err := r.projectCerts(context.Background(), newRenderModel())
 	if err != nil || !ch || n != 0 {
@@ -112,7 +112,7 @@ func TestProjectCerts_GeneratesTheDefaultCertificateOnceAndReusesIt(t *testing.T
 func TestProjectCerts_RegeneratesTheDefaultCertificateOnlyWhenItMust(t *testing.T) {
 	good := func(t *testing.T, dir string, now time.Time) (crt, key []byte) {
 		r := &IngressReconciler{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
-			CertsOutDir: dir, Now: func() time.Time { return now }}
+			CertsOutDir: dir, Clock: func() time.Time { return now }}
 		if _, _, err := r.projectCerts(context.Background(), newRenderModel()); err != nil {
 			t.Fatal(err)
 		}
@@ -158,7 +158,7 @@ func TestProjectCerts_PruneKeepsTheDefaultCertificate(t *testing.T) {
 	dir := t.TempDir()
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY")).Build()
-	r := &IngressReconciler{Client: c, CertsOutDir: dir, Now: func() time.Time { return certT0 }}
+	r := &IngressReconciler{Client: c, CertsOutDir: dir, Clock: func() time.Time { return certT0 }}
 	m := newRenderModel()
 	m.addCert("x.example.com", "x.example.com", "a", "b", nil)
 	if _, n, err := r.projectCerts(context.Background(), m); err != nil || n != 1 {
@@ -178,7 +178,7 @@ func TestProjectCertsToSecret_ReplaceKeepsTheDefaultCertificate(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY")).Build()
 	now := certT0
-	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: clockAt(&now)}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out, Clock: clockAt(&now)}
 	get := func() corev1.Secret {
 		var s corev1.Secret
 		if err := c.Get(context.Background(), out, &s); err != nil {
@@ -236,7 +236,7 @@ func TestProjectCertsToSecret_UnparseableDefaultIsReplaced(t *testing.T) {
 	old.Labels = map[string]string{ingressCertsManagedLabel: "true"}
 	old.Data = map[string][]byte{defaultCertStem + ".crt": []byte("junk"), defaultCertStem + ".key": []byte("junk")}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(old).Build()
-	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return certT0 }}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out, Clock: func() time.Time { return certT0 }}
 	if _, _, err := r.projectCertsToSecret(context.Background(), newRenderModel()); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestDefaultCert_NoTenantCertificateIsTheDefault(t *testing.T) {
 	out := types.NamespacedName{Namespace: "synapse-os", Name: "synapse-proxy-certs"}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(tlsSecret("a", "b", "CRT", "KEY"), tlsSecret("c", "d", "CRT2", "KEY2")).Build()
-	r := &IngressReconciler{Client: c, CertsOutSecret: out, Now: func() time.Time { return certT0 }}
+	r := &IngressReconciler{Client: c, CertsOutSecret: out, Clock: func() time.Time { return certT0 }}
 	m := newRenderModel()
 	m.addCert("", "a_b", "a", "b", nil)
 	m.addCert("", "c_d", "c", "d", nil)

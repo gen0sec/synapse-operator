@@ -95,8 +95,8 @@ const (
 )
 
 func (r *IngressReconciler) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
+	if r.Clock != nil {
+		return r.Clock()
 	}
 	return time.Now()
 }

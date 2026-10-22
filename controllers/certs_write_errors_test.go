@@ -399,7 +399,7 @@ func TestReconcile_AFailedDefaultRewriteDoesNotFailTheRender(t *testing.T) {
 		CertsOutDir:      dir,
 		UpstreamsOutPath: routes,
 		ClusterDomain:    "cluster.local",
-		Now:              func() time.Time { return now },
+		Clock:            func() time.Time { return now },
 	}
 	r.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
 		[]client.Object{

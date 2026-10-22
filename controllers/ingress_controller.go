@@ -106,9 +106,8 @@ type IngressReconciler struct {
 	// claims of what RenderExtra brings, so that they are resolved with
 	// the Ingresses'.
 	ExtraClaims func() []hostClaim
-	// Now is the clock the default certificate's age is read from. Nil
-	// means time.Now.
-	Now func() time.Time
+	// Clock is where "now" comes from. nil ⇒ time.Now.
+	Clock func() time.Time
 
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
