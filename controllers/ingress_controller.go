@@ -317,6 +317,12 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		}
 	}
 
+	anyPassthrough := false
+	for _, o := range ours {
+		anyPassthrough = anyPassthrough || o.a.passthrough
+	}
+	v2Aliases := r.writesV2(anyPassthrough) || r.HostOwnership
+
 	for _, o := range ours {
 		ing, a := o.ing, o.a
 		refused := map[string]bool{}
@@ -325,9 +331,10 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		// under host ownership that is what hostKeyProblem says too; a v1
 		// file without ownership keeps `*`, the host of every name that
 		// has no other, and refuses only what would be a bogus host key.
+		// A passthrough Ingress makes the file v2, so it counts as v2 here.
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
 			problem := hostProblem(alias)
-			if !r.UpstreamsV2 && !r.HostOwnership {
+			if !v2Aliases {
 				problem = hostCharProblem(alias)
 			}
 			if alias == "" || problem == "" {
@@ -552,7 +559,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	// keep emitting v1 so unrelated deployments see zero behaviour
 	// change.
 	var yaml string
-	if r.UpstreamsV2 || len(m.passthroughHosts) > 0 {
+	if r.writesV2(len(m.passthroughHosts) > 0) {
 		m.sameAsV1 = r.UpstreamsV2
 		yaml = renderUpstreamsV2(m)
 	} else {
@@ -1005,4 +1012,11 @@ func (p renderPrimer) Start(ctx context.Context) error {
 func (r *IngressReconciler) LogStartup(log logr.Logger) {
 	log.Info("synapse ingress controller",
 		"ingressClass", r.IngressClassName, "out", r.UpstreamsOutPath)
+}
+
+// writesV2 says whether the routes file is written in the v2 schema: always
+// with UpstreamsV2, otherwise only beside a passthrough host, which v1 cannot
+// represent.
+func (r *IngressReconciler) writesV2(passthrough bool) bool {
+	return r.UpstreamsV2 || passthrough
 }
