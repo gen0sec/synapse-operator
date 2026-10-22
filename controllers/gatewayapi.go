@@ -35,7 +35,7 @@ import (
 //
 // The routes are written for a Synapse that tries a host's expressions in
 // the order of their keys, takes them in a v2 file, and has an expression
-// route's own headers follow its requests: one newer than 0.8.7.
+// route's own headers follow its requests: 0.8.8 or newer.
 //
 // What cannot be done is one of two things; see rules. A rule that cannot be
 // carried out keeps its requests, which are then answered with an error. A

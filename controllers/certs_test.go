@@ -317,8 +317,9 @@ func TestRender_CollectsIngressTLS(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dir, "app.example.com.crt")); string(b) != "C" {
 		t.Fatalf("empty-Hosts spec.tls must bind the rule host: %q", b)
 	}
-	if s, _ := os.ReadFile(out); !strings.Contains(string(s), "certificate: \"app.example.com\"") {
-		t.Fatalf("per-host certificate: not emitted:\n%s", s)
+	s, _ := os.ReadFile(out)
+	if got := parseV2(t, string(s)).Hosts["app.example.com"].TLS.Terminate; got == nil || got.Cert != "app.example.com" {
+		t.Fatalf("per-host certificate not emitted: terminate is %+v\n%s", got, s)
 	}
 }
 
@@ -480,8 +481,11 @@ func TestRender_ReservedHostGetsItsOwnCertificate(t *testing.T) {
 		t.Errorf("default_g0s-tls.crt=%q", b)
 	}
 	s, _ := os.ReadFile(out)
-	if strings.Count(string(s), "certificate: \"default_g0s-tls\"") != 2 {
-		t.Errorf("the certificate: lines do not name the file:\n%s", s)
+	hosts := parseV2(t, string(s)).Hosts
+	for _, h := range []string{"cert", "default"} {
+		if tm := hosts[h].TLS.Terminate; tm == nil || tm.Cert != "default_g0s-tls" {
+			t.Errorf("the cert: of %q does not name the file:\n%s", h, s)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(dir, "default.crt")); err == nil {
 		t.Error("default.crt would be the proxy's default certificate")

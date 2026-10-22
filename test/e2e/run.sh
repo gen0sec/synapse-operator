@@ -2,7 +2,7 @@
 # Runs the end-to-end test: starts a k3s cluster in a container, installs the
 # operator built from this tree into it, and runs test/e2e against it.
 #
-#   E2E_SYNAPSE_IMAGE   the Synapse image the proxies run, 0.8.5 or newer,
+#   E2E_SYNAPSE_IMAGE   the Synapse image the proxies run, 0.8.8 or newer,
 #                       with a tag other than latest. Required. It is copied
 #                       into the cluster from the local Docker, and pulled
 #                       into that first if it is not there.
@@ -14,7 +14,7 @@
 # temporary directory.
 set -euo pipefail
 
-: "${E2E_SYNAPSE_IMAGE:?set E2E_SYNAPSE_IMAGE to the Synapse image the proxies run, 0.8.5 or newer}"
+: "${E2E_SYNAPSE_IMAGE:?set E2E_SYNAPSE_IMAGE to the Synapse image the proxies run, 0.8.8 or newer}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

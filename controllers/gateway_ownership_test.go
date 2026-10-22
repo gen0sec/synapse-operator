@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -405,7 +404,7 @@ func TestGatewayOwnership_AnOwnedNameUnderAGatewayWildcard(t *testing.T) {
 	if !strings.Contains(out, `"*.example.com":`) {
 		t.Fatalf("the Gateway's wildcard is not served:\n%s", out)
 	}
-	if !regexp.MustCompile(`"shop\.example\.com":\s+paths: \{\}`).MatchString(out) {
+	if !heldInV2(t, out, "shop.example.com") {
 		t.Errorf("the owned name under a younger foreign wildcard has no entry without paths:\n%s", out)
 	}
 
@@ -439,7 +438,6 @@ func TestGatewayOwnership_AForeignWildcardRouteDoesNotServeANameTheNamespaceName
 			}}
 		return renderToFile(t, r)
 	}
-	held := regexp.MustCompile(`"admin\.example\.com":\s+paths: \{\}`)
 
 	t.Run("a route names the wildcard through a hostless listener", func(t *testing.T) {
 		out := render(t, "", func() gwv1.HTTPRoute {
@@ -448,7 +446,7 @@ func TestGatewayOwnership_AForeignWildcardRouteDoesNotServeANameTheNamespaceName
 		if !strings.Contains(out, `"*.example.com":`) {
 			t.Fatalf("the wildcard is not served:\n%s", out)
 		}
-		if !held.MatchString(out) {
+		if !heldInV2(t, out, "admin.example.com") {
 			t.Errorf("the name edge names has no entry without paths:\n%s", out)
 		}
 	})
@@ -460,7 +458,7 @@ func TestGatewayOwnership_AForeignWildcardRouteDoesNotServeANameTheNamespaceName
 		if !strings.Contains(out, `"*.example.com":`) {
 			t.Fatalf("the wildcard is not served:\n%s", out)
 		}
-		if !held.MatchString(out) {
+		if !heldInV2(t, out, "admin.example.com") {
 			t.Errorf("the name edge names has no entry without paths:\n%s", out)
 		}
 	})
@@ -491,7 +489,13 @@ func renderGateways(t *testing.T, w *gwWorld, objs ...client.Object) string {
 	return renderToFile(t, r, objs...)
 }
 
-var heldAdmin = regexp.MustCompile(`"admin\.example\.com":\s+paths: \{\}`)
+// heldInV2 says whether the v2 file has an entry for host that is there only
+// to hold the name: no routes, `paths: {}`.
+func heldInV2(t *testing.T, rendered, host string) bool {
+	t.Helper()
+	h, ok := parseV2(t, rendered).Hosts[host]
+	return ok && h.Paths != nil && len(h.Paths) == 0
+}
 
 // Any route of another namespace that brings a wildcard in makes it one the
 // namespace's names are held against, whatever else brings it in.
@@ -510,7 +514,7 @@ func TestGatewayOwnership_AWildcardTheNamespaceAndAForeignRouteBothBringIn(t *te
 	if !strings.Contains(out, `"*.example.com":`) {
 		t.Fatalf("the wildcard is not served:\n%s", out)
 	}
-	if !heldAdmin.MatchString(out) {
+	if !heldInV2(t, out, "admin.example.com") {
 		t.Errorf("the name edge names has no entry without paths:\n%s", out)
 	}
 }
@@ -545,7 +549,7 @@ func TestGatewayOwnership_ANameNamedAfterTheWildcardIsHeld(t *testing.T) {
 		w.in.gateways[0].CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
 		w.in.gateways[1].CreationTimestamp = metav1.NewTime(t0)
 		w.in.routes = []gwv1.HTTPRoute{httpRoute("wild", []string{"*.example.com"}, to("app", prefix("/admin")))}
-		if out := renderGateways(t, w); !heldAdmin.MatchString(out) {
+		if out := renderGateways(t, w); !heldInV2(t, out, "admin.example.com") {
 			t.Errorf("the name edge names has no entry without paths:\n%s", out)
 		}
 	})
@@ -558,7 +562,7 @@ func TestGatewayOwnership_ANameNamedAfterTheWildcardIsHeld(t *testing.T) {
 		ing := ingressIn("edge", "admin", "admin.example.com", "/")
 		ing.CreationTimestamp = metav1.NewTime(t0.Add(time.Hour))
 		ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "nosuchport"}
-		if out := renderGateways(t, w, ing); !heldAdmin.MatchString(out) {
+		if out := renderGateways(t, w, ing); !heldInV2(t, out, "admin.example.com") {
 			t.Errorf("the name edge names has no entry without paths:\n%s", out)
 		}
 	})

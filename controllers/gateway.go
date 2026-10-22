@@ -173,7 +173,11 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					}
 				}
 			}
-			for _, rx := range regexes {
+			for _, raw := range regexes {
+				rx, ok := r.canonicalRegexPath(logger, rt, raw, "")
+				if !ok {
+					continue
+				}
 				for _, h := range hostnames {
 					host := string(h)
 					if !m.addRegexRoute(host, rx, servers, a, req, resp) {
