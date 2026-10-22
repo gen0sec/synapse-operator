@@ -138,6 +138,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		}
 		matched++
 		a := parseAnnotations(rt.Annotations)
+		r.reportRedirectCode(ctx, rt, a)
 		if a.sticky {
 			m.sticky = true
 		}

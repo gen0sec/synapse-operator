@@ -748,6 +748,45 @@ func TestRender_TheOlderModesAliasesAreAsTheyCame(t *testing.T) {
 	}
 }
 
+// A redirect code Synapse cannot read as a status would make it refuse the
+// file. The route is redirected with the default, and the Ingress is told.
+func TestRender_ARedirectCodeSynapseDoesNotServeIsRefused(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	bad := routedIngress("bad", ptr("synapse"), "bad.example.com")
+	bad.Annotations = map[string]string{
+		"synapse.gen0sec.com/permanent-redirect":      "https://example.com/new",
+		"synapse.gen0sec.com/permanent-redirect-code": "70000",
+	}
+	other := routedIngress("other", ptr("synapse"), "other.example.com")
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(bad, other).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", UpstreamsOutPath: out, UpstreamsV2: true,
+		CertsOutDir: t.TempDir(), ClusterDomain: "cluster.local", Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	rendered, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := parseV2(t, string(rendered))
+	if route := doc.Hosts["bad.example.com"].Paths["/"]; route.Redirect == nil || route.Redirect.Status != 301 {
+		t.Errorf("bad.example.com redirects with %+v, want status 301\n%s", route.Redirect, rendered)
+	}
+	if _, ok := doc.Hosts["other.example.com"]; !ok {
+		t.Errorf("the other Ingress's host is not rendered\n%s", rendered)
+	}
+	var told bool
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.Contains(event, " InvalidRedirectCode ") && strings.Contains(event, "70000") {
+			told = true
+		}
+	}
+	if !told {
+		t.Error("the Ingress was not told with an InvalidRedirectCode event")
+	}
+}
+
 // What an Ingress asks for that Synapse would refuse a v2 file over is left
 // out for itself, and the rest of the Ingress is served.
 func TestRoutes_WhatSynapseWouldRefuseTheFileOver(t *testing.T) {
