@@ -131,8 +131,8 @@ func TestRoutes_UnboundProxyGetsEmptyOutputs(t *testing.T) {
 	if got, floor := upstreamsOf(t, r, edge), proxyFloor(); got != floor {
 		t.Errorf("upstreams =\n%s\nwant the empty document\n%s", got, floor)
 	}
-	if sec := certsOf(t, r, edge); len(sec.Data) != 0 {
-		t.Errorf("certs Secret holds %d keys, want none", len(sec.Data))
+	if sec := certsOf(t, r, edge); len(sec.Data) != 2 || sec.Data[defaultCertStem+".crt"] == nil {
+		t.Errorf("certs Secret holds %d keys, want only the default certificate", len(sec.Data))
 	}
 }
 

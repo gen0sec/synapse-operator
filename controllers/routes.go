@@ -133,7 +133,10 @@ type annSettings struct {
 	// non-empty, addRoute writes a redirect-only route block.
 	redirectStatus   *uint64
 	redirectLocation string
-	sticky           bool
+	// redirectCodeRefused is a redirect code Synapse does not serve, as
+	// written; the route keeps the default status.
+	redirectCodeRefused string
+	sticky              bool
 	// useRegex mirrors nginx `nginx.ingress.kubernetes.io/use-regex: "true"`:
 	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
 	// regex routes rather than longest-prefix paths.
@@ -176,6 +179,10 @@ type renderModel struct {
 	// owners says which namespace holds each host. nil means no host is
 	// held, and every gate that reads it lets everything through.
 	owners *hostOwners
+	// foreignWild are the hosts, by hostKey, that any route of a namespace
+	// other than its Gateway's brings in. A name the Gateway's namespace
+	// names is held against them, even when its own routes bring them in too.
+	foreignWild map[string]bool
 }
 
 func newRenderModel() *renderModel {
@@ -707,6 +714,17 @@ func parseBool(s string) *bool {
 	return &v
 }
 
+// validRedirectStatus reports whether Synapse serves code as a redirect. It
+// reads the status as a u16 and refuses the whole file over a value it
+// cannot hold.
+func validRedirectStatus(code uint64) bool {
+	switch code {
+	case 301, 302, 303, 307, 308:
+		return true
+	}
+	return false
+}
+
 func parseUint(s string) *uint64 {
 	if n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err == nil {
 		return &n
@@ -881,13 +899,17 @@ func parseAnnotations(ann map[string]string) annSettings {
 		} else if v, ok := ann[nginxPrefix+codeKey]; ok {
 			codeStr = v
 		}
+		var refused string
 		if codeStr != "" {
-			if n := parseUint(codeStr); n != nil {
+			if n := parseUint(codeStr); n != nil && validRedirectStatus(*n) {
 				status = *n
+			} else {
+				refused = codeStr
 			}
 		}
 		s.redirectLocation = loc
 		s.redirectStatus = &status
+		s.redirectCodeRefused = refused
 	}
 	// temporal first so permanent can clobber it (permanent wins on tie)
 	pickRedirect("temporal-redirect", "temporal-redirect-code", 302)
