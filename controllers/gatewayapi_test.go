@@ -1047,6 +1047,26 @@ func TestCanonicalRegex(t *testing.T) {
 	}
 }
 
+// The parse tree writes a character that cannot be printed as its number,
+// whether it was typed or written so. The reason names which it was.
+func TestCanonicalRegex_NonPrintableReason(t *testing.T) {
+	for re, want := range map[string]string{
+		"/a\u00a0b":    "a character outside ASCII that cannot be printed",
+		"/a\u00a0b|/c": "a character outside ASCII that cannot be printed",
+		`/x\x{a0}y`:    "a character outside ASCII cannot be written by its number",
+		`/x\x{80}y`:    "a character outside ASCII cannot be written by its number",
+		`/x\x{2028}y`:  "a character outside ASCII cannot be written by its number",
+	} {
+		_, err := canonicalRegex(re)
+		if err == nil || err.Error() != want {
+			t.Errorf("canonicalRegex(%q) error = %v; want %q", re, err, want)
+		}
+	}
+	if got, err := canonicalRegex("/café"); err != nil || got != "/café" {
+		t.Errorf("canonicalRegex(café) = %q, %v; want it accepted", got, err)
+	}
+}
+
 func TestGateway_ARegularExpressionTooLargeIsRefused(t *testing.T) {
 	// A class is written out as the ranges it stands for, and \pL is tens of
 	// kilobytes of them, in every route that has to exclude this one.

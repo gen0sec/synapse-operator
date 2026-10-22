@@ -563,7 +563,7 @@ func canonicalRegex(re string) (string, error) {
 	if len(out) > maxRegexLen {
 		return "", fmt.Errorf("it is %d bytes with its classes written out, and the limit is %d", len(out), maxRegexLen)
 	}
-	if err := asciiRegex(parsed, out); err != nil {
+	if err := asciiRegex(parsed, out, re); err != nil {
 		return "", err
 	}
 	return out, nil
@@ -571,7 +571,9 @@ func canonicalRegex(re string) (string, error) {
 
 // asciiRegex says what in a regular expression Synapse's engine does not
 // take, or would take to mean something else: it is run without Unicode.
-// written is the expression as parsed.String() gives it.
+// written is the expression as parsed.String() gives it, source the one
+// that was parsed. A character that cannot be printed is written by its
+// number whoever typed it, so source tells the two apart for the message.
 //
 //   - A class with a character outside ASCII in it is an error there.
 //   - A letter outside ASCII has no other case there.
@@ -580,7 +582,7 @@ func canonicalRegex(re string) (string, error) {
 //
 // A character outside ASCII that is simply to be matched is fine: it is the
 // same bytes on both sides.
-func asciiRegex(parsed *syntax.Regexp, written string) error {
+func asciiRegex(parsed *syntax.Regexp, written, source string) error {
 	var folded func(re *syntax.Regexp) bool
 	folded = func(re *syntax.Regexp) bool {
 		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 &&
@@ -604,6 +606,9 @@ func asciiRegex(parsed *syntax.Regexp, written string) error {
 				digits, size = written[i+3:i+end], end+1
 			}
 			if n, err := strconv.ParseUint(digits, 16, 32); err != nil || n > unicode.MaxASCII {
+				if err == nil && strings.ContainsRune(source, rune(n)) {
+					return fmt.Errorf("a character outside ASCII that cannot be printed")
+				}
 				return fmt.Errorf("a character outside ASCII cannot be written by its number")
 			}
 		case r == '\\':
