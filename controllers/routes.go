@@ -2,9 +2,16 @@ package controllers
 
 import (
 	"fmt"
+	"regexp"
+	"regexp/syntax"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Annotation support for synapse upstream settings.
@@ -35,14 +42,10 @@ import (
 //   temporal-redirect    url         -> redirect { status: 302, location }
 //   temporal-redirect-code  u16      -> override 302 (e.g. 307)
 //
-// ssl-passthrough switches the emitted file from v1 to v2 schema for
-// the WHOLE FILE (the v1 schema has no passthrough representation; the
-// v2 parser is schema-version-strict). Every other Ingress in the
-// cluster is then re-rendered in v2 form too. The v1 → v2 fidelity
-// for terminate hosts depends on synapse-utils carrying per-route
-// ssl_enabled, http2_enabled, disable_access_log, and max_body_size
-// in its v2 RawRoute (synapse PR feat(upstreams_v2): per-route v1-
-// compat knobs).
+// The file is always the v2 schema. Terminate hosts keep per-route
+// ssl_enabled, http2_enabled, disable_access_log, and max_body_size, which
+// synapse-utils carries in its v2 RawRoute (synapse PR feat(upstreams_v2):
+// per-route v1-compat knobs).
 //
 // Sizes for proxy-body-size accept nginx-style suffixes: "50m" = 50MiB,
 // "1g" = 1GiB, "1024k" = 1024KiB, bare bytes (e.g. "1048576"). Synapse
@@ -50,11 +53,10 @@ import (
 // the cap returns 413 Payload Too Large. nginx-compat key
 // `nginx.ingress.kubernetes.io/proxy-body-size` is accepted as a fallback.
 //
-// All map onto fields the synapse legacy v1 upstreams schema already
-// supports (synapse-utils structs.rs). HTTPRoute backendRef weights
-// and Request/ResponseHeaderModifier filters are translated too;
-// URLRewrite has no equivalent in the v1 per-path schema and is left
-// unmodified (not silently faked).
+// All map onto fields of the synapse v2 upstreams schema (synapse-utils
+// structs.rs). HTTPRoute backendRef weights and Request/ResponseHeaderModifier
+// filters are translated too; URLRewrite has no equivalent in the per-path
+// schema and is left unmodified (not silently faked).
 
 const (
 	annPrefix   = "synapse.gen0sec.com/"
@@ -83,6 +85,10 @@ type routeCfg struct {
 	maxBodySize      *uint64
 	reqHeaders       []string
 	respHeaders      []string
+	// Headers the route adds a value to, as "Name: value" lines, and
+	// names of headers it removes.
+	reqAdd, respAdd       []string
+	reqRemove, respRemove []string
 	// redirect, when set, makes this route a 3xx short-circuit. Status is
 	// 301 (permanent) or 302 (temporal) by default; *-code annotations
 	// override. Mutually exclusive with rewriting/forwarding at the proxy:
@@ -119,7 +125,7 @@ type annSettings struct {
 	serverAliases []string
 	// passthrough, when true, makes every rule host on this Ingress an
 	// SNI-routed TCP passthrough host (synapse terminates nothing for
-	// these hosts). Triggers v2 schema emission for the whole file.
+	// these hosts).
 	passthrough bool
 	// redirectStatus + redirectLocation drive the per-route redirect
 	// short-circuit. Populated by parseAnnotations from
@@ -127,7 +133,10 @@ type annSettings struct {
 	// non-empty, addRoute writes a redirect-only route block.
 	redirectStatus   *uint64
 	redirectLocation string
-	sticky           bool
+	// redirectCodeRefused is a redirect code Synapse does not serve, as
+	// written; the route keeps the default status.
+	redirectCodeRefused string
+	sticky              bool
 	// useRegex mirrors nginx `nginx.ingress.kubernetes.io/use-regex: "true"`:
 	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
 	// regex routes rather than longest-prefix paths.
@@ -140,11 +149,13 @@ type certProjection struct {
 	stem string // file-stem == synapse cert name (usually the host)
 	ns   string // Secret namespace
 	name string // Secret name
+	// from is the object that references the Secret, the one an event about
+	// the certificate is recorded on.
+	from client.Object
 }
 
 type renderModel struct {
 	hosts map[string]map[string]*routeCfg
-	acme  string
 	// hostCert maps a host to a cert file-stem, emitted as the
 	// per-host `certificate:` in upstreams.yaml (synapse SNI
 	// precedence #1: upstreams_cert_map).
@@ -152,12 +163,26 @@ type renderModel struct {
 	// certProjections is the set of Secrets to write into the
 	// certificates dir (keyed by stem, first-writer-wins).
 	certProjections map[string]certProjection
-	// passthroughHosts maps SNI → upstream "addr:port". A non-empty
-	// map triggers v2 schema emission for the whole file (v1 has no
-	// passthrough representation). FIRST-WRITER-WINS against both
-	// terminate hosts in `hosts` and other passthrough entries.
+	// passthroughHosts maps SNI → upstream "addr:port". FIRST-WRITER-WINS
+	// against both terminate hosts in `hosts` and other passthrough entries.
 	passthroughHosts map[string]string
 	sticky           bool
+	// solvers are the paths of cert-manager's HTTP-01 solvers, by host,
+	// each with where it is answered. They are no routes of the host as
+	// far as anything else goes: a solver does not take a host from what
+	// may route it. See solverRoutesFor.
+	solvers map[string]map[string]string
+	// solverSources are the Ingresses and HTTPRoutes the solvers came
+	// from, each with the name it answers for: who is told when a solver
+	// cannot be served.
+	solverSources []solverSource
+	// owners says which namespace holds each host. nil means no host is
+	// held, and every gate that reads it lets everything through.
+	owners *hostOwners
+	// foreignWild are the hosts, by hostKey, that any route of a namespace
+	// other than its Gateway's brings in. A name the Gateway's namespace
+	// names is held against them, even when its own routes bring them in too.
+	foreignWild map[string]bool
 }
 
 func newRenderModel() *renderModel {
@@ -166,19 +191,224 @@ func newRenderModel() *renderModel {
 		hostCert:         map[string]string{},
 		certProjections:  map[string]certProjection{},
 		passthroughHosts: map[string]string{},
+		solvers:          map[string]map[string]string{},
 	}
+}
+
+// addSolver records the path of an HTTP-01 solver on host and the address
+// it is answered at. The first one for a path keeps it.
+func (m *renderModel) addSolver(host, path, addr string) {
+	if m.solvers[host] == nil {
+		m.solvers[host] = map[string]string{}
+	}
+	// As a plain path is keyed: Synapse walks up the request's path and
+	// never arrives at a key that ends in a slash.
+	path = plainPathKey(path)
+	if _, ok := m.solvers[host][path]; !ok {
+		m.solvers[host][path] = addr
+	}
+}
+
+// solverSource is an object that brought a solver, and the name the solver
+// answers for.
+type solverSource struct {
+	obj  client.Object
+	host string
+}
+
+// solverFrom records where a solver for host came from.
+func (m *renderModel) solverFrom(obj client.Object, host string) {
+	m.solverSources = append(m.solverSources, solverSource{obj, host})
+}
+
+// solverHost is the host that serves requests for name, which is where a
+// solver for name has to be a path: Synapse serves a request as one host
+// and looks no further. It is looked for as Synapse looks, among the hosts
+// it routes plain HTTP by, which a passthrough host is not one of: the name
+// as it is spelled; or the same name in another spelling, compared without
+// regard to case or to a dot at the end; or the wildcard host with the
+// longest suffix that covers it. The host is returned as the file spells
+// it.
+//
+// When no host serves the name, it is written for the solver, unless the
+// name is a passthrough host's or one a passthrough wildcard covers: a host
+// of its own would take the name's TLS from that one. ok is then false,
+// and host the passthrough host.
+func (m *renderModel) solverHost(name string) (host string, ok bool) {
+	if _, routed := m.hosts[name]; routed {
+		return name, true
+	}
+	if host := sameOrCovering(name, m.hosts); host != "" {
+		return host, true
+	}
+	if host := sameOrCovering(name, m.passthroughHosts); host != "" {
+		return host, false
+	}
+	return name, true
+}
+
+// sameOrCovering is the key of hosts that is name in another spelling, or
+// else the wildcard with the longest suffix that covers name; "" when there
+// is neither. Of several spellings it is the first in order, so that it is
+// the same one each time. The host `*` covers any name and is the shortest
+// wildcard there is.
+func sameOrCovering[V any](name string, hosts map[string]V) string {
+	asked := strings.TrimRight(name, ".")
+	same, wildcard, longest := "", "", 0
+	for h := range hosts {
+		spelled := strings.TrimRight(h, ".")
+		if strings.EqualFold(spelled, asked) {
+			if same == "" || h < same {
+				same = h
+			}
+			continue
+		}
+		if suffix, wild := strings.CutPrefix(spelled, "*"); wild && len(asked) > len(suffix) &&
+			(len(suffix) > longest || len(suffix) == longest && (wildcard == "" || h < wildcard)) &&
+			strings.EqualFold(asked[len(asked)-len(suffix):], suffix) {
+			wildcard, longest = h, len(suffix)
+		}
+	}
+	if same != "" {
+		return same
+	}
+	return wildcard
+}
+
+// solverRoutes are the solvers' paths by the host each is written under,
+// for those that can be served. Of two solvers for one path on one host,
+// the one of the first name is kept.
+func (m *renderModel) solverRoutes() map[string]map[string]string {
+	names := make([]string, 0, len(m.solvers))
+	for name := range m.solvers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := map[string]map[string]string{}
+	for _, name := range names {
+		host, ok := m.solverHost(name)
+		if !ok {
+			continue
+		}
+		if out[host] == nil {
+			out[host] = map[string]string{}
+		}
+		for p, addr := range m.solvers[name] {
+			if _, taken := out[host][p]; !taken {
+				out[host][p] = addr
+			}
+		}
+	}
+	return out
+}
+
+// solverDirKey is the key of the route for a solver of the whole challenge
+// directory on a host that has expression routes. Synapse tries those in
+// the order of their keys, and this one is before `expr:` and `gateway:`.
+const solverDirKey = "acme:challenge"
+
+// solverHosts adds to hostKeys the hosts that are written for a solver and
+// are no host of the model: a name that has a solver and no host that serves
+// it. solved is m.solverRoutes().
+func (m *renderModel) solverHosts(hostKeys []string, solved map[string]map[string]string) []string {
+	for h := range solved {
+		if _, routed := m.hosts[h]; !routed {
+			hostKeys = append(hostKeys, h)
+		}
+	}
+	return hostKeys
+}
+
+// solverRoutesFor is the routes written on host for its solvers, by the key
+// each is written under; paths are the routes the host has, and solved is
+// m.solverRoutes(). A solver is the plain path of the whole challenge, which
+// Synapse tries before the host's expressions and, among plain paths, is the
+// longest. A route the host has for that very path keeps it.
+//
+// A solver for the whole challenge directory is a prefix, which Synapse tries
+// after the host's expressions. On a host that has any, it is an expression
+// too, and the first of them.
+//
+// A solver is reached in plain HTTP, which is said so.
+func solverRoutesFor(paths map[string]*routeCfg, solved map[string]string) map[string]*routeCfg {
+	out := map[string]*routeCfg{}
+	expressions := slices.ContainsFunc(sortedKeys(paths), func(p string) bool { return paths[p].matchExpr != "" })
+	for p, addr := range solved {
+		if _, routed := paths[p]; routed {
+			continue
+		}
+		plain := false
+		rc := &routeCfg{servers: []backend{{addr: addr}}, ssl: &plain}
+		if p == acmeChallengePrefix && expressions {
+			rc.matchExpr = fmt.Sprintf("(http.request.path eq %s or http.request.path matches %s)",
+				wfString(p), wfRegex("^"+regexp.QuoteMeta(p)+"/"))
+			p = solverDirKey
+		}
+		out[p] = rc
+	}
+	return out
+}
+
+// hostKeyProblem says why Synapse would not take name as a host of a v2
+// file, which it then refuses as a whole; "" when it would.
+func hostKeyProblem(name string) string {
+	name = strings.TrimRight(name, ".")
+	switch {
+	case name == "":
+		return "it is empty"
+	case strings.Contains(strings.TrimPrefix(name, "*."), "*"):
+		return "a `*` can only stand for the labels in front, as in `*.example.com`"
+	}
+	return ""
+}
+
+// hostCharsOK says name, without its trailing dots, is made of ASCII
+// letters and digits and of `.`, `*`, `-` and `_` alone. It looks at the
+// runes as written: a case fold would let U+212A (Kelvin) pass for `k`.
+func hostCharsOK(name string) bool {
+	name = strings.TrimRight(name, ".")
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '*', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// hostCharProblem says a name has characters a host name cannot have; ""
+// when it has none.
+func hostCharProblem(name string) string {
+	if !hostCharsOK(name) {
+		return "it has characters a host name cannot have"
+	}
+	return ""
+}
+
+// hostProblem says why a name cannot be a host the operator writes in a v2
+// file or under host ownership: either Synapse would not take it
+// (hostKeyProblem) or it fails hostCharProblem; "" when it can.
+func hostProblem(name string) string {
+	if p := hostKeyProblem(name); p != "" {
+		return p
+	}
+	return hostCharProblem(name)
 }
 
 // addCert records a host→Secret TLS binding: it schedules the Secret
 // for projection as <stem>.crt/<stem>.key and (when host != "")
 // binds the host to that cert name in upstreams.yaml. First-writer-
 // wins per stem and per host so output is deterministic.
-func (m *renderModel) addCert(host, stem, ns, name string) {
+func (m *renderModel) addCert(host, stem, ns, name string, from client.Object) {
 	if stem == "" || ns == "" || name == "" {
 		return
 	}
 	if _, ok := m.certProjections[stem]; !ok {
-		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name}
+		m.certProjections[stem] = certProjection{stem: stem, ns: ns, name: name, from: from}
 	}
 	if host != "" {
 		if _, ok := m.hostCert[host]; !ok {
@@ -204,11 +434,7 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 	// like ".../index.html" (the truncation yields "/docs/x/swagger", which
 	// != the slashed key). Storing the de-slashed key lets the route cover its
 	// whole subtree. Regex routes (addRegexRoute) keep their literal form.
-	if path != "/" {
-		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
-			path = trimmed
-		}
-	}
+	path = plainPathKey(path)
 	if _, claimed := m.passthroughHosts[host]; claimed {
 		return false
 	}
@@ -251,16 +477,296 @@ func regexRouteKey(regex string) string {
 }
 
 // pathRegexExpr renders the synapse wirefilter match expression for a path
-// regex, e.g. `http.request.path matches "^/api/runs/[^/]+/stream$"`. The
-// regex is anchored at the start (`^`) when not already, because an
-// Ingress/HTTPRoute path regex matches from the beginning of the request
-// path (nginx use-regex / Gateway semantics) — k8s also requires the stored
-// path to begin with `/`, so the `^` is supplied here rather than in the spec.
+// regex, e.g. `http.request.path matches "^(?:/api/runs/[^/]+/stream$)"`. The
+// regex is anchored at the start of the request path (nginx use-regex /
+// Gateway semantics) as a whole, so each alternative of `/a|/b` is anchored
+// and not only the first; a `^` the regex starts with is harmless inside the
+// group. k8s also requires the stored path to begin with `/`, so the anchor
+// is supplied here rather than in the spec.
 func pathRegexExpr(regex string) string {
-	if !strings.HasPrefix(regex, "^") {
-		regex = "^" + regex
+	return "http.request.path matches " + wfRegex("^(?:"+regex+")")
+}
+
+// wfString writes s as a string literal of Synapse's expression language.
+// The language has three escapes, `\"`, `\\` and `\xHH`, and refuses any
+// other, so a general-purpose quoting function writes strings it cannot
+// read.
+func wfString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20 || c > 0x7e:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
 	}
-	return fmt.Sprintf("http.request.path matches %q", regex)
+	b.WriteByte('"')
+	return b.String()
+}
+
+// wfRegex writes a regular expression as a regex literal of that language,
+// which is not a string literal: a backslash and the character after it go
+// to the regex engine as they are. Doubled, as quoting a string would, `\.`
+// becomes a backslash and any character.
+//
+// The one thing to take care of is the quote, which ends the literal. `\"`
+// is a quote outside a character class only, so it is written `\x22`, which
+// the engine reads as a quote everywhere.
+func wfRegex(re string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(re); i++ {
+		switch {
+		case re[i] == '"':
+			b.WriteString(`\x22`)
+		case re[i] == '\\' && i+1 < len(re) && re[i+1] == '"':
+			b.WriteString(`\x22`)
+			i++
+		case re[i] == '\\' && i+1 < len(re):
+			b.WriteByte(re[i])
+			b.WriteByte(re[i+1])
+			i++
+		default:
+			b.WriteByte(re[i])
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// maxRegexLen bounds a regular expression as it is written out. A class is
+// written as the ranges it stands for, and one like `\pL` is tens of
+// kilobytes of them.
+const maxRegexLen = 1024
+
+// canonicalRegex returns re as Go's own parser writes it back, or why it
+// cannot be used.
+//
+// Synapse's regex engine is not Go's, and the two do not read every
+// expression alike: braces that are no repetition are literal here and an
+// error there, `\Q...\E` exists only here, `\<` is a character here and a
+// word boundary there. An expression Synapse refuses costs its route, and
+// with it every route that was written to exclude it. Written back from the
+// parse tree it is in the small common core of the two: classes as explicit
+// ranges, literals escaped, groups and flags spelled out.
+func canonicalRegex(re string) (string, error) {
+	parsed, err := syntax.Parse(re, syntax.Perl)
+	if err != nil {
+		return "", err
+	}
+	out := parsed.String()
+	if len(out) > maxRegexLen {
+		return "", fmt.Errorf("it is %d bytes with its classes written out, and the limit is %d", len(out), maxRegexLen)
+	}
+	if err := asciiRegex(parsed, out, re); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// asciiRegex says what in a regular expression Synapse's engine does not
+// take, or would take to mean something else: it is run without Unicode.
+// written is the expression as parsed.String() gives it, source the one
+// that was parsed. A character that cannot be printed is written by its
+// number whoever typed it, so source tells the two apart for the message.
+//
+//   - A class with a character outside ASCII in it is an error there.
+//   - A letter outside ASCII has no other case there.
+//   - A character written by its number is one byte there, and above 0x7f
+//     not the character it is here.
+//
+// A character outside ASCII that is simply to be matched is fine: it is the
+// same bytes on both sides.
+func asciiRegex(parsed *syntax.Regexp, written, source string) error {
+	// Under (?i) every rune of a literal keeps FoldCase, letter or not. A rune
+	// that cannot be printed and has no other case is left to the scan below,
+	// which names it as it does without (?i).
+	var folded func(re *syntax.Regexp) (found, letter bool)
+	folded = func(re *syntax.Regexp) (found, letter bool) {
+		if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
+			for _, r := range re.Rune {
+				switch {
+				case r <= unicode.MaxASCII:
+				case unicode.SimpleFold(r) != r:
+					return true, true
+				case unicode.IsPrint(r):
+					found = true
+				}
+			}
+		}
+		for _, sub := range re.Sub {
+			f, l := folded(sub)
+			found, letter = found || f, letter || l
+		}
+		return found, letter
+	}
+	if found, letter := folded(parsed); letter {
+		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	} else if found {
+		return fmt.Errorf("a character outside ASCII cannot be matched without regard to case")
+	}
+	inClass := false
+	for i := 0; i < len(written); {
+		r, size := utf8.DecodeRuneInString(written[i:])
+		switch {
+		case r == '\\' && strings.HasPrefix(written[i:], `\x`):
+			// `\x{10ffff}`, or two digits without the braces.
+			digits := written[min(i+2, len(written)):min(i+4, len(written))]
+			size = 4
+			if end := strings.IndexByte(written[i:], '}'); strings.HasPrefix(digits, "{") && end > 0 {
+				digits, size = written[i+3:i+end], end+1
+			}
+			if n, err := strconv.ParseUint(digits, 16, 32); err != nil || n > unicode.MaxASCII {
+				if err == nil && strings.ContainsRune(source, rune(n)) {
+					return fmt.Errorf("a character outside ASCII that cannot be printed")
+				}
+				return fmt.Errorf("a character outside ASCII cannot be written by its number")
+			}
+		case r == '\\':
+			size++ // and whatever it escapes
+		case r == '[' && !inClass:
+			inClass = true
+		case r == ']':
+			inClass = false
+		case r > unicode.MaxASCII && inClass:
+			return fmt.Errorf("a character class cannot hold a character outside ASCII")
+		}
+		i += size
+	}
+	if hidden(source) {
+		return fmt.Errorf("a letter outside ASCII cannot be matched without regard to case")
+	}
+	return nil
+}
+
+// The markers stand in for the letters that Go's parser would write as ASCII
+// ones: U+017F and U+212A. They are in the private use area, so they have no
+// case of their own, and there are two so that the parser merges and factors
+// the swapped text as it does the source.
+const (
+	markerLongS  = '\ue000'
+	markerKelvin = '\ue001'
+)
+
+func isMarker(r rune) bool { return r == markerLongS || r == markerKelvin }
+
+// hidden reports whether source holds a case-folded literal of U+017F (long s)
+// or U+212A (Kelvin sign). The parser writes a folded literal as the lowest
+// rune of its fold orbit, so `(?i)ſ` comes back as `(?i:S)` and the written
+// form no longer shows the letter. The source is parsed again with the
+// letter replaced by a rune that has no case; a folded literal that holds it
+// is one that was hidden. It runs after the scan of the written form, so a
+// class the user wrote has been refused by then, and one that holds the
+// marker was made by merging literals, as in `(?i)s|ſ`.
+//
+// The letter is tracked in every form Go's parseEscape turns into a rune:
+//   - typed, also inside \Q...\E, where an escape is plain text;
+//   - \x{17f} with any number of digits, any case;
+//   - \x7f-style two digits, which cannot reach it, and octal \0 to \777,
+//     where \577 is U+017F;
+//   - \\, which is a backslash and so hides what follows from the escapes.
+//
+// A swap that no longer parses is refused: the letter was in a range.
+func hidden(source string) bool {
+	var b strings.Builder
+	changed, quoted := false, false
+	for i := 0; i < len(source); {
+		rest := source[i:]
+		r, size := utf8.DecodeRuneInString(rest)
+		switch {
+		case quoted && strings.HasPrefix(rest, `\E`):
+			quoted, size = false, 2
+		case quoted:
+		case strings.HasPrefix(rest, `\Q`):
+			quoted, size = true, 2
+		case r == '\\':
+			if v, n, ok := escapeRune(rest); ok {
+				size, r = n, v
+			} else {
+				_, n := utf8.DecodeRuneInString(rest[1:])
+				size += n
+			}
+		}
+		switch r {
+		case 0x17f:
+			r = markerLongS
+		case 0x212a:
+			r = markerKelvin
+		}
+		if isMarker(r) {
+			changed = true
+			b.WriteRune(r)
+		} else {
+			b.WriteString(rest[:size])
+		}
+		i += size
+	}
+	if !changed {
+		return false
+	}
+	parsed, err := syntax.Parse(b.String(), syntax.Perl)
+	if err != nil {
+		return true
+	}
+	var walk func(re *syntax.Regexp) bool
+	walk = func(re *syntax.Regexp) bool {
+		switch re.Op {
+		case syntax.OpLiteral:
+			if re.Flags&syntax.FoldCase != 0 && slices.ContainsFunc(re.Rune, isMarker) {
+				return true
+			}
+		case syntax.OpCharClass:
+			for i := 0; i+1 < len(re.Rune); i += 2 {
+				if re.Rune[i] == re.Rune[i+1] && isMarker(re.Rune[i]) {
+					return true
+				}
+			}
+		}
+		return slices.ContainsFunc(re.Sub, walk)
+	}
+	return walk(parsed)
+}
+
+// escapeRune reads the numeric escape at the start of s the way Go's
+// parseEscape does: \0 and up to two more octal digits, \1 to \7 followed by
+// an octal digit and up to one more, \xNN, and \x{...}. It gives the rune
+// and the length of the escape, or false if s does not start with one.
+func escapeRune(s string) (rune, int, bool) {
+	if len(s) < 2 {
+		return 0, 0, false
+	}
+	isOct := func(i int) bool { return i < len(s) && s[i] >= '0' && s[i] <= '7' }
+	switch c := s[1]; {
+	case c == '0' || c >= '1' && c <= '7' && isOct(2):
+		r, n := rune(c-'0'), 2
+		for ; n < 4 && isOct(n); n++ {
+			r = r*8 + rune(s[n]-'0')
+		}
+		return r, n, true
+	case c == 'x' && strings.HasPrefix(s, `\x{`):
+		var r rune
+		n := 3
+		for ; n < len(s) && s[n] != '}'; n++ {
+			v, err := strconv.ParseUint(s[n:n+1], 16, 8)
+			if err != nil || r > unicode.MaxRune {
+				return 0, 0, false
+			}
+			r = r*16 + rune(v)
+		}
+		if n == len(s) || n == 3 || r > unicode.MaxRune {
+			return 0, 0, false
+		}
+		return r, n + 1, true
+	case c == 'x' && len(s) >= 4:
+		v, err := strconv.ParseUint(s[2:4], 16, 8)
+		return rune(v), 4, err == nil
+	}
+	return 0, 0, false
 }
 
 // addRegexRoute records a regex path route: it is matched by `match_expr`
@@ -306,10 +812,35 @@ func (m *renderModel) addRegexRoute(host, regex string, servers []backend, a ann
 	return true
 }
 
+// addExprRoute records a route that Synapse matches by the given expression,
+// under a label that only has to be unique on the host. It is addRegexRoute
+// for an expression that is more than one regular expression on the path.
+func (m *renderModel) addExprRoute(host, label, expr string, servers []backend, extraReq, extraResp []string) bool {
+	if expr == "" || label == "" {
+		return false
+	}
+	if _, claimed := m.passthroughHosts[host]; claimed {
+		return false
+	}
+	if m.hosts[host] == nil {
+		m.hosts[host] = map[string]*routeCfg{}
+	}
+	if _, exists := m.hosts[host][label]; exists {
+		return false
+	}
+	m.hosts[host][label] = &routeCfg{
+		servers:     servers,
+		reqHeaders:  slices.Clone(extraReq),
+		respHeaders: slices.Clone(extraResp),
+		matchExpr:   expr,
+	}
+	return true
+}
+
 // addPassthroughHost claims `host` as an SNI-routed TCP passthrough
 // upstream. FIRST-WRITER-WINS: returns false if any terminate route
 // already exists for the host, or another passthrough is already
-// registered. Triggers v2 schema emission for the whole file.
+// registered.
 func (m *renderModel) addPassthroughHost(host, upstream string) bool {
 	if host == "" || upstream == "" {
 		return false
@@ -330,6 +861,17 @@ func parseBool(s string) *bool {
 		return nil
 	}
 	return &v
+}
+
+// validRedirectStatus reports whether Synapse serves code as a redirect. It
+// reads the status as a u16 and refuses the whole file over a value it
+// cannot hold.
+func validRedirectStatus(code uint64) bool {
+	switch code {
+	case 301, 302, 303, 307, 308:
+		return true
+	}
+	return false
 }
 
 func parseUint(s string) *uint64 {
@@ -473,8 +1015,7 @@ func parseAnnotations(ann map[string]string) annSettings {
 		s.serverAliases = csv(v)
 	}
 	// ssl-passthrough: route TLS connections straight to a TCP upstream
-	// without termination. Triggers v2 schema emission. synapse-compat
-	// key first, then nginx-compat.
+	// without termination. synapse-compat key first, then nginx-compat.
 	if v, ok := get("ssl-passthrough"); ok {
 		if b := parseBool(v); b != nil {
 			s.passthrough = *b
@@ -507,13 +1048,17 @@ func parseAnnotations(ann map[string]string) annSettings {
 		} else if v, ok := ann[nginxPrefix+codeKey]; ok {
 			codeStr = v
 		}
+		var refused string
 		if codeStr != "" {
-			if n := parseUint(codeStr); n != nil {
+			if n := parseUint(codeStr); n != nil && validRedirectStatus(*n) {
 				status = *n
+			} else {
+				refused = codeStr
 			}
 		}
 		s.redirectLocation = loc
 		s.redirectStatus = &status
+		s.redirectCodeRefused = refused
 	}
 	// temporal first so permanent can clobber it (permanent wins on tie)
 	pickRedirect("temporal-redirect", "temporal-redirect-code", 302)
@@ -526,125 +1071,47 @@ func parseAnnotations(ann map[string]string) annSettings {
 	return s
 }
 
-// renderUpstreams emits the synapse legacy v1 schema. The ACME
-// challenge backend is an `internal_paths` override (plain HTTP, no
-// knobs — it is cert-manager's solver). Deterministic ordering keeps
-// output stable so writeIfChanged avoids spurious reloads.
-func renderUpstreams(m *renderModel) string {
-	var b strings.Builder
-	b.WriteString("# Generated by synapse-operator ingress controller. Do not edit.\n")
-	if m.acme != "" {
-		fmt.Fprintf(&b, "internal_paths:\n  \"/.well-known/acme-challenge/*\":\n    servers:\n      - %q\n    ssl_enabled: false\n", m.acme)
-	}
-	if m.sticky {
-		b.WriteString("sticky_sessions: true\n")
-	}
-	b.WriteString("upstreams:\n")
-	hostKeys := make([]string, 0, len(m.hosts))
-	for h := range m.hosts {
-		hostKeys = append(hostKeys, h)
-	}
-	sort.Strings(hostKeys)
-	for _, h := range hostKeys {
-		fmt.Fprintf(&b, "  %q:\n", h)
-		if stem := m.hostCert[h]; stem != "" {
-			fmt.Fprintf(&b, "    certificate: %q\n", stem)
-		}
-		b.WriteString("    paths:\n")
-		paths := m.hosts[h]
-		pathKeys := make([]string, 0, len(paths))
-		for p := range paths {
-			pathKeys = append(pathKeys, p)
-		}
-		sort.Strings(pathKeys)
-		for _, p := range pathKeys {
-			rc := paths[p]
-			fmt.Fprintf(&b, "      %q:\n        servers:\n", p)
-			for _, sv := range rc.servers {
-				if sv.weight > 0 {
-					fmt.Fprintf(&b, "          - { address: %q, weight: %d }\n", sv.addr, sv.weight)
-				} else {
-					fmt.Fprintf(&b, "          - %q\n", sv.addr)
-				}
-			}
-			if rc.matchExpr != "" {
-				fmt.Fprintf(&b, "        match_expr: %q\n", rc.matchExpr)
-			}
-			// ssl_enabled: explicit annotation wins; default false
-			// (plain HTTP to backend — unchanged prior behavior).
-			ssl := false
-			if rc.ssl != nil {
-				ssl = *rc.ssl
-			}
-			fmt.Fprintf(&b, "        ssl_enabled: %t\n", ssl)
-			if rc.http2 != nil {
-				fmt.Fprintf(&b, "        http2_enabled: %t\n", *rc.http2)
-			}
-			if rc.forceHTTPS != nil {
-				fmt.Fprintf(&b, "        https_proxy_enabled: %t\n", *rc.forceHTTPS)
-			}
-			if rc.healthcheck != nil {
-				fmt.Fprintf(&b, "        healthcheck: %t\n", *rc.healthcheck)
-			}
-			if rc.disableAccessLog != nil {
-				fmt.Fprintf(&b, "        disable_access_log: %t\n", *rc.disableAccessLog)
-			}
-			if rc.connectTimeout != nil {
-				fmt.Fprintf(&b, "        connection_timeout: %d\n", *rc.connectTimeout)
-			}
-			if rc.readTimeout != nil {
-				fmt.Fprintf(&b, "        read_timeout: %d\n", *rc.readTimeout)
-			}
-			if rc.writeTimeout != nil {
-				fmt.Fprintf(&b, "        write_timeout: %d\n", *rc.writeTimeout)
-			}
-			if rc.idleTimeout != nil {
-				fmt.Fprintf(&b, "        idle_timeout: %d\n", *rc.idleTimeout)
-			}
-			if rc.maxBodySize != nil {
-				fmt.Fprintf(&b, "        max_body_size: %d\n", *rc.maxBodySize)
-			}
-			if rc.redirectStatus != nil && rc.redirectLocation != "" {
-				fmt.Fprintf(&b, "        redirect:\n          status: %d\n          location: %q\n",
-					*rc.redirectStatus, rc.redirectLocation)
-			}
-			writeHeaderList(&b, "request_headers", rc.reqHeaders)
-			writeHeaderList(&b, "response_headers", rc.respHeaders)
+// plainPathKey is the key a plain path is stored under: without a trailing
+// slash, except the root. See addRoute.
+func plainPathKey(path string) string {
+	if path != "/" {
+		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
+			return trimmed
 		}
 	}
-	return b.String()
+	return path
 }
 
-func writeHeaderList(b *strings.Builder, key string, hs []string) {
-	if len(hs) == 0 {
-		return
-	}
-	fmt.Fprintf(b, "        %s:\n", key)
-	for _, h := range hs {
-		fmt.Fprintf(b, "          - %q\n", h)
-	}
-}
-
-// renderUpstreamsV2 emits the v2 synapse upstreams schema. Used when
-// at least one host is SNI passthrough — v1 has no passthrough
-// representation, so the whole file switches to v2. Terminate hosts
-// are emitted with full per-route fidelity (ssl_enabled, http2_enabled,
-// disable_access_log, max_body_size, force_https, timeouts, headers),
-// which requires synapse's RawRoute to carry those four knobs (see
-// synapse feat(upstreams_v2): per-route v1-compat knobs).
+// renderUpstreamsV2 emits the v2 synapse upstreams schema, in which every
+// mode writes its routes. Terminate hosts are emitted with full per-route
+// fidelity (ssl_enabled, http2_enabled, disable_access_log, max_body_size,
+// force_https, timeouts, headers), which requires synapse's RawRoute to
+// carry those four knobs (see synapse feat(upstreams_v2): per-route
+// v1-compat knobs).
+//
+// Saying nothing does not mean the same in every version of the schema, so
+// the file says what it means:
+//
+//   - how a backend is reached: plain HTTP unless the route asks for TLS.
+//     Unsaid, a route goes by the backend's port.
+//   - whether it is probed: unless the route says not to, and then with
+//     the global settings. That is a route without `health_check:`; one
+//     that is not probed says `type: none`.
+//   - how long a backend may take to send: 120 seconds. Unsaid, a route
+//     gets 60.
+//   - what a backend is told about the client: nothing. Unsaid, the
+//     client's fingerprints are sent on in request headers.
+//
+// A route's headers are its own, each way: a path without a list of
+// headers does not take the one of the path above it.
 func renderUpstreamsV2(m *renderModel) string {
 	var b strings.Builder
 	b.WriteString("# Generated by synapse-operator ingress controller. Do not edit.\n")
 	b.WriteString("version: 2\n")
-
+	fmt.Fprintf(&b, "timeouts:\n  read: %d\n", defaultReadTimeoutSeconds)
+	b.WriteString("proxy:\n  fingerprints:\n    forward: false\n")
 	if m.sticky {
-		b.WriteString("proxy:\n  sticky_sessions:\n    enabled: true\n")
-	}
-
-	// ACME HTTP-01 challenge backend: v2 expresses internal paths as a
-	// top-level `internal:` list (the v1 `internal_paths:` override).
-	if m.acme != "" {
-		fmt.Fprintf(&b, "internal:\n  - path: \"/.well-known/acme-challenge/*\"\n    upstream: %q\n", m.acme)
+		b.WriteString("  sticky_sessions:\n    enabled: true\n")
 	}
 
 	// Stable iteration: terminate hosts first (sorted), then passthrough
@@ -657,6 +1124,10 @@ func renderUpstreamsV2(m *renderModel) string {
 	for h := range m.passthroughHosts {
 		hostKeys = append(hostKeys, h)
 	}
+	// A name that has a solver, and no host that serves it, is written for
+	// the solver.
+	solved := m.solverRoutes()
+	hostKeys = m.solverHosts(hostKeys, solved)
 	sort.Strings(hostKeys)
 
 	if len(hostKeys) == 0 {
@@ -670,20 +1141,36 @@ func renderUpstreamsV2(m *renderModel) string {
 			fmt.Fprintf(&b, "    upstream: %q\n", upstream)
 			continue
 		}
-		// terminate path
-		b.WriteString("    tls:\n      terminate:\n")
+		// terminate path. A host with no certificate bound to it is
+		// served in plain HTTP, and over TLS with whatever the listener
+		// has for its name. That has to be said with an empty block: a
+		// `terminate:` with nothing after it is no `tls:` block at all to
+		// Synapse, which refuses a host without one, and the file with it.
 		if stem := m.hostCert[h]; stem != "" {
-			fmt.Fprintf(&b, "        cert: %q\n", stem)
+			fmt.Fprintf(&b, "    tls:\n      terminate:\n        cert: %q\n", stem)
+		} else {
+			b.WriteString("    tls:\n      terminate: {}\n")
 		}
 		paths := m.hosts[h]
 		pathKeys := make([]string, 0, len(paths))
 		for p := range paths {
 			pathKeys = append(pathKeys, p)
 		}
+		solvers := solverRoutesFor(paths, solved[h])
+		for p := range solvers {
+			pathKeys = append(pathKeys, p)
+		}
 		sort.Strings(pathKeys)
+		if len(pathKeys) == 0 {
+			b.WriteString("    paths: {}\n")
+			continue
+		}
 		b.WriteString("    paths:\n")
 		for _, p := range pathKeys {
 			rc := paths[p]
+			if rc == nil {
+				rc = solvers[p]
+			}
 			fmt.Fprintf(&b, "      %q:\n", p)
 			writeRouteV2(&b, rc)
 		}
@@ -691,10 +1178,18 @@ func renderUpstreamsV2(m *renderModel) string {
 	return b.String()
 }
 
+// defaultReadTimeoutSeconds is how long a backend may take to send, for a
+// route that does not say.
+const defaultReadTimeoutSeconds = 120
+
 // writeRouteV2 emits one v2 route block. Field ordering and indentation
 // match the v2 schema (synapse-utils RawRoute) — anything else fails
 // the deny_unknown_fields parser.
 func writeRouteV2(b *strings.Builder, rc *routeCfg) {
+	// A route is probed unless it says `healthcheck: false`. Synapse does
+	// not probe a route chosen by an expression at all, and refuses a file
+	// that says how to.
+	unprobed := rc.matchExpr == "" && rc.healthcheck != nil && !*rc.healthcheck
 	if len(rc.servers) == 1 && rc.servers[0].weight == 0 {
 		fmt.Fprintf(b, "        upstream: %q\n", rc.servers[0].addr)
 	} else {
@@ -710,8 +1205,15 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 	if rc.matchExpr != "" {
 		fmt.Fprintf(b, "        match_expr: %q\n", rc.matchExpr)
 	}
-	if rc.ssl != nil {
+	switch {
+	case unprobed:
+		// A backend that is never probed is reached by its port, whatever
+		// the route says of TLS. A v2 file that says otherwise beside
+		// `type: none` is refused, so nothing is said.
+	case rc.ssl != nil:
 		fmt.Fprintf(b, "        ssl_enabled: %t\n", *rc.ssl)
+	default:
+		b.WriteString("        ssl_enabled: false\n")
 	}
 	if rc.http2 != nil {
 		fmt.Fprintf(b, "        http2_enabled: %t\n", *rc.http2)
@@ -719,12 +1221,8 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 	if rc.forceHTTPS != nil && *rc.forceHTTPS {
 		b.WriteString("        force_https: true\n")
 	}
-	if rc.healthcheck != nil && *rc.healthcheck {
-		// v2 requires a structured health_check. v1 had only a boolean,
-		// so fall back to the simplest type: TCP. Operators that need
-		// HTTP health checks can hand-edit upstreams.yaml or extend
-		// the annotation set later.
-		b.WriteString("        health_check:\n          type: tcp\n")
+	if unprobed {
+		b.WriteString("        health_check:\n          type: none\n")
 	}
 	if rc.disableAccessLog != nil {
 		fmt.Fprintf(b, "        disable_access_log: %t\n", *rc.disableAccessLog)
@@ -766,4 +1264,52 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 			}
 		}
 	}
+	writeTransformsV2(b, rc)
+}
+
+// writeTransformsV2 writes the headers a route adds a value to and the ones
+// it removes: one transform rule for requests and one for responses. Within
+// a rule Synapse removes first and adds after. `headers:`, which sets, runs
+// before both.
+func writeTransformsV2(b *strings.Builder, rc *routeCfg) {
+	rule := func(key string, remove, add []string) {
+		if len(remove) == 0 && len(add) == 0 {
+			return
+		}
+		fmt.Fprintf(b, "          %s:\n", key)
+		lead := "            - "
+		if len(remove) > 0 {
+			b.WriteString(lead + "remove:\n")
+			lead = "              "
+			for _, name := range remove {
+				fmt.Fprintf(b, "                - %q\n", name)
+			}
+		}
+		if len(add) > 0 {
+			b.WriteString(lead + "add:\n")
+			// A header's values, in the order they were given, under
+			// its name; the names in the order they first appear.
+			var names []string
+			values := map[string][]string{}
+			for _, line := range add {
+				name, value, _ := strings.Cut(line, ": ")
+				if _, seen := values[name]; !seen {
+					names = append(names, name)
+				}
+				values[name] = append(values[name], value)
+			}
+			for _, name := range names {
+				fmt.Fprintf(b, "                %q:\n", name)
+				for _, value := range values[name] {
+					fmt.Fprintf(b, "                  - %q\n", value)
+				}
+			}
+		}
+	}
+	if len(rc.reqRemove)+len(rc.reqAdd)+len(rc.respRemove)+len(rc.respAdd) == 0 {
+		return
+	}
+	b.WriteString("        transforms:\n")
+	rule("request_headers", rc.reqRemove, rc.reqAdd)
+	rule("response_headers", rc.respRemove, rc.respAdd)
 }

@@ -54,9 +54,13 @@ var (
 		Name: "synapse_operator_route_conflicts_total",
 		Help: "Total host+path route conflicts ignored (first-writer-wins).",
 	})
+	mHostConflicts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_host_conflicts_total",
+		Help: "Total hosts refused to a namespace because another namespace had them first.",
+	})
 	mUnsupportedMatch = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_unsupported_match_total",
-		Help: "Total Ingress/HTTPRoute match features not representable in synapse v1.",
+		Help: "Total Ingress/HTTPRoute match features not representable in synapse.",
 	})
 	mBackendUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_backend_unresolved_total",
@@ -82,6 +86,32 @@ var (
 		Name: "synapse_operator_certs",
 		Help: "TLS Secrets currently projected into the certificates dir.",
 	})
+	// The three below are the per-owner counterparts of mHosts, mRoutes and
+	// mCerts, for renders that have an owner (IngressReconciler.OwnerRef).
+	mProxyHosts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_hosts",
+		Help: "Distinct hosts in the upstreams.yaml most recently rendered for a proxy.",
+	}, []string{"namespace", "name"})
+	mProxyRoutes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_routes",
+		Help: "Distinct host+path routes in the upstreams.yaml most recently rendered for a proxy.",
+	}, []string{"namespace", "name"})
+	mProxyCerts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_certs",
+		Help: "TLS Secrets currently projected into a proxy's certificates Secret.",
+	}, []string{"namespace", "name"})
+	mProxyRenderErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "synapse_operator_proxy_render_errors_total",
+		Help: "Renders of a proxy's routes and certificates that failed.",
+	}, []string{"namespace", "name"})
+	mProxyReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_proxy_ready",
+		Help: "1 when a SynapseProxy's Ready condition is true, else 0.",
+	}, []string{"namespace", "name"})
+	mHostClaimLedgerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "synapse_operator_host_claim_ledger_errors_total",
+		Help: "Problems with the host claim ledger, by reason: write (could not be written), full (lines dropped to fit), quota (lines dropped past the per-namespace limit), invalid (names that cannot be a line), malformed (lines skipped).",
+	}, []string{"reason"})
 	mCertErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_cert_errors_total",
 		Help: "Referenced TLS Secrets that were missing or not usable.",
@@ -91,8 +121,9 @@ var (
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
-		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
-		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
+		mRouteConflicts, mHostConflicts, mUnsupportedMatch, mBackendUnresolved,
+		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors, mHostClaimLedgerErrors,
+		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,
 	)
