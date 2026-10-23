@@ -465,6 +465,9 @@ func TestAgent_NameCollision(t *testing.T) {
 			res := e.reconcile(a)
 
 			c := wantAgentCondition(t, a, ConditionReady, metav1.ConditionFalse, ReasonNameCollision)
+			if a.Status.ConfigHash != "" {
+				t.Errorf("status.configHash = %q on an agent that was never applied", a.Status.ConfigHash)
+			}
 			if !strings.Contains(c.Message, kind) {
 				t.Errorf("message does not say what is in the way: %s", c.Message)
 			}

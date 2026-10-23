@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -172,6 +173,48 @@ func TestAgent_FollowsItsInputs(t *testing.T) {
 	}
 	e.create(svc)
 	configHas("a Service with a VIP is followed", "203.0.113.77/32")
+
+	// What the controller owns is watched: the DaemonSet's status, and the
+	// Secret and the ServiceAccount it applied.
+	eventually(t, "the DaemonSet's status reaches the agent", func() string {
+		var d appsv1.DaemonSet
+		if err := e.k8s.Get(ctx, e.key(), &d); err != nil {
+			return err.Error()
+		}
+		if d.Status.ObservedGeneration != d.Generation || d.Status.NumberAvailable != 2 {
+			changeStatus(t, e.k8s, &d, func() {
+				d.Status = appsv1.DaemonSetStatus{ObservedGeneration: d.Generation, DesiredNumberScheduled: 2,
+					CurrentNumberScheduled: 2, UpdatedNumberScheduled: 2, NumberReady: 2, NumberAvailable: 2}
+			})
+		}
+		if err := e.k8s.Get(ctx, e.key(), a); err != nil {
+			return err.Error()
+		}
+		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionReady); c == nil || c.Status != metav1.ConditionTrue {
+			return fmt.Sprintf("Ready is %+v", c)
+		}
+		return ""
+	})
+	for name, obj := range map[string]client.Object{"agent-config": &corev1.Secret{}, "agent": &corev1.ServiceAccount{}} {
+		key := client.ObjectKey{Namespace: e.ns, Name: name}
+		if err := e.k8s.Get(ctx, key, obj); err != nil {
+			t.Fatal(err)
+		}
+		old := obj.GetUID()
+		if err := e.k8s.Delete(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, name+" is recreated after it is deleted", func() string {
+			fresh := obj.DeepCopyObject().(client.Object)
+			if err := e.k8s.Get(ctx, key, fresh); err != nil {
+				return err.Error()
+			}
+			if fresh.GetUID() == old {
+				return "still the deleted object"
+			}
+			return ""
+		})
+	}
 }
 
 func TestTakesHomeNetFromCluster(t *testing.T) {

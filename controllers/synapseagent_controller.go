@@ -21,8 +21,10 @@ import (
 // selects no node.
 const ReasonNoMatchingNodes = "NoMatchingNodes"
 
-// agentFieldOwner is the field manager the agent's objects are applied as.
-const agentFieldOwner = proxyFieldOwner
+// agentFieldOwner is the field manager the agent's objects are applied as. It
+// is not the proxy's: an apply forced as the same manager could take over an
+// object of a SynapseProxy of the same name, if the collision check missed it.
+const agentFieldOwner = "synapse-operator-agent"
 
 // SynapseAgentReconciler runs a SynapseAgent: it renders the config into a
 // Secret and applies the ServiceAccount and the DaemonSet around it.
@@ -119,7 +121,6 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 	}
 	o.configValid = metav1.Condition{Type: ConditionConfigValid, Status: metav1.ConditionTrue, Reason: ReasonRendered,
 		Message: "spec renders to a Synapse configuration"}
-	o.configHash = cfg.Hash
 
 	objects := []client.Object{
 		buildAgentConfigSecret(agent, cfg.YAML),
@@ -138,11 +139,17 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 			return o, nil
 		}
 	}
+	var appliedGeneration int64
 	for _, obj := range objects {
-		if err := applyObject(ctx, r.Client, obj); err != nil {
+		applied, err := applyObject(ctx, r.Client, agentFieldOwner, obj)
+		if err != nil {
 			return nil, fmt.Errorf("apply %T %s: %w", obj, obj.GetName(), err)
 		}
+		if _, isDaemonSet := obj.(*appsv1.DaemonSet); isDaemonSet {
+			appliedGeneration = applied.GetGeneration()
+		}
 	}
+	o.configHash = cfg.Hash
 
 	var ds appsv1.DaemonSet
 	if err := r.Get(ctx, client.ObjectKeyFromObject(agent), &ds); err != nil {
@@ -154,7 +161,7 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 		o.notReady(ReasonRollingOut, "waiting for the DaemonSet to be observed")
 		return o, nil
 	}
-	reason, message = agentRolloutState(&ds)
+	reason, message = agentRolloutStateAt(&ds, appliedGeneration)
 	if reason == ReasonApplied {
 		o.ready = metav1.Condition{Type: ConditionReady, Status: metav1.ConditionTrue, Reason: reason, Message: message}
 	} else {
@@ -174,6 +181,16 @@ func (r *SynapseAgentReconciler) clusterHomeNet(ctx context.Context) (string, er
 		return "", fmt.Errorf("list services: %w", err)
 	}
 	return homeNetFromCluster(nodes.Items, services.Items), nil
+}
+
+// agentRolloutStateAt is agentRolloutState for a DaemonSet read from a cache
+// that may not hold the generation the operator just applied. Until it does,
+// its status describes an older template.
+func agentRolloutStateAt(ds *appsv1.DaemonSet, applied int64) (reason, message string) {
+	if ds.Generation < applied {
+		return ReasonRollingOut, "waiting for the DaemonSet to be observed"
+	}
+	return agentRolloutState(ds)
 }
 
 // agentRolloutState says whether the DaemonSet runs what it was last told to,

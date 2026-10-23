@@ -266,19 +266,24 @@ func objectInTheWay(ctx context.Context, c client.Reader, owner client.Object, o
 
 // apply applies obj server-side.
 func (r *SynapseProxyReconciler) apply(ctx context.Context, obj client.Object) error {
-	return applyObject(ctx, r.Client, obj)
+	_, err := applyObject(ctx, r.Client, proxyFieldOwner, obj)
+	return err
 }
 
-// applyObject applies obj server-side as the operator. The empty status the
-// conversion writes out is ignored by the API server: status is a
-// subresource of everything applied here that has one.
-func applyObject(ctx context.Context, c client.Client, obj client.Object) error {
+// applyObject applies obj server-side as fieldOwner and returns the object as
+// the API server stored it. The empty status the conversion writes out is
+// ignored by the API server: status is a subresource of everything applied
+// here that has one.
+func applyObject(ctx context.Context, c client.Client, fieldOwner string, obj client.Object) (client.Object, error) {
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	u := &unstructured.Unstructured{Object: content}
-	return c.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(proxyFieldOwner), client.ForceOwnership)
+	if err := c.Patch(ctx, u, client.Apply, client.FieldOwner(fieldOwner), client.ForceOwnership); err != nil {
+		return nil, err
+	}
+	return u, nil
 }
 
 // pruneConfigSecrets deletes the proxy's config Secrets that nothing mounts
