@@ -1017,9 +1017,8 @@ spec:
                 description: IDS configures the intrusion detection of the agent.
                 properties:
                   enabled:
-                    description: |-
-                      Enabled turns the intrusion detection on or off. Empty leaves Synapse's
-                      default.
+                    description: Enabled turns the intrusion detection on or off.
+                      Empty means true.
                     type: boolean
                   enforceBlock:
                     description: |-

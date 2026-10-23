@@ -155,15 +155,6 @@ func TestRenderAgentConfig_TypedFieldsAndInputs(t *testing.T) {
 	wantAt(t, tree, "ids.address_vars.EXTERNAL_NET", "!$HOME_NET")
 }
 
-func TestRenderAgentConfig_InvalidHomeNet(t *testing.T) {
-	_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
-		s.IDS = &synapsev1alpha1.AgentIDSSpec{HomeNet: []string{"10.0.0.0/8", "not-a-net"}}
-	})})
-	if err == nil || !strings.Contains(err.Error(), "spec.ids.homeNet[1]") {
-		t.Fatalf("err = %v, want it to name spec.ids.homeNet[1]", err)
-	}
-}
-
 func TestRenderAgentConfig_OwnedKeys(t *testing.T) {
 	cases := map[string]struct{ raw, path, hint string }{
 		"mode":                      {`{"mode": "proxy"}`, "spec.config.mode", "agent mode"},
@@ -420,4 +411,134 @@ func TestRenderAgentConfig_RawIfaceWithCaptureInterfaces(t *testing.T) {
 	tree := agentTree(t, AgentConfigInput{Agent: agentForConfig(raw)})
 	wantAt(t, tree, "network.iface", "eth1")
 	wantAbsent(t, tree, "network.ifaces")
+}
+
+// With the IDS off nothing reloads the file in a running agent, so every
+// change has to roll the pods.
+func TestRenderAgentConfig_RestartHashWithIDSOff(t *testing.T) {
+	off := func(homeNet ...string) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.IDS = &synapsev1alpha1.AgentIDSSpec{Enabled: boolPtr(false), HomeNet: homeNet}
+		}
+	}
+	render := func(mutate ...func(*synapsev1alpha1.SynapseAgentSpec)) AgentConfigOutput {
+		return renderAgentOK(t, AgentConfigInput{Agent: agentForConfig(mutate...)})
+	}
+	base := render(off())
+	changed := render(off("10.0.0.0/8"))
+	if changed.RestartHash == base.RestartHash {
+		t.Error("a HOME_NET change with the IDS off did not move RestartHash")
+	}
+	if changed.RestartHash != changed.Hash {
+		t.Error("with the IDS off RestartHash should equal Hash")
+	}
+	hot := render(off(), agentRawConfig(`{"ids": {"max_flows": 99}}`))
+	if hot.RestartHash == base.RestartHash {
+		t.Error("a hot field change with the IDS off did not move RestartHash")
+	}
+
+	on := render(func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.IDS = &synapsev1alpha1.AgentIDSSpec{Enabled: boolPtr(true), HomeNet: []string{"10.0.0.0/8"}}
+	})
+	onBase := render(func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.IDS = &synapsev1alpha1.AgentIDSSpec{Enabled: boolPtr(true)}
+	})
+	if on.RestartHash != onBase.RestartHash {
+		t.Error("a HOME_NET change with the IDS on moved RestartHash")
+	}
+}
+
+// The restart hash is computed from the tree, not by a float64 round trip.
+func TestRenderAgentConfig_RestartHashKeepsBigIntegers(t *testing.T) {
+	render := func(raw string) AgentConfigOutput {
+		return renderAgentOK(t, AgentConfigInput{Agent: agentForConfig(agentRawConfig(raw))})
+	}
+	for name, pair := range map[string][2]string{
+		"ids.poll_timeout_ms": {`{"ids": {"poll_timeout_ms": 9007199254740993}}`, `{"ids": {"poll_timeout_ms": 9007199254740992}}`},
+		"u64 max":             {`{"telemetry": {"limit": 18446744073709551615}}`, `{"telemetry": {"limit": 18446744073709551614}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if render(pair[0]).RestartHash == render(pair[1]).RestartHash {
+				t.Error("two different integers give the same RestartHash")
+			}
+		})
+	}
+}
+
+func TestAgentRestartHash_StripsOnlyTheHotSet(t *testing.T) {
+	tree := func(ids, fwIDS map[string]any) map[string]any {
+		return map[string]any{"ids": ids, "firewall": map[string]any{"ids": fwIDS}}
+	}
+	for _, f := range hotReloadIdsFields {
+		one := agentRestartHash(tree(map[string]any{f: "1"}, map[string]any{f: "1"}))
+		two := agentRestartHash(tree(map[string]any{f: "2"}, map[string]any{f: "2"}))
+		if one != two {
+			t.Errorf("%s counts as a restart field", f)
+		}
+	}
+	a := agentRestartHash(tree(map[string]any{"enabled": true, "max_flows": 1}, map[string]any{"enabled": true}))
+	b := agentRestartHash(tree(map[string]any{"enabled": false, "max_flows": 2}, map[string]any{"enabled": true}))
+	if a == b {
+		t.Error("ids.enabled is stripped; it is not hot")
+	}
+	c := agentRestartHash(tree(map[string]any{"max_flows": 1}, map[string]any{"enabled": true}))
+	d := agentRestartHash(tree(map[string]any{"max_flows": 1}, map[string]any{"enabled": false}))
+	if c == d {
+		t.Error("firewall.ids.enabled is stripped; it is not hot")
+	}
+	in := map[string]any{"max_flows": 1, "x": 2}
+	agentRestartHash(tree(in, nil))
+	if _, ok := in["max_flows"]; !ok {
+		t.Error("agentRestartHash edited its input")
+	}
+}
+
+func TestRenderAgentConfig_RefusesControlCharacters(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*synapsev1alpha1.SynapseAgentSpec)
+		path   string
+	}{
+		"identity.cluster": {func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Platform = &synapsev1alpha1.AgentPlatformSpec{Identity: &synapsev1alpha1.AgentIdentitySpec{Cluster: "prod\x01eu"}}
+		}, "spec.platform.identity.cluster"},
+		"capture.interfaces": {func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Capture = &synapsev1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0", "eth\x011"}}
+		}, "spec.capture.interfaces[1]"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(c.mutate)})
+			if err == nil || !strings.Contains(err.Error(), c.path) {
+				t.Errorf("err = %v, want it to name %s", err, c.path)
+			}
+		})
+	}
+}
+
+func TestRenderAgentConfig_MergeErrors(t *testing.T) {
+	t.Run("a null over a default object", func(t *testing.T) {
+		_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(agentRawConfig(`{"ids": null}`))})
+		if err == nil || !strings.Contains(err.Error(), "spec.config.ids") {
+			t.Errorf("err = %v, want it to name spec.config.ids", err)
+		}
+	})
+	t.Run("a key with a control character", func(t *testing.T) {
+		_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(agentRawConfig(`{"telemetry": {"a\u0001": 1}}`))})
+		if err == nil || !strings.Contains(err.Error(), "spec.config.telemetry") {
+			t.Errorf("err = %v, want it to name spec.config.telemetry", err)
+		}
+	})
+	t.Run("the order of several errors is stable", func(t *testing.T) {
+		raw := `{"ids": {"a\u0001": 1}, "logging": {"b\u0001": 1}, "platform": {"c\u0001": 1}, "network": {"d\u0001": 1}, "telemetry": {"e\u0001": 1}}`
+		in := AgentConfigInput{Agent: agentForConfig(agentRawConfig(raw))}
+		_, first := RenderAgentConfig(in)
+		if first == nil {
+			t.Fatal("render accepted the keys")
+		}
+		for i := 0; i < 30; i++ {
+			if _, err := RenderAgentConfig(in); err == nil || err.Error() != first.Error() {
+				t.Fatalf("render %d: %v, want %v", i, err, first)
+			}
+		}
+	})
 }

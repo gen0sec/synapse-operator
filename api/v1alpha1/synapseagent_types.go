@@ -175,8 +175,7 @@ type AgentCaptureSpec struct {
 
 // AgentIDSSpec configures the intrusion detection of the agent.
 type AgentIDSSpec struct {
-	// Enabled turns the intrusion detection on or off. Empty leaves Synapse's
-	// default.
+	// Enabled turns the intrusion detection on or off. Empty means true.
 	//
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
