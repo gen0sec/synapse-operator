@@ -71,11 +71,12 @@ type SynapseAgentSpec struct {
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
 	// Tolerations are the taints the agent pods tolerate. Unset, the agent
-	// tolerates every taint, so it runs on every selected node.
+	// tolerates every taint, so it runs on every selected node. An explicit
+	// empty list means it tolerates none.
 	//
 	// +optional
 	// +kubebuilder:default={{operator: Exists}}
-	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	Tolerations []corev1.Toleration `json:"tolerations"`
 
 	// Affinity is the scheduling affinity of the agent pods.
 	//
@@ -94,10 +95,9 @@ type SynapseAgentSpec struct {
 	UpdateStrategy *appsv1.DaemonSetUpdateStrategy `json:"updateStrategy,omitempty"`
 
 	// HostPID runs the agent pods in the process namespace of their node, so
-	// the agent can see the host's processes.
+	// the agent can see the host's processes. Unset means true on Linux.
 	//
 	// +optional
-	// +kubebuilder:default=true
 	HostPID *bool `json:"hostPID,omitempty"`
 
 	// OS is the operating system of the nodes the agent runs on.

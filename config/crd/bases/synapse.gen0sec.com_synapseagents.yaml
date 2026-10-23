@@ -1018,10 +1018,9 @@ spec:
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               hostPID:
-                default: true
                 description: |-
                   HostPID runs the agent pods in the process namespace of their node, so
-                  the agent can see the host's processes.
+                  the agent can see the host's processes. Unset means true on Linux.
                 type: boolean
               ids:
                 description: IDS configures the intrusion detection of the agent.
@@ -1204,7 +1203,8 @@ spec:
                 - operator: Exists
                 description: |-
                   Tolerations are the taints the agent pods tolerate. Unset, the agent
-                  tolerates every taint, so it runs on every selected node.
+                  tolerates every taint, so it runs on every selected node. An explicit
+                  empty list means it tolerates none.
                 items:
                   description: |-
                     The pod this Toleration is attached to tolerates any taint that matches

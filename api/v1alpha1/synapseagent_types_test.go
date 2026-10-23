@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/discovery"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	"synapse-operator/api/v1alpha1"
@@ -76,6 +77,14 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 		{"an unknown os",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.OS = "freebsd" },
 			"spec.os"},
+		{"a duplicate homeNet entry",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.IDS = &v1alpha1.AgentIDSSpec{HomeNet: []string{"10.0.0.0/8", "10.0.0.0/8"}}
+			},
+			"Duplicate value"},
+		{"an empty capture interface",
+			func(a *v1alpha1.SynapseAgent) { a.Spec.Capture = &v1alpha1.AgentCaptureSpec{Interfaces: []string{""}} },
+			"spec.capture.interfaces"},
 		{"an API key reference without a key",
 			func(a *v1alpha1.SynapseAgent) {
 				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{APIKeySecretRef: &v1alpha1.SecretKeyReference{Name: "creds"}}
@@ -111,11 +120,25 @@ func TestSynapseAgent_Defaults(t *testing.T) {
 	if want := []corev1.Toleration{{Operator: corev1.TolerationOpExists}}; !reflect.DeepEqual(a.Spec.Tolerations, want) {
 		t.Errorf("tolerations = %+v, want %+v", a.Spec.Tolerations, want)
 	}
-	if a.Spec.HostPID == nil || !*a.Spec.HostPID {
-		t.Errorf("hostPID = %v, want it defaulted to true", a.Spec.HostPID)
+	if a.Spec.HostPID != nil {
+		t.Errorf("hostPID = %v, want it left unset: the builder defaults it per OS", *a.Spec.HostPID)
 	}
 	if a.Spec.OS != "linux" {
 		t.Errorf("os = %q, want it defaulted to linux", a.Spec.OS)
+	}
+}
+
+func TestSynapseAgent_ExplicitEmptyTolerationsAreKept(t *testing.T) {
+	a := validAgent()
+	a.Spec.Tolerations = []corev1.Toleration{}
+	mustCreateAgent(t, a)
+
+	var got v1alpha1.SynapseAgent
+	if err := k8s.Get(context.Background(), client.ObjectKeyFromObject(a), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Tolerations == nil || len(got.Spec.Tolerations) != 0 {
+		t.Errorf("tolerations = %#v, want the explicit empty list kept", got.Spec.Tolerations)
 	}
 }
 
@@ -225,7 +248,8 @@ func TestSynapseAgent_PrinterColumns(t *testing.T) {
 		CurrentNumberScheduled: 4,
 		UpdatedNumberScheduled: 3,
 		NumberReady:            2,
-		NumberAvailable:        2,
+		NumberAvailable:        1,
+		NumberMisscheduled:     6,
 		Conditions: []metav1.Condition{{
 			Type: "Ready", Status: metav1.ConditionTrue, Reason: "Applied",
 			LastTransitionTime: metav1.Now(),
