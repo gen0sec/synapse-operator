@@ -171,13 +171,6 @@ type AgentCaptureSpec struct {
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
 	Interfaces []string `json:"interfaces,omitempty"`
-
-	// IPVersion selects the IP versions captured: both, ipv4 or ipv6. Empty
-	// leaves Synapse's default.
-	//
-	// +optional
-	// +kubebuilder:validation:Enum=both;ipv4;ipv6
-	IPVersion string `json:"ipVersion,omitempty"`
 }
 
 // AgentIDSSpec configures the intrusion detection of the agent.
