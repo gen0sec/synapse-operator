@@ -122,7 +122,6 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 			{Name: "data", MountPath: agentDataDir},
 			{Name: "bpffs", MountPath: "/sys/fs/bpf", MountPropagation: kptr.To(corev1.MountPropagationBidirectional)},
 			{Name: "debugfs", MountPath: "/sys/kernel/debug"},
-			{Name: "btf", MountPath: "/sys/kernel/btf", ReadOnly: true},
 			{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
 		},
 	}
@@ -173,7 +172,6 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 						{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 						hostPath("bpffs", "/sys/fs/bpf"),
 						hostPath("debugfs", "/sys/kernel/debug"),
-						hostPath("btf", "/sys/kernel/btf"),
 						hostPath("modules", "/lib/modules"),
 					},
 				},

@@ -108,8 +108,11 @@ func TestAgentDaemonSet_Pod(t *testing.T) {
 	if pod.PriorityClassName != "system-node-critical" || len(pod.ImagePullSecrets) != 1 || pod.Affinity == nil {
 		t.Errorf("scheduling fields not passed: %+v", pod)
 	}
-	if sc := pod.SecurityContext; sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 0 {
-		t.Errorf("pod security context = %+v, want runAsUser 0", sc)
+	if sc := pod.SecurityContext; sc == nil ||
+		sc.RunAsUser == nil || *sc.RunAsUser != 0 ||
+		sc.RunAsGroup == nil || *sc.RunAsGroup != 0 ||
+		sc.RunAsNonRoot == nil || *sc.RunAsNonRoot {
+		t.Errorf("pod security context = %+v, want runAsUser 0, runAsGroup 0, runAsNonRoot false", sc)
 	}
 
 	if c.Image != "example.test/synapse:1.0.0" {
@@ -170,7 +173,6 @@ func TestAgentDaemonSet_Pod(t *testing.T) {
 	}{
 		{"/sys/fs/bpf", false, true},
 		{"/sys/kernel/debug", false, false},
-		{"/sys/kernel/btf", true, false},
 		{"/lib/modules", true, false},
 	}
 	for _, h := range hostPaths {
@@ -186,8 +188,21 @@ func TestAgentDaemonSet_Pod(t *testing.T) {
 			t.Errorf("%s volume = %+v", h.path, hp)
 		}
 	}
-	if len(pod.Volumes) != 6 || len(c.VolumeMounts) != 6 {
-		t.Errorf("%d volumes and %d mounts, want 6 each", len(pod.Volumes), len(c.VolumeMounts))
+	// DirectoryOrCreate under sysfs cannot create the directory on a kernel
+	// without BTF, which would leave the pod in ContainerCreating. The
+	// privileged container sees the host's sysfs anyway.
+	for _, v := range pod.Volumes {
+		if v.HostPath != nil && v.HostPath.Path == "/sys/kernel/btf" {
+			t.Errorf("volume %q mounts /sys/kernel/btf", v.Name)
+		}
+	}
+	for _, m := range c.VolumeMounts {
+		if m.MountPath == "/sys/kernel/btf" {
+			t.Errorf("mount %q at /sys/kernel/btf", m.Name)
+		}
+	}
+	if len(pod.Volumes) != 5 || len(c.VolumeMounts) != 5 {
+		t.Errorf("%d volumes and %d mounts, want 5 each", len(pod.Volumes), len(c.VolumeMounts))
 	}
 }
 
@@ -329,18 +344,31 @@ func TestAgentObjects_OwnerRefs(t *testing.T) {
 	}
 }
 
-// The Helm chart's workloads and the operator's config controller select by
-// app.kubernetes.io/name=synapse, the operator's default --label-selector
-// (main.go, README "Flags"). The chart is not vendored here, so its agent
-// selector labels are taken to be that label plus an instance label.
+// The Helm agent is installed through synapse-stack with nameOverride
+// synapse-agent, so its selector is app.kubernetes.io/name=synapse-agent plus
+// app.kubernetes.io/instance=<release> (helm-charts, charts/synapse
+// templates/_helpers.tpl "synapse.selectorLabels"). The stack's operator
+// selects by app.kubernetes.io/name in (synapse-proxy,synapse-agent), and a
+// plain install by name=synapse, the operator's default --label-selector.
 func TestAgentObjects_DoNotMatchLegacySelectors(t *testing.T) {
 	a := nodeAgent()
-	selectors := []labels.Selector{
-		labels.SelectorFromSet(labels.Set{"app.kubernetes.io/name": "synapse"}),
-		labels.SelectorFromSet(labels.Set{"app.kubernetes.io/name": "synapse", "app.kubernetes.io/instance": "node-agent"}),
-		labels.SelectorFromSet(labels.Set{"app.kubernetes.io/name": "synapse", "app.kubernetes.io/component": "agent"}),
+	mustParse := func(s string) labels.Selector {
+		sel, err := labels.Parse(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sel
 	}
-	podLabels := labels.Set(buildAgentDaemonSet(a, "rh").Spec.Template.Labels)
+	selectors := []labels.Selector{
+		mustParse("app.kubernetes.io/name=synapse"),
+		mustParse("app.kubernetes.io/name=synapse,app.kubernetes.io/instance=node-agent"),
+		mustParse("app.kubernetes.io/name=synapse,app.kubernetes.io/component=agent"),
+		mustParse("app.kubernetes.io/name=synapse-agent"),
+		mustParse("app.kubernetes.io/name=synapse-agent,app.kubernetes.io/instance=node-agent"),
+		mustParse("app.kubernetes.io/name in (synapse-proxy,synapse-agent)"),
+	}
+	d := buildAgentDaemonSet(a, "rh")
+	podLabels := labels.Set(d.Spec.Template.Labels)
 	for _, obj := range agentObjects(a) {
 		if _, ok := obj.GetLabels()["app.kubernetes.io/name"]; ok {
 			t.Errorf("%T %s carries app.kubernetes.io/name", obj, obj.GetName())
@@ -350,6 +378,9 @@ func TestAgentObjects_DoNotMatchLegacySelectors(t *testing.T) {
 				t.Errorf("%q matches %T %s", sel, obj, obj.GetName())
 			}
 		}
+	}
+	if _, ok := d.Spec.Template.Labels["app.kubernetes.io/name"]; ok {
+		t.Errorf("the pod template carries app.kubernetes.io/name: %v", d.Spec.Template.Labels)
 	}
 	for _, sel := range selectors {
 		if sel.Matches(podLabels) {
