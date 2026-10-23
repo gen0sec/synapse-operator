@@ -192,20 +192,30 @@ func (r *NetVarsResolverReconciler) desiredHomeNet(ctx context.Context, cm *core
 	return auto, false, nil
 }
 
-// autoHomeNet builds the HOME_NET list from cluster nodes + LoadBalancer
-// Service VIPs + internal supernets.
+// autoHomeNet lists the cluster's Nodes and Services and builds HOME_NET
+// from them.
 func (r *NetVarsResolverReconciler) autoHomeNet(ctx context.Context) (string, error) {
 	var nodes corev1.NodeList
 	if err := r.List(ctx, &nodes); err != nil {
 		return "", fmt.Errorf("list nodes: %w", err)
 	}
+	var svcs corev1.ServiceList
+	if err := r.List(ctx, &svcs); err != nil {
+		return "", fmt.Errorf("list services: %w", err)
+	}
+	return homeNetFromCluster(nodes.Items, svcs.Items), nil
+}
 
+// homeNetFromCluster builds the HOME_NET list from node addresses and
+// PodCIDRs, LoadBalancer Service VIPs and the internal supernets. The result
+// is a sorted, de-duplicated "[a,b,...]" list.
+func homeNetFromCluster(nodes []corev1.Node, services []corev1.Service) string {
 	set := make(map[string]struct{})
 	for _, c := range internalSupernets {
 		set[c] = struct{}{}
 	}
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
+	for i := range nodes {
+		n := &nodes[i]
 		for _, addr := range n.Status.Addresses {
 			if addr.Type != corev1.NodeInternalIP && addr.Type != corev1.NodeExternalIP {
 				continue
@@ -230,8 +240,12 @@ func (r *NetVarsResolverReconciler) autoHomeNet(ctx context.Context) (string, er
 	// LoadBalancer Service VIPs: a source-rewriting edge LB makes the agent's
 	// packet IDS see the LB IP as the source of all ingress, so it must be HOME
 	// (never bannable). These are distinct from any Node ExternalIP.
-	if err := r.addLoadBalancerIPs(ctx, set); err != nil {
-		return "", err
+	for i := range services {
+		for _, ip := range loadBalancerIPs(services[i]) {
+			if cidr := hostCIDR(strings.TrimSpace(ip)); cidr != "" {
+				set[cidr] = struct{}{}
+			}
+		}
 	}
 
 	cidrs := make([]string, 0, len(set))
@@ -239,34 +253,23 @@ func (r *NetVarsResolverReconciler) autoHomeNet(ctx context.Context) (string, er
 		cidrs = append(cidrs, c)
 	}
 	sort.Strings(cidrs)
-	return "[" + strings.Join(cidrs, ",") + "]", nil
+	return "[" + strings.Join(cidrs, ",") + "]"
 }
 
-// addLoadBalancerIPs adds every Service's LoadBalancer ingress IP(s),
-// .spec.externalIPs, and .spec.loadBalancerIP to the HOME set as /32 or /128.
-func (r *NetVarsResolverReconciler) addLoadBalancerIPs(ctx context.Context, set map[string]struct{}) error {
-	var svcs corev1.ServiceList
-	if err := r.List(ctx, &svcs); err != nil {
-		return fmt.Errorf("list services: %w", err)
-	}
-	add := func(ip string) {
-		if cidr := hostCIDR(strings.TrimSpace(ip)); cidr != "" {
-			set[cidr] = struct{}{}
+// loadBalancerIPs returns a Service's LoadBalancer ingress IP(s),
+// .spec.externalIPs and .spec.loadBalancerIP, as written (not validated).
+func loadBalancerIPs(svc corev1.Service) []string {
+	var ips []string
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		if ing.IP != "" {
+			ips = append(ips, ing.IP)
 		}
 	}
-	for i := range svcs.Items {
-		s := &svcs.Items[i]
-		for _, ing := range s.Status.LoadBalancer.Ingress {
-			add(ing.IP)
-		}
-		for _, ip := range s.Spec.ExternalIPs {
-			add(ip)
-		}
-		if s.Spec.LoadBalancerIP != "" {
-			add(s.Spec.LoadBalancerIP)
-		}
+	ips = append(ips, svc.Spec.ExternalIPs...)
+	if svc.Spec.LoadBalancerIP != "" {
+		ips = append(ips, svc.Spec.LoadBalancerIP)
 	}
-	return nil
+	return ips
 }
 
 // hostCIDR turns a bare IP into a single-host CIDR (/32 or /128).
