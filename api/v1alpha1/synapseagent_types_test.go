@@ -71,9 +71,6 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 		{"an unknown log level",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.Logging = &v1alpha1.LoggingSpec{Level: "verbose"} },
 			"spec.logging.level"},
-		{"an unknown ipVersion",
-			func(a *v1alpha1.SynapseAgent) { a.Spec.Capture = &v1alpha1.AgentCaptureSpec{IPVersion: "v4"} },
-			"spec.capture.ipVersion"},
 		{"an unknown os",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.OS = "freebsd" },
 			"spec.os"},
@@ -165,7 +162,7 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 		APIKeySecretRef: &v1alpha1.SecretKeyReference{Name: "synapse-credentials", Key: "API_KEY"},
 		Identity:        &v1alpha1.AgentIdentitySpec{Enabled: ptr.To(true), Cluster: "prod-eu"},
 	}
-	a.Spec.Capture = &v1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0", "eth1"}, IPVersion: "ipv4"}
+	a.Spec.Capture = &v1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0", "eth1"}}
 	a.Spec.IDS = &v1alpha1.AgentIDSSpec{
 		Enabled:      ptr.To(true),
 		EnforceBlock: ptr.To(false),
@@ -203,6 +200,18 @@ func agentVersion(t *testing.T) map[string]any {
 		t.Fatalf("%d versions, want 1", len(versions))
 	}
 	return versions[0].(map[string]any)
+}
+
+// Synapse never acts on network.ip_version, so the typed field is gone.
+func TestSynapseAgent_CaptureHasNoIPVersion(t *testing.T) {
+	spec := agentVersion(t)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)
+	capture := spec["properties"].(map[string]any)["capture"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := capture["ipVersion"]; ok {
+		t.Error("spec.capture.ipVersion is in the CRD schema")
+	}
+	if _, ok := capture["interfaces"]; !ok {
+		t.Error("spec.capture.interfaces is missing: the probe is reading the wrong path")
+	}
 }
 
 func TestSynapseAgent_HasNoScaleSubresource(t *testing.T) {

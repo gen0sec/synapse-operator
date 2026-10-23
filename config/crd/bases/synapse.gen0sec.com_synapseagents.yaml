@@ -1000,15 +1000,6 @@ spec:
                       type: string
                     type: array
                     x-kubernetes-list-type: set
-                  ipVersion:
-                    description: |-
-                      IPVersion selects the IP versions captured: both, ipv4 or ipv6. Empty
-                      leaves Synapse's default.
-                    enum:
-                    - both
-                    - ipv4
-                    - ipv6
-                    type: string
                 type: object
               config:
                 description: |-
