@@ -34,7 +34,8 @@ func TestHomeNetFromCluster(t *testing.T) {
 			nodes: []corev1.Node{nodeWith(corev1.NodeSpec{},
 				corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.1.2.3"},
 				corev1.NodeAddress{Type: corev1.NodeExternalIP, Address: "198.51.100.4"},
-				corev1.NodeAddress{Type: corev1.NodeHostName, Address: "node-a"},
+				corev1.NodeAddress{Type: corev1.NodeHostName, Address: "192.0.2.50"},
+				corev1.NodeAddress{Type: corev1.NodeInternalDNS, Address: "192.0.2.51"},
 				corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "not-an-ip"})},
 			want: "[10.0.0.0/8,10.1.2.3/32,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16,198.51.100.4/32,fc00::/7,fe80::/10]",
 		},
@@ -51,6 +52,16 @@ func TestHomeNetFromCluster(t *testing.T) {
 				PodCIDRs: []string{"198.18.0.0/24", "2001:db8:1::/64", "garbage"},
 			})},
 			want: "[10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16,198.18.0.0/24,2001:db8:1::/64,fc00::/7,fe80::/10]",
+		},
+		{
+			name:  "invalid singular PodCIDR is dropped",
+			nodes: []corev1.Node{nodeWith(corev1.NodeSpec{PodCIDR: "garbage"})},
+			want:  "[" + supernets + "]",
+		},
+		{
+			name:  "singular PodCIDR alone is kept",
+			nodes: []corev1.Node{nodeWith(corev1.NodeSpec{PodCIDR: "198.19.0.0/24"})},
+			want:  "[10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16,198.19.0.0/24,fc00::/7,fe80::/10]",
 		},
 		{
 			name: "service ingress IP, externalIPs and loadBalancerIP",
