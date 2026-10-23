@@ -245,6 +245,12 @@ func TestAgent_RendersAndApplies(t *testing.T) {
 	wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
 	wantAgentCondition(t, a, ConditionReady, metav1.ConditionFalse, ReasonRollingOut)
 
+	for _, o := range []client.Object{ds, secret, &sa} {
+		if !managedByAs(o, agentFieldOwner, metav1.ManagedFieldsOperationApply) {
+			t.Errorf("%T %s is not applied by %q: %+v", o, o.GetName(), agentFieldOwner, o.GetManagedFields())
+		}
+	}
+
 	// A second pass changes nothing anywhere.
 	var fresh synapsev1alpha1.SynapseAgent
 	e.get(e.name, &fresh)
@@ -595,4 +601,13 @@ func TestAgent_Gone(t *testing.T) {
 	if agentReadySeries(t, e.ns, e.name) {
 		t.Error("the series outlived the agent")
 	}
+}
+
+func managedByAs(o client.Object, manager string, op metav1.ManagedFieldsOperationType) bool {
+	for _, f := range o.GetManagedFields() {
+		if f.Manager == manager && f.Operation == op {
+			return true
+		}
+	}
+	return false
 }

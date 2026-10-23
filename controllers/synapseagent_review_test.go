@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -10,6 +11,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
 
 // A cache that lags behind lets the collision check miss. The apply must then
@@ -144,4 +147,39 @@ func TestAgent_ProblemsAreWarnings(t *testing.T) {
 			t.Errorf("event = %q, want a Warning %s", got, ReasonNameCollision)
 		}
 	})
+}
+
+// staleDaemonSets answers every Get of a DaemonSet with a copy taken earlier,
+// as an informer cache does that has not seen the latest write.
+type staleDaemonSets struct {
+	client.Client
+	stale *appsv1.DaemonSet
+}
+
+func (s staleDaemonSets) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if ds, ok := obj.(*appsv1.DaemonSet); ok {
+		s.stale.DeepCopyInto(ds)
+		return nil
+	}
+	return s.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestAgent_ACacheBehindTheApplyIsRollingOut(t *testing.T) {
+	e := newAgentEnv(t)
+	a := e.running()
+	d := e.daemonSet()
+	changeStatus(t, e.k8s, d, func() {
+		d.Status = appsv1.DaemonSetStatus{ObservedGeneration: d.Generation, DesiredNumberScheduled: 2,
+			CurrentNumberScheduled: 2, UpdatedNumberScheduled: 2, NumberReady: 2, NumberAvailable: 2}
+	})
+	e.reconcile(a)
+	wantAgentCondition(t, a, ConditionReady, metav1.ConditionTrue, ReasonApplied)
+
+	e.agents.Client = staleDaemonSets{Client: e.k8s, stale: e.daemonSet()}
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} })
+	e.reconcile(a)
+	if now := e.daemonSet(); now.Generation == e.agents.Client.(staleDaemonSets).stale.Generation {
+		t.Fatal("the restart-field edit did not roll the template")
+	}
+	wantAgentCondition(t, a, ConditionReady, metav1.ConditionFalse, ReasonRollingOut)
 }

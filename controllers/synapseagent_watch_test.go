@@ -176,25 +176,34 @@ func TestAgent_FollowsItsInputs(t *testing.T) {
 
 	// What the controller owns is watched: the DaemonSet's status, and the
 	// Secret and the ServiceAccount it applied.
-	eventually(t, "the DaemonSet's status reaches the agent", func() string {
+	setDaemonSetStatus := func(updated int32) {
 		var d appsv1.DaemonSet
 		if err := e.k8s.Get(ctx, e.key(), &d); err != nil {
-			return err.Error()
+			t.Fatal(err)
 		}
-		if d.Status.ObservedGeneration != d.Generation || d.Status.NumberAvailable != 2 {
-			changeStatus(t, e.k8s, &d, func() {
-				d.Status = appsv1.DaemonSetStatus{ObservedGeneration: d.Generation, DesiredNumberScheduled: 2,
-					CurrentNumberScheduled: 2, UpdatedNumberScheduled: 2, NumberReady: 2, NumberAvailable: 2}
-			})
+		changeStatus(t, e.k8s, &d, func() {
+			d.Status = appsv1.DaemonSetStatus{ObservedGeneration: d.Generation, DesiredNumberScheduled: 2,
+				CurrentNumberScheduled: 2, UpdatedNumberScheduled: updated, NumberReady: 2, NumberAvailable: 2}
+		})
+	}
+	readyIs := func(status metav1.ConditionStatus, reason string) func() string {
+		return func() string {
+			if err := e.k8s.Get(ctx, e.key(), a); err != nil {
+				return err.Error()
+			}
+			if c := meta.FindStatusCondition(a.Status.Conditions, ConditionReady); c == nil || c.Status != status || c.Reason != reason {
+				return fmt.Sprintf("Ready is %+v", c)
+			}
+			return ""
 		}
-		if err := e.k8s.Get(ctx, e.key(), a); err != nil {
-			return err.Error()
-		}
-		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionReady); c == nil || c.Status != metav1.ConditionTrue {
-			return fmt.Sprintf("Ready is %+v", c)
-		}
-		return ""
-	})
+	}
+	// The reconciles still queued by the steps above may set Ready on their
+	// own. Settling first absorbs them; the step after it can then only be
+	// the DaemonSet's own event.
+	setDaemonSetStatus(2)
+	eventually(t, "a settled DaemonSet is Ready", readyIs(metav1.ConditionTrue, ReasonApplied))
+	setDaemonSetStatus(1)
+	eventually(t, "a DaemonSet that stops being updated reaches the agent", readyIs(metav1.ConditionFalse, ReasonRollingOut))
 	for name, obj := range map[string]client.Object{"agent-config": &corev1.Secret{}, "agent": &corev1.ServiceAccount{}} {
 		key := client.ObjectKey{Namespace: e.ns, Name: name}
 		if err := e.k8s.Get(ctx, key, obj); err != nil {
