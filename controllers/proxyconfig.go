@@ -251,9 +251,14 @@ func decodeConfigObject(data []byte) (map[string]any, error) {
 // checkOwnedConfigKeys reports every owned key raw sets, and every place raw
 // puts something other than an object where an owned key has to live.
 func checkOwnedConfigKeys(raw map[string]any, base *field.Path) field.ErrorList {
+	return checkOwnedConfigKeysIn(ownedConfigKeys, raw, base)
+}
+
+// checkOwnedConfigKeysIn is checkOwnedConfigKeys for a given list of keys.
+func checkOwnedConfigKeysIn(keys []ownedConfigKey, raw map[string]any, base *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	notObjects := map[string]bool{}
-	for _, owned := range ownedConfigKeys {
+	for _, owned := range keys {
 		parts := strings.Split(owned.path, ".")
 		cur, path := raw, base
 		for i, part := range parts {
