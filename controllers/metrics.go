@@ -108,6 +108,10 @@ var (
 		Name: "synapse_operator_proxy_ready",
 		Help: "1 when a SynapseProxy's Ready condition is true, else 0.",
 	}, []string{"namespace", "name"})
+	mAgentReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "synapse_operator_agent_ready",
+		Help: "1 when a SynapseAgent's Ready condition is true, else 0.",
+	}, []string{"namespace", "name"})
 	mHostClaimLedgerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "synapse_operator_host_claim_ledger_errors_total",
 		Help: "Problems with the host claim ledger, by reason: write (could not be written), full (lines dropped to fit), quota (lines dropped past the per-namespace limit), invalid (names that cannot be a line), malformed (lines skipped).",
@@ -123,7 +127,7 @@ func init() {
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mHostConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors, mHostClaimLedgerErrors,
-		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady,
+		mProxyHosts, mProxyRoutes, mProxyCerts, mProxyRenderErrors, mProxyReady, mAgentReady,
 		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
 		mEndpointsFallbackTotal,
 	)
