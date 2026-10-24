@@ -19,8 +19,13 @@ import (
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
 
-// agentInstall is where what CheckAgentAccess finds missing comes from.
-const agentInstall = "config/agent-controller"
+// Where what CheckAgentAccess finds missing comes from. The CRDs are in
+// config/crd. config/agent-controller leaves them out because
+// config/proxy-controller carries them, and both are applied together.
+const (
+	agentCRDInstall  = "config/crd"
+	agentRoleInstall = "config/agent-controller"
+)
 
 // agentAPIKeySecretIndex indexes SynapseAgents by the Secret their API key
 // comes from, so a change to that Secret finds the agents that read it.
@@ -163,9 +168,9 @@ func CheckAgentAccess(ctx context.Context, c client.Reader, namespace string) er
 	case err == nil:
 		return nil
 	case meta.IsNoMatchError(err):
-		return fmt.Errorf("the SynapseAgent CRD is not installed; it is part of %s: %w", agentInstall, err)
+		return fmt.Errorf("the SynapseAgent CRD is not installed; it is in %s: %w", agentCRDInstall, err)
 	case apierrors.IsForbidden(err):
-		return fmt.Errorf("not allowed to read SynapseAgent resources; the role that allows it is in %s: %w", agentInstall, err)
+		return fmt.Errorf("not allowed to read SynapseAgent resources; the role that allows it is in %s: %w", agentRoleInstall, err)
 	}
 	return err
 }

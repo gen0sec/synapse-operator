@@ -72,7 +72,6 @@ func TestParseFlags(t *testing.T) {
 		expectedAnnot     string
 		expectedCMKeys    string
 		expectedSecretKey string
-		expectedAgent     bool
 	}{
 		{
 			name:              "default flags",
@@ -146,17 +145,6 @@ func TestParseFlags(t *testing.T) {
 			expectedCMKeys:    "upstreams.yaml,extra.yaml",
 			expectedSecretKey: "password",
 		},
-		{
-			name:              "run the agent controller",
-			args:              []string{"-agent-controller"},
-			expectedMetrics:   ":8080",
-			expectedProbe:     ":8081",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
-			expectedAnnot:     "synapse.gen0sec.com/config-hash",
-			expectedCMKeys:    "upstreams.yaml",
-			expectedSecretKey: "",
-			expectedAgent:     true,
-		},
 	}
 
 	for _, tt := range tests {
@@ -172,7 +160,6 @@ func TestParseFlags(t *testing.T) {
 			var configHashAnnotation string
 			var ignoredConfigMapKeys string
 			var ignoredSecretKeys string
-			var agentController bool
 
 			flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 			flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
@@ -182,8 +169,6 @@ func TestParseFlags(t *testing.T) {
 			flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 			flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 			flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
-
-			flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources.")
 
 			err := flag.CommandLine.Parse(tt.args)
 			require.NoError(t, err)
@@ -196,7 +181,6 @@ func TestParseFlags(t *testing.T) {
 			assert.Equal(t, tt.expectedAnnot, configHashAnnotation)
 			assert.Equal(t, tt.expectedCMKeys, ignoredConfigMapKeys)
 			assert.Equal(t, tt.expectedSecretKey, ignoredSecretKeys)
-			assert.Equal(t, tt.expectedAgent, agentController)
 		})
 	}
 }

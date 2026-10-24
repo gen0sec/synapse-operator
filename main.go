@@ -137,7 +137,7 @@ func main() {
 	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
 	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
 	flag.BoolVar(&proxyController, "proxy-controller", false, "Run SynapseProxy resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its Deployment, Service and ServiceAccount, and render the routes and certificates of the Ingresses whose IngressClass names it in spec.parameters. Needs the CRD and the role in config/proxy-controller. Composable with the config-hash controller and the resolvers; cannot be combined with --ingress-mode or --config-sync.")
-	flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its DaemonSet, Secret and ServiceAccount. Needs the CRD and the role in config/agent-controller.")
+	flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its DaemonSet, Secret and ServiceAccount. Needs the CRD in config/crd and the role in config/agent-controller.")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))

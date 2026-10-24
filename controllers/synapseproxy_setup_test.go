@@ -54,8 +54,9 @@ func TestCheckProxyAccess(t *testing.T) {
 	})
 
 	t.Run("the role is bound", func(t *testing.T) {
-		role, binding := loadProxyRole(t)
-		cfg, _ := operatorHolding(t, rbacAdmin(t), role, binding)
+		role, _ := loadProxyRole(t)
+		own, binding := ownCopy(t, role)
+		cfg, _ := operatorHolding(t, rbacAdmin(t), own, binding)
 		operator, err := client.New(cfg, client.Options{Scheme: proxyTestScheme(t)})
 		if err != nil {
 			t.Fatal(err)

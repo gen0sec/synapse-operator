@@ -297,9 +297,10 @@ func TestAgentRole_IsBoundToTheOperator(t *testing.T) {
 // Holding the role and nothing else, the operator is refused nothing; and
 // there is nothing it may read that it does not.
 func TestAgentRole_IsEnoughToRunAnAgent(t *testing.T) {
-	role, binding := loadRole(t, agentRoleManifest)
+	role, _ := loadRole(t, agentRoleManifest)
+	own, binding := ownCopy(t, role)
 	admin := rbacAdmin(t)
-	cfg, operator := operatorHolding(t, admin, role, binding)
+	cfg, operator := operatorHolding(t, admin, own, binding)
 	stop := runAgentController(t, cfg)
 
 	finished := newAgentStory(t, admin, operator).run()

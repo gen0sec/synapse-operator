@@ -41,8 +41,9 @@ func TestCheckAgentAccess_TheRoleIsNotBound(t *testing.T) {
 }
 
 func TestCheckAgentAccess_TheRoleIsBound(t *testing.T) {
-	role, binding := loadRole(t, agentRoleManifest)
-	cfg, _ := operatorHolding(t, rbacAdmin(t), role, binding)
+	role, _ := loadRole(t, agentRoleManifest)
+	own, binding := ownCopy(t, role)
+	cfg, _ := operatorHolding(t, rbacAdmin(t), own, binding)
 	operator, err := client.New(cfg, client.Options{Scheme: proxyTestScheme(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +71,7 @@ func TestCheckAgentAccess_TheCRDIsNotInstalled(t *testing.T) {
 	if err == nil {
 		t.Fatal("no error without the CRD")
 	}
-	for _, want := range []string{"CRD is not installed", "config/agent-controller"} {
+	for _, want := range []string{"CRD is not installed", "config/crd"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not say %q: %v", want, err)
 		}
