@@ -29,6 +29,7 @@ A Go [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)
 - **Status & HA** — optionally publishes load-balancer addresses on matched Ingresses and gates shared status writes behind a Lease when running more than one proxy replica
 - **Helm-native** — keys off `app.kubernetes.io/name` being `synapse`, `synapse-proxy` or `synapse-agent`, so it plugs straight into Synapse Helm releases
 - **SynapseProxy** (`--proxy-controller`, alpha) — runs a Synapse proxy from one typed resource: its configuration, Deployment, Service, routes and certificates. See [SynapseProxy](#synapseproxy)
+- **SynapseAgent** (`--agent-controller`, alpha) — runs a Synapse agent on every selected node from one typed resource: its configuration and DaemonSet. See [SynapseAgent](#synapseagent)
 
 > **Go 1.26+** · any conformant **Kubernetes** cluster · Gateway API CRDs required only for `--gateway-api`
 
@@ -349,6 +350,127 @@ flowchart TD
 
 ---
 
+## SynapseAgent
+
+> **Alpha** (`synapse.gen0sec.com/v1alpha1`): the API can still change. Off unless the operator runs with `--agent-controller`.
+
+A `SynapseAgent` is a Synapse agent (packet capture, firewall and IDS, no proxy) that runs on every node it selects, described by one resource. The operator renders its configuration into a Secret and creates the ServiceAccount and the DaemonSet. Nobody edits a ConfigMap.
+
+```yaml
+apiVersion: synapse.gen0sec.com/v1alpha1
+kind: SynapseAgent
+metadata:
+  name: agent
+  namespace: synapse
+spec:
+  image: ghcr.io/gen0sec/synapse:<version>
+  platform:
+    apiKeySecretRef:          # optional
+      name: gen0sec-api-key
+      key: api-key
+```
+
+Only `spec.image` is required. Without `spec.platform.apiKeySecretRef` the agent runs with no platform API key. The Secret MUST be in the agent's namespace.
+
+```console
+$ kubectl get synagent -n synapse
+NAME    READY   REASON    NODES   READY-PODS   UPDATED   AGE
+agent   True    Applied   3       3            3         2m
+```
+
+`synagent` is the short name of `synapseagents`. `-o wide` adds `IMAGE` and `CONFIG` (the hash of the rendered configuration). `READY` is true when the DaemonSet runs the spec as it is written. It does not say that Synapse loaded the configuration, or that it attached to every interface (see Status). When it is not true, `REASON` and the resource's conditions say why.
+
+### Install
+
+```bash
+kubectl apply -k config                    # the operator
+kubectl apply -k config/crd                # the CRDs
+kubectl apply -k config/agent-controller   # the role the agent controller needs
+```
+
+Where the `SynapseProxy` controller is installed too, `config/proxy-controller` already carries both CRDs: apply it and `config/agent-controller`, and skip `config/crd`. Then add `--agent-controller` to the operator's arguments in `config/manager.yaml`. The ClusterRole and its binding are both named `synapse-operator-agent-controller`, and bind the ServiceAccount `synapse-operator` in `synapse-os`. When it starts, the operator checks that it can read `SynapseAgent` resources, and exits with an error if it cannot. The error names `config/crd` when the CRD is missing, and `config/agent-controller` when the listing is forbidden. It is refused with `--ingress-mode` and `--config-sync`, with exit 1.
+
+### What to know
+
+- **The pod is privileged and runs as root,** as the Helm chart's agent does, because packet capture, the kernel firewall and the IDS need it. The container is `privileged`, adds `SYS_ADMIN`, `NET_ADMIN`, `BPF` and `SYS_RESOURCE`, runs with `hostNetwork`, and with `hostPID` unless `spec.hostPID` is `false`. Its seccomp and AppArmor profiles are `Unconfined`. Whoever may create or change a `SynapseAgent` chooses the image, the nodes and the pod's scheduling. Create, update and patch rights on `SynapseAgent` MUST therefore go only to principals you trust with a root pod on those nodes.
+- **Pod Security `baseline` or `restricted` refuses the pods, not the DaemonSet.** Label the namespace `pod-security.kubernetes.io/enforce: privileged`, and run agents in a namespace of their own.
+- **It takes Kubernetes 1.30 or newer,** because the pod sets the `appArmorProfile` field. There is no annotation fallback.
+- **Three hostPaths are mounted:** `/sys/fs/bpf` (bidirectional, for the BPF pins), `/sys/kernel/debug` (read-write) and `/lib/modules` (read-only). Each is created when it is missing. Only `/lib/modules` is read-only. `/sys/kernel/btf` is not mounted, on purpose: a privileged pod already sees the host's sysfs, and Synapse treats BTF as optional.
+- **The node's kernel MUST support eBPF and XDP.** XDP needs IPv6 on the interface to attach. Where it is off, Synapse writes `0` to `/proc/sys/net/ipv6/conf/<iface>/disable_ipv6` and retries. That changes the node's interface setting, and it stays changed. The attach fails only if that write fails or IPv6 is disabled at boot (`ipv6.disable=1`). Synapse then falls back without XDP (AF_PACKET capture) and `READY` still goes `True`. Check the pod's log.
+- **There is no Service and there are no probes.** An agent listens on nothing. `READY` follows the DaemonSet, not a health check. The ServiceAccount has no token mounted and no RBAC: the agent never talks to the Kubernetes API.
+- **Defaults of the spec:**
+  - `spec.tolerations` unset tolerates every taint, so the agent runs on every selected node. An explicit `tolerations: []` tolerates none.
+  - `spec.hostPID` unset is `true`.
+  - `spec.ids.enabled` unset is `true`. Synapse's own default is `false`.
+  - `spec.updateStrategy` unset is a rolling update with `maxUnavailable: 1`, one node at a time.
+  - `spec.nodeSelector` always gets `kubernetes.io/os: linux`. A selector that says another value is refused.
+- **`spec.config` takes the Synapse settings that have no field,** in the shape of Synapse's own configuration file. A key the operator owns is refused and reported in the `ConfigValid` condition. It is never silently overridden. An invalid configuration changes nothing that is running. The owned keys are `mode`, `daemon.enabled`, `proxy` and its alias `pingora`, `arxignis` (use `platform`), `firewall.ids` (use the top-level `ids`), `logging.level`, `platform.api_key`, `platform.identity.enabled`, `platform.identity.cluster`, `network.ifaces`, `ids.enabled`, `ids.enforce_block` and `ids.address_vars.HOME_NET`. Other keys under these sections, such as `ids.address_vars.CUSTOM`, are allowed.
+- **`network.ip_version` has no field.** Synapse does not act on it. It MAY be set in `spec.config`.
+- **`spec.capture.interfaces` writes `network.ifaces`.** Synapse ignores `network.iface` beside it, so a raw `network.iface` in `spec.config` is refused when interfaces are set.
+- **HOME_NET.** A typed `spec.ids.homeNet` wins. Its entries MUST be IP addresses or CIDRs; the operator refuses anything else, such as `any`, a comma or a bracket, and names the entry. Without it the operator computes HOME_NET from the nodes' addresses, their PodCIDRs and the LoadBalancer IPs of Services, plus the private-network supernets, and follows the cluster as it changes. With `ids.enabled` false, every such change (a node joins or leaves, a load balancer IP changes) rolls the DaemonSet on every node. A typed `spec.ids.homeNet` stops that.
+- **A typed `spec.ids.homeNet` replaces the computed list.** HOME_NET also feeds Synapse's never-ban guard. A short list can let `enforceBlock` ban the cluster's own nodes or a load balancer IP. The list SHOULD cover the nodes, the pods and the load balancers.
+- **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
+- **The agent owns three objects:** the Secret `<name>-config`, the ServiceAccount `<name>` and the DaemonSet `<name>`. Each has an owner reference to the agent, and they go with it.
+
+### Hot reload and rollouts
+
+Six IDS settings are hot: `rule_paths`, `address_vars` (HOME_NET included), `port_vars`, `flow_timeout_secs`, `max_flows` and `enforce_block`, under `ids` and `firewall.ids`. A change confined to them updates the config Secret in place. The pods are not replaced. Synapse reloads the file once kubelet has synced the mounted Secret, which takes up to about a minute.
+
+Every other change rolls the DaemonSet, one node at a time by default. The pod template carries a hash of the configuration without the six settings (`synapse.gen0sec.com/restart-config-hash`), so only a change to the rest replaces pods. A new image, a new resource limit and the like roll it in the usual way.
+
+When `ids.enabled` is false, every change rolls, since no IDS worker would reload the file.
+
+The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change never reaches a running pod. It takes effect at the next restart, including a HOME_NET change, which also feeds the never-ban guard. Restart it yourself: `kubectl -n <ns> rollout restart daemonset/<name>`.
+
+### Status
+
+| Condition | Meaning |
+|---|---|
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference) |
+| `Ready` | The DaemonSet runs the spec as it is written |
+
+Reasons of `Ready`:
+
+| Reason | Meaning |
+|---|---|
+| `Applied` | The DaemonSet runs the current template and every pod is available. The Secret is applied, but kubelet may not have synced the file yet, and Synapse may not have reloaded it. A hot change is not confirmed by this |
+| `RollingOut` | The DaemonSet is not yet observed, or not every pod runs the current template or is available |
+| `NoMatchingNodes` | No node matches the node selector and tolerations |
+| `ConfigInvalid` | `ConfigValid` is false. What runs is left as it is |
+| `NameCollision` | An object of the same name that the agent does not own is in the way. Nothing is written until it is gone |
+
+`synapse_operator_agent_ready{namespace,name}` is 1 while `Ready` is true and 0 otherwise. The series is deleted with the agent.
+
+### Migrating from the Helm agent
+
+The `agent.enabled` toggle exists only in the `synapse-stack` chart (an alias of the `synapse` subchart, off by default). For a standalone `synapse` release that runs as the agent, uninstall that release instead.
+
+Both paths leave a window. Pick one.
+
+**Overlap first** keeps the node protected, and costs a window of two agents. What happens depends on the Helm agent:
+
+- Without the `/sys/fs/bpf` mount (the chart's default), the second attach is either refused, so the new agent skips the interface, or it replaces the Helm agent's program, depending on the attach mode.
+- With the mount, the new agent opens the pinned link and swaps its program in. Nothing is refused, and the two agents share the pins and run two firewalls.
+
+1. Create the `SynapseAgent` and wait for `READY` to be `True`.
+2. Remove the Helm agent (`agent.enabled=false`).
+3. Restart the new agent: `kubectl -n <ns> rollout restart daemonset/<name>`. The attach happens when the pod starts, so an interface it skipped stays skipped until then.
+4. Read the pod's log. Look for these lines:
+   - `XDP: skipped N interface(s) that already have a foreign XDP program`: an interface was skipped.
+   - `Failed to attach XDP to '<iface>': ...`: the attach failed, for example when the Helm agent holds a pinned link.
+   - `thalamus IDS capture auto-resolved to AF_PACKET recvfrom (XDP unavailable)`: the IDS fell back.
+   - `XDP/BPF: no interface attached`: no interface got XDP.
+
+   Synapse then falls back to AF_PACKET for the IDS and to nftables or iptables for the firewall, and `READY` is still `True`.
+
+**Gap first** has no overlap and no skipped interface, and costs a node that is unprotected between the two steps. Remove the Helm agent, then create the `SynapseAgent`. It is the simpler path where a short gap is acceptable.
+
+The operator's objects carry no `app.kubernetes.io/name` label, so the chart's selectors, and the config-hash controller's `--label-selector`, never match them.
+
+A `SynapseAgent` and a `SynapseProxy` MUST NOT share a name in one namespace. They would collide on the ServiceAccount, and the operator refuses with `NameCollision`.
+
+---
+
 ## Configuration flags
 
 **Common**
@@ -377,6 +499,12 @@ Before this default, it was `app.kubernetes.io/name=synapse`. An install that do
 |---|---|---|
 | `--proxy-controller` | `false` | Run [`SynapseProxy`](#synapseproxy) resources. Needs the CRD and the role in [`config/proxy-controller`](config/proxy-controller/). Composable with the default config-sync controller and the resolvers; refused with `--ingress-mode` and `--config-sync` |
 | `--cluster-domain` | `cluster.local` | Cluster DNS domain, for a backend that has no cluster IP |
+
+**SynapseAgent**
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--agent-controller` | `false` | Run [`SynapseAgent`](#synapseagent) resources. Needs the CRD in [`config/crd`](config/crd/) and the role in [`config/agent-controller`](config/agent-controller/). Composable with the default config-sync controller, `--proxy-controller` and the resolvers; refused with `--ingress-mode` and `--config-sync` |
 
 **Ingress / Gateway API mode** (`--ingress-mode`)
 
