@@ -272,6 +272,27 @@ func TestAgentDaemonSet_HostPIDUnsetIsOn(t *testing.T) {
 	}
 }
 
+func TestAgentDaemonSet_HostNetworkOff(t *testing.T) {
+	d := buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(false) }), "rh")
+	pod := agentPodSpec(d)
+	if pod.HostNetwork || pod.DNSPolicy != "" {
+		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want false and the API default", pod.HostNetwork, pod.DNSPolicy)
+	}
+	d = buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(true) }), "rh")
+	pod = agentPodSpec(d)
+	if !pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want true and ClusterFirstWithHostNet", pod.HostNetwork, pod.DNSPolicy)
+	}
+}
+
+func TestAgentDaemonSet_HostNetworkUnsetIsOn(t *testing.T) {
+	d := buildAgentDaemonSet(nodeAgent(), "rh")
+	pod := agentPodSpec(d)
+	if !pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Errorf("unset hostNetwork gives %v, dnsPolicy %q, want true and ClusterFirstWithHostNet", pod.HostNetwork, pod.DNSPolicy)
+	}
+}
+
 func TestAgentDaemonSet_TolerationsUnsetToleratesEverything(t *testing.T) {
 	d := buildAgentDaemonSet(nodeAgent(), "rh")
 	got := agentPodSpec(d).Tolerations

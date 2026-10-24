@@ -100,6 +100,14 @@ type SynapseAgentSpec struct {
 	// +optional
 	HostPID *bool `json:"hostPID,omitempty"`
 
+	// HostNetwork runs the agent pods in the network namespace of their node.
+	// Unset means true. With false the pod has its own network namespace, so
+	// capture, XDP and the firewall see only the pod's interface and not the
+	// traffic of the node.
+	//
+	// +optional
+	HostNetwork *bool `json:"hostNetwork,omitempty"`
+
 	// OS is the operating system of the nodes the agent runs on.
 	//
 	// +optional

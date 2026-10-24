@@ -120,6 +120,9 @@ func TestSynapseAgent_Defaults(t *testing.T) {
 	if a.Spec.HostPID != nil {
 		t.Errorf("hostPID = %v, want it left unset: the builder defaults it per OS", *a.Spec.HostPID)
 	}
+	if a.Spec.HostNetwork != nil {
+		t.Errorf("hostNetwork = %v, want it left unset: the builder defaults it", *a.Spec.HostNetwork)
+	}
 	if a.Spec.OS != "linux" {
 		t.Errorf("os = %q, want it defaulted to linux", a.Spec.OS)
 	}
@@ -156,6 +159,7 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 		RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: &maxUnavailable},
 	}
 	a.Spec.HostPID = ptr.To(false)
+	a.Spec.HostNetwork = ptr.To(false)
 	a.Spec.OS = "linux"
 	a.Spec.Logging = &v1alpha1.LoggingSpec{Level: "debug"}
 	a.Spec.Platform = &v1alpha1.AgentPlatformSpec{
@@ -173,6 +177,9 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 
 	if a.Spec.HostPID == nil || *a.Spec.HostPID {
 		t.Errorf("hostPID = %v, want the explicit false kept", a.Spec.HostPID)
+	}
+	if a.Spec.HostNetwork == nil || *a.Spec.HostNetwork {
+		t.Errorf("hostNetwork = %v, want the explicit false kept", a.Spec.HostNetwork)
 	}
 	if a.Spec.IDS == nil || len(a.Spec.IDS.HomeNet) != 2 {
 		t.Errorf("ids = %+v, want it kept", a.Spec.IDS)

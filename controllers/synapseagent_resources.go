@@ -145,9 +145,9 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 					Annotations: map[string]string{agentRestartHashAnnotation: restartHash},
 				},
 				Spec: corev1.PodSpec{
-					HostNetwork: true,
+					HostNetwork: agentHostNetwork(spec),
 					HostPID:     agentHostPID(spec),
-					DNSPolicy:   corev1.DNSClusterFirstWithHostNet,
+					DNSPolicy:   agentDNSPolicy(spec),
 
 					ServiceAccountName:           a.Name,
 					AutomountServiceAccountToken: kptr.To(false),
@@ -184,6 +184,21 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 // processes of its node by default.
 func agentHostPID(spec *synapsev1alpha1.SynapseAgentSpec) bool {
 	return spec.HostPID == nil || *spec.HostPID
+}
+
+// agentHostNetwork is true unless the spec says otherwise: the agent sees the
+// traffic of its node by default.
+func agentHostNetwork(spec *synapsev1alpha1.SynapseAgentSpec) bool {
+	return spec.HostNetwork == nil || *spec.HostNetwork
+}
+
+// agentDNSPolicy keeps cluster DNS working for a pod on the host network,
+// which would otherwise resolve through the node.
+func agentDNSPolicy(spec *synapsev1alpha1.SynapseAgentSpec) corev1.DNSPolicy {
+	if agentHostNetwork(spec) {
+		return corev1.DNSClusterFirstWithHostNet
+	}
+	return ""
 }
 
 // agentTolerations tolerates every taint when the spec sets none. An empty

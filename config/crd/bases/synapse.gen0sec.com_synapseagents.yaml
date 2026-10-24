@@ -1008,6 +1008,13 @@ spec:
                   the operator itself sets is refused, not overridden.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              hostNetwork:
+                description: |-
+                  HostNetwork runs the agent pods in the network namespace of their node.
+                  Unset means true. With false the pod has its own network namespace, so
+                  capture, XDP and the firewall see only the pod's interface and not the
+                  traffic of the node.
+                type: boolean
               hostPID:
                 description: |-
                   HostPID runs the agent pods in the process namespace of their node, so
