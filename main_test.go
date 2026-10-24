@@ -80,7 +80,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -92,7 +92,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -104,7 +104,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":9091",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -116,7 +116,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     true,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -128,7 +128,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "test-ns",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -165,7 +165,7 @@ func TestParseFlags(t *testing.T) {
 			flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 			flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 			flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
-			flag.StringVar(&selector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads.")
+			flag.StringVar(&selector, "label-selector", defaultLabelSelector, "Label selector for config sources and workloads.")
 			flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 			flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 			flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
@@ -344,4 +344,18 @@ func TestCRDKustomizationListsEveryCRD(t *testing.T) {
 		want = append(want, "bases/"+filepath.Base(file))
 	}
 	assert.ElementsMatch(t, want, kustomization.Resources)
+}
+
+func TestDefaultLabelSelector(t *testing.T) {
+	selector, err := parseLabelSelector(defaultLabelSelector)
+	require.NoError(t, err)
+
+	const key = "app.kubernetes.io/name"
+	for _, name := range []string{"synapse", "synapse-proxy", "synapse-agent"} {
+		assert.True(t, selector.Matches(labels.Set{key: name}), name)
+	}
+	for _, name := range []string{"synapse-operator", "other"} {
+		assert.False(t, selector.Matches(labels.Set{key: name}), name)
+	}
+	assert.False(t, selector.Matches(labels.Set{"app": "synapse"}), "missing label")
 }

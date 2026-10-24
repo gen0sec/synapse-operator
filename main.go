@@ -45,6 +45,10 @@ func init() {
 	utilruntime.Must(synapsev1alpha1.AddToScheme(scheme))
 }
 
+// defaultLabelSelector keeps the legacy "synapse" name and adds the names the
+// synapse-stack chart sets through nameOverride.
+const defaultLabelSelector = "app.kubernetes.io/name in (synapse,synapse-proxy,synapse-agent)"
+
 func main() {
 	var metricsAddr string
 	var probeAddr string
@@ -98,7 +102,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
-	flag.StringVar(&labelSelector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads. Objects controlled by one of the operator's own resources are left alone even when they match.")
+	flag.StringVar(&labelSelector, "label-selector", defaultLabelSelector, "Label selector for config sources and workloads. Objects controlled by one of the operator's own resources are left alone even when they match.")
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")

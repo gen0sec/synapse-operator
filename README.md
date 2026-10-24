@@ -27,7 +27,7 @@ A Go [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)
 - **Ingress / Gateway API mode** (`--ingress-mode`) — reconciles class-matched `Ingress` and Gateway API `HTTPRoute` objects into Synapse's v2 `upstreams.yaml` on a shared volume, hot-reloaded via inotify + `SIGHUP`
 - **TLS projection** — projects referenced Ingress/Gateway TLS Secrets into Synapse's certificates directory, operator-owned and hot-reloaded. A certificate that cannot be written does not stop the render: the pair already on disk keeps serving (a new one is left out), a `CertificateNotWritten` event is recorded on the object that references it, and the render is retried after a minute
 - **Status & HA** — optionally publishes load-balancer addresses on matched Ingresses and gates shared status writes behind a Lease when running more than one proxy replica
-- **Helm-native** — keys off `app.kubernetes.io/name=synapse`, so it plugs straight into Synapse Helm releases
+- **Helm-native** — keys off `app.kubernetes.io/name` being `synapse`, `synapse-proxy` or `synapse-agent`, so it plugs straight into Synapse Helm releases
 - **SynapseProxy** (`--proxy-controller`, alpha) — runs a Synapse proxy from one typed resource: its configuration, Deployment, Service, routes and certificates. See [SynapseProxy](#synapseproxy)
 
 > **Go 1.26+** · any conformant **Kubernetes** cluster · Gateway API CRDs required only for `--gateway-api`
@@ -364,7 +364,7 @@ flowchart TD
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--label-selector` | `app.kubernetes.io/name=synapse` | Selects config sources and workloads. Objects controlled by one of the operator's own resources (`synapse.gen0sec.com`) are left alone even when they match: the controller for that resource rolls them |
+| `--label-selector` | `app.kubernetes.io/name in (synapse,synapse-proxy,synapse-agent)` | Selects config sources and workloads. Objects controlled by one of the operator's own resources (`synapse.gen0sec.com`) are left alone even when they match: the controller for that resource rolls them |
 | `--config-hash-annotation` | `synapse.gen0sec.com/config-hash` | Annotation key for the hash |
 | `--ignore-configmap-keys` | `upstreams.yaml` | Comma-separated ConfigMap keys excluded from the hash |
 | `--ignore-secret-keys` | _(none)_ | Comma-separated Secret keys excluded from the hash |
