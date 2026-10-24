@@ -197,12 +197,20 @@ func (r *SynapseProxyReconciler) reconcile(ctx context.Context, proxy *synapsev1
 // apiKey resolves spec.platform.apiKeySecretRef. A non-empty reason means the
 // reference cannot be resolved and says why.
 func (r *SynapseProxyReconciler) apiKey(ctx context.Context, proxy *synapsev1alpha1.SynapseProxy) (key, reason, message string, err error) {
-	if proxy.Spec.Platform == nil || proxy.Spec.Platform.APIKeySecretRef == nil {
+	if proxy.Spec.Platform == nil {
 		return "", "", "", nil
 	}
-	ref := proxy.Spec.Platform.APIKeySecretRef
+	return resolveAPIKey(ctx, r.Client, proxy.Namespace, proxy.Spec.Platform.APIKeySecretRef)
+}
+
+// resolveAPIKey reads the Secret key ref points at. No ref is no key. A
+// non-empty reason means the reference cannot be resolved and says why.
+func resolveAPIKey(ctx context.Context, c client.Reader, namespace string, ref *synapsev1alpha1.SecretKeyReference) (key, reason, message string, err error) {
+	if ref == nil {
+		return "", "", "", nil
+	}
 	var secret corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: proxy.Namespace, Name: ref.Name}, &secret); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", ReasonSecretNotFound, fmt.Sprintf("spec.platform.apiKeySecretRef: Secret %q not found", ref.Name), nil
 		}
@@ -239,27 +247,43 @@ func (r *SynapseProxyReconciler) missingRouteOutput(ctx context.Context, proxy *
 // being this proxy's. It is left untouched: applying over it would take it
 // from whoever it belongs to.
 func (r *SynapseProxyReconciler) inTheWay(ctx context.Context, proxy *synapsev1alpha1.SynapseProxy, obj client.Object) (string, error) {
+	return objectInTheWay(ctx, r.Client, proxy, "SynapseProxy", obj)
+}
+
+// objectInTheWay reports an object that already exists under obj's name
+// without being controlled by owner, or returns "".
+func objectInTheWay(ctx context.Context, c client.Reader, owner client.Object, ownerKind string, obj client.Object) (string, error) {
 	existing := obj.DeepCopyObject().(client.Object)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
+	if err := c.Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
 		return "", client.IgnoreNotFound(err)
 	}
-	if metav1.IsControlledBy(existing, proxy) {
+	if metav1.IsControlledBy(existing, owner) {
 		return "", nil
 	}
 	kind := obj.GetObjectKind().GroupVersionKind().Kind
-	return fmt.Sprintf("%s %q already exists and does not belong to this SynapseProxy", kind, obj.GetName()), nil
+	return fmt.Sprintf("%s %q already exists and does not belong to this %s", kind, obj.GetName(), ownerKind), nil
 }
 
-// apply applies obj server-side. The empty status the conversion writes out
-// is ignored by the API server: status is a subresource of everything here
-// that has one.
+// apply applies obj server-side.
 func (r *SynapseProxyReconciler) apply(ctx context.Context, obj client.Object) error {
+	_, err := applyObject(ctx, r.Client, proxyFieldOwner, obj)
+	return err
+}
+
+// applyObject applies obj server-side as fieldOwner and returns the object as
+// the API server stored it. The empty status the conversion writes out is
+// ignored by the API server: status is a subresource of everything applied
+// here that has one.
+func applyObject(ctx context.Context, c client.Client, fieldOwner string, obj client.Object) (client.Object, error) {
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	u := &unstructured.Unstructured{Object: content}
-	return r.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(proxyFieldOwner), client.ForceOwnership)
+	if err := c.Patch(ctx, u, client.Apply, client.FieldOwner(fieldOwner), client.ForceOwnership); err != nil {
+		return nil, err
+	}
+	return u, nil
 }
 
 // pruneConfigSecrets deletes the proxy's config Secrets that nothing mounts
