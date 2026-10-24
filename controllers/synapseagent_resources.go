@@ -120,9 +120,6 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "config", MountPath: agentConfigDir, ReadOnly: true},
 			{Name: "data", MountPath: agentDataDir},
-			{Name: "bpffs", MountPath: "/sys/fs/bpf", MountPropagation: kptr.To(corev1.MountPropagationBidirectional)},
-			{Name: "debugfs", MountPath: "/sys/kernel/debug"},
-			{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
 		},
 	}
 
@@ -132,6 +129,27 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 			Type: kptr.To(corev1.HostPathDirectoryOrCreate),
 		}}}
 	}
+
+	volumes := []corev1.Volume{
+		{Name: "config", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: agentConfigSecretName(a)},
+		}},
+		{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	}
+	// Synapse pins by interface name and adopts an existing pin without
+	// checking its network namespace. A pod of its own would take over the
+	// node's pins, so only a pod on the host network gets the node's bpffs.
+	if agentHostNetwork(spec) {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name: "bpffs", MountPath: "/sys/fs/bpf", MountPropagation: kptr.To(corev1.MountPropagationBidirectional),
+		})
+		volumes = append(volumes, hostPath("bpffs", "/sys/fs/bpf"))
+	}
+	container.VolumeMounts = append(container.VolumeMounts,
+		corev1.VolumeMount{Name: "debugfs", MountPath: "/sys/kernel/debug"},
+		corev1.VolumeMount{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
+	)
+	volumes = append(volumes, hostPath("debugfs", "/sys/kernel/debug"), hostPath("modules", "/lib/modules"))
 
 	return &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
@@ -145,9 +163,9 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 					Annotations: map[string]string{agentRestartHashAnnotation: restartHash},
 				},
 				Spec: corev1.PodSpec{
-					HostNetwork: true,
+					HostNetwork: agentHostNetwork(spec),
 					HostPID:     agentHostPID(spec),
-					DNSPolicy:   corev1.DNSClusterFirstWithHostNet,
+					DNSPolicy:   agentDNSPolicy(spec),
 
 					ServiceAccountName:           a.Name,
 					AutomountServiceAccountToken: kptr.To(false),
@@ -165,15 +183,7 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 						RunAsNonRoot: kptr.To(false),
 					},
 					Containers: []corev1.Container{container},
-					Volumes: []corev1.Volume{
-						{Name: "config", VolumeSource: corev1.VolumeSource{
-							Secret: &corev1.SecretVolumeSource{SecretName: agentConfigSecretName(a)},
-						}},
-						{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						hostPath("bpffs", "/sys/fs/bpf"),
-						hostPath("debugfs", "/sys/kernel/debug"),
-						hostPath("modules", "/lib/modules"),
-					},
+					Volumes:    volumes,
 				},
 			},
 		},
@@ -184,6 +194,21 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 // processes of its node by default.
 func agentHostPID(spec *synapsev1alpha1.SynapseAgentSpec) bool {
 	return spec.HostPID == nil || *spec.HostPID
+}
+
+// agentHostNetwork is true unless the spec says otherwise: the agent sees the
+// traffic of its node by default.
+func agentHostNetwork(spec *synapsev1alpha1.SynapseAgentSpec) bool {
+	return spec.HostNetwork == nil || *spec.HostNetwork
+}
+
+// agentDNSPolicy keeps cluster DNS working for a pod on the host network,
+// which would otherwise resolve through the node.
+func agentDNSPolicy(spec *synapsev1alpha1.SynapseAgentSpec) corev1.DNSPolicy {
+	if agentHostNetwork(spec) {
+		return corev1.DNSClusterFirstWithHostNet
+	}
+	return ""
 }
 
 // agentTolerations tolerates every taint when the spec sets none. An empty

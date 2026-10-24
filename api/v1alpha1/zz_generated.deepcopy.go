@@ -310,6 +310,11 @@ func (in *SynapseAgentSpec) DeepCopyInto(out *SynapseAgentSpec) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.HostNetwork != nil {
+		in, out := &in.HostNetwork, &out.HostNetwork
+		*out = new(bool)
+		**out = **in
+	}
 	if in.Logging != nil {
 		in, out := &in.Logging, &out.Logging
 		*out = new(LoggingSpec)
