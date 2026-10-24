@@ -360,6 +360,8 @@ flowchart TD
 | `--leader-elect` | `false` | Leader election for the controller manager |
 | `--namespace` | _(all)_ | Restrict the watch to one namespace |
 
+Before this default, it was `app.kubernetes.io/name=synapse`. An install that does not pass `--label-selector` now also selects workloads named `synapse-proxy` and `synapse-agent`. The first reconcile after the upgrade stamps a hash on each of them, which rolls each once. When a proxy and an agent share a namespace, they also share that namespace's hash, so a change to the agent's config rolls the proxy: set `--per-workload-config-hash` to avoid it.
+
 **Config-sync mode**
 
 | Flag | Default | Purpose |
