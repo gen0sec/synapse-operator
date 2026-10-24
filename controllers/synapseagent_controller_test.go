@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	kptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -324,6 +325,44 @@ func TestAgent_RestartFieldRollsTemplate(t *testing.T) {
 	}
 	if e.configSecret().UID != secret.UID || !strings.Contains(e.config(), "level: debug") {
 		t.Error("the Secret was not updated in place")
+	}
+}
+
+func TestAgent_HostNetworkSwitch(t *testing.T) {
+	e := newAgentEnv(t)
+	a := e.running()
+	on := e.daemonSet()
+	if !on.Spec.Template.Spec.HostNetwork {
+		t.Fatal("a new agent is not on the host network")
+	}
+
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(false) })
+	e.reconcile(a)
+	off := e.daemonSet()
+	pod := off.Spec.Template.Spec
+	if pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirst {
+		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want false and ClusterFirst", pod.HostNetwork, pod.DNSPolicy)
+	}
+	if v, m := bpffsOf(t, off); v || m {
+		t.Errorf("the pod off the host network has the node's bpffs: volume=%v mount=%v", v, m)
+	}
+	if off.Generation <= on.Generation {
+		t.Errorf("generation %d after %d: the switch did not roll the pods", off.Generation, on.Generation)
+	}
+
+	e.reconcile(a)
+	if again := e.daemonSet(); again.ResourceVersion != off.ResourceVersion {
+		t.Errorf("a second reconcile rewrote the DaemonSet: resourceVersion %s -> %s", off.ResourceVersion, again.ResourceVersion)
+	}
+
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(true) })
+	e.reconcile(a)
+	back := e.daemonSet()
+	if !back.Spec.Template.Spec.HostNetwork || back.Spec.Template.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want true and ClusterFirstWithHostNet", back.Spec.Template.Spec.HostNetwork, back.Spec.Template.Spec.DNSPolicy)
+	}
+	if v, m := bpffsOf(t, back); !v || !m {
+		t.Errorf("the bpffs did not come back: volume=%v mount=%v", v, m)
 	}
 }
 

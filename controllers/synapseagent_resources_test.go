@@ -272,16 +272,38 @@ func TestAgentDaemonSet_HostPIDUnsetIsOn(t *testing.T) {
 	}
 }
 
+// bpffsOf reports whether the pod declares or mounts the node's bpffs.
+func bpffsOf(t *testing.T, d *appsv1.DaemonSet) (volume, mount bool) {
+	t.Helper()
+	for _, v := range agentPodSpec(d).Volumes {
+		if v.HostPath != nil && v.HostPath.Path == "/sys/fs/bpf" {
+			volume = true
+		}
+	}
+	for _, m := range agentContainer(t, d).VolumeMounts {
+		if m.MountPath == "/sys/fs/bpf" {
+			mount = true
+		}
+	}
+	return volume, mount
+}
+
 func TestAgentDaemonSet_HostNetworkOff(t *testing.T) {
 	d := buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(false) }), "rh")
 	pod := agentPodSpec(d)
 	if pod.HostNetwork || pod.DNSPolicy != "" {
 		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want false and the API default", pod.HostNetwork, pod.DNSPolicy)
 	}
+	if v, m := bpffsOf(t, d); v || m {
+		t.Errorf("off the host network the pod has the node's bpffs: volume=%v mount=%v", v, m)
+	}
 	d = buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(true) }), "rh")
 	pod = agentPodSpec(d)
 	if !pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
 		t.Errorf("hostNetwork = %v, dnsPolicy = %q, want true and ClusterFirstWithHostNet", pod.HostNetwork, pod.DNSPolicy)
+	}
+	if v, m := bpffsOf(t, d); !v || !m {
+		t.Errorf("on the host network the bpffs is missing: volume=%v mount=%v", v, m)
 	}
 }
 

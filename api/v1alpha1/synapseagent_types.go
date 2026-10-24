@@ -101,9 +101,11 @@ type SynapseAgentSpec struct {
 	HostPID *bool `json:"hostPID,omitempty"`
 
 	// HostNetwork runs the agent pods in the network namespace of their node.
-	// Unset means true. With false the pod has its own network namespace, so
-	// capture, XDP and the firewall see only the pod's interface and not the
-	// traffic of the node.
+	// Unset means true. With false the pod has its own network namespace and
+	// no bpffs of the node, so it inspects and protects only the traffic of
+	// its own pod, and its XDP state does not survive a restart. Switching an
+	// existing agent leaves the XDP link, tc programs and pinned maps of the
+	// earlier pod on the node until `synapse --force-stop` runs there.
 	//
 	// +optional
 	HostNetwork *bool `json:"hostNetwork,omitempty"`
