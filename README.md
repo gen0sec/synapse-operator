@@ -384,10 +384,11 @@ agent   True    Applied   3       3            3         2m
 
 ```bash
 kubectl apply -k config                    # the operator
-kubectl apply -k config/agent-controller   # the CRD, and the role the agent controller needs
+kubectl apply -k config/crd                # the CRDs
+kubectl apply -k config/agent-controller   # the role the agent controller needs
 ```
 
-then add `--agent-controller` to the operator's arguments in `config/manager.yaml`. The ClusterRole and its binding are both named `synapse-operator-agent-controller`, and bind the ServiceAccount `synapse-operator` in `synapse-os`. When it starts, the operator checks that it can read `SynapseAgent` resources, and exits with an error that names `config/agent-controller` if the CRD is missing or the listing is forbidden. It is refused with `--ingress-mode` and `--config-sync`, with exit 1.
+Where the `SynapseProxy` controller is installed too, `config/proxy-controller` already carries both CRDs: apply it and `config/agent-controller`, and skip `config/crd`. Then add `--agent-controller` to the operator's arguments in `config/manager.yaml`. The ClusterRole and its binding are both named `synapse-operator-agent-controller`, and bind the ServiceAccount `synapse-operator` in `synapse-os`. When it starts, the operator checks that it can read `SynapseAgent` resources, and exits with an error if it cannot. The error names `config/crd` when the CRD is missing, and `config/agent-controller` when the listing is forbidden. It is refused with `--ingress-mode` and `--config-sync`, with exit 1.
 
 ### What to know
 
@@ -448,13 +449,19 @@ Both paths leave a window. Pick one.
 
 **Overlap first** keeps the node protected, and costs a window of two agents. What happens depends on the Helm agent:
 
-- Without the `/sys/fs/bpf` mount (the chart's default), the second XDP attach is refused. The new agent skips the interface.
+- Without the `/sys/fs/bpf` mount (the chart's default), the second attach is either refused, so the new agent skips the interface, or it replaces the Helm agent's program, depending on the attach mode.
 - With the mount, the new agent opens the pinned link and swaps its program in. Nothing is refused, and the two agents share the pins and run two firewalls.
 
 1. Create the `SynapseAgent` and wait for `READY` to be `True`.
 2. Remove the Helm agent (`agent.enabled=false`).
 3. Restart the new agent: `kubectl -n <ns> rollout restart daemonset/<name>`. The attach happens when the pod starts, so an interface it skipped stays skipped until then.
-4. Read the pod's log. A skipped interface shows as `XDP: skipped N interface(s) that already have a foreign XDP program`. Synapse then falls back to AF_PACKET for the IDS and to nftables or iptables for the firewall, and `READY` is still `True`.
+4. Read the pod's log. Look for these lines:
+   - `XDP: skipped N interface(s) that already have a foreign XDP program`: an interface was skipped.
+   - `Failed to attach XDP to '<iface>': ...`: the attach failed, for example when the Helm agent holds a pinned link.
+   - `thalamus IDS capture auto-resolved to AF_PACKET recvfrom (XDP unavailable)`: the IDS fell back.
+   - `XDP/BPF: no interface attached`: no interface got XDP.
+
+   Synapse then falls back to AF_PACKET for the IDS and to nftables or iptables for the firewall, and `READY` is still `True`.
 
 **Gap first** has no overlap and no skipped interface, and costs a node that is unprotected between the two steps. Remove the Helm agent, then create the `SynapseAgent`. It is the simpler path where a short gap is acceptable.
 
@@ -495,7 +502,7 @@ A `SynapseAgent` and a `SynapseProxy` MUST NOT share a name in one namespace. Th
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent-controller` | `false` | Run [`SynapseAgent`](#synapseagent) resources. Needs the CRD and the role in [`config/agent-controller`](config/agent-controller/). Composable with the default config-sync controller, `--proxy-controller` and the resolvers; refused with `--ingress-mode` and `--config-sync` |
+| `--agent-controller` | `false` | Run [`SynapseAgent`](#synapseagent) resources. Needs the CRD in [`config/crd`](config/crd/) and the role in [`config/agent-controller`](config/agent-controller/). Composable with the default config-sync controller, `--proxy-controller` and the resolvers; refused with `--ingress-mode` and `--config-sync` |
 
 **Ingress / Gateway API mode** (`--ingress-mode`)
 
