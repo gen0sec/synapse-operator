@@ -348,8 +348,9 @@ func TestAgentObjects_OwnerRefs(t *testing.T) {
 // synapse-agent, so its selector is app.kubernetes.io/name=synapse-agent plus
 // app.kubernetes.io/instance=<release> (helm-charts, charts/synapse
 // templates/_helpers.tpl "synapse.selectorLabels"). The stack's operator
-// selects by app.kubernetes.io/name in (synapse-proxy,synapse-agent), and a
-// plain install by name=synapse, the operator's default --label-selector.
+// selects by app.kubernetes.io/name in (synapse-proxy,synapse-agent), an older
+// install by name=synapse, and the operator's default --label-selector by
+// all three names.
 func TestAgentObjects_DoNotMatchLegacySelectors(t *testing.T) {
 	a := nodeAgent()
 	mustParse := func(s string) labels.Selector {
@@ -366,6 +367,7 @@ func TestAgentObjects_DoNotMatchLegacySelectors(t *testing.T) {
 		mustParse("app.kubernetes.io/name=synapse-agent"),
 		mustParse("app.kubernetes.io/name=synapse-agent,app.kubernetes.io/instance=node-agent"),
 		mustParse("app.kubernetes.io/name in (synapse-proxy,synapse-agent)"),
+		mustParse("app.kubernetes.io/name in (synapse,synapse-proxy,synapse-agent)"),
 	}
 	d := buildAgentDaemonSet(a, "rh")
 	podLabels := labels.Set(d.Spec.Template.Labels)
