@@ -1,0 +1,13 @@
+# What running SynapseAgent resources takes on top of the operator in ../:
+# the CRD, and the role its controller needs.
+#
+#   kubectl apply -k config
+#   kubectl apply -k config/agent-controller
+#
+# and --agent-controller in the operator's arguments.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../crd
+  - rbac.yaml

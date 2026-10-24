@@ -113,18 +113,25 @@ func readManifest(t *testing.T, path string) map[string][]byte {
 
 func loadProxyRole(t *testing.T) (*rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding) {
 	t.Helper()
-	docs := readManifest(t, proxyRoleManifest)
+	return loadRole(t, proxyRoleManifest)
+}
+
+// loadRole reads a manifest that holds a ClusterRole and its binding, and
+// nothing else.
+func loadRole(t *testing.T, path string) (*rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding) {
+	t.Helper()
+	docs := readManifest(t, path)
 	role, binding := &rbacv1.ClusterRole{}, &rbacv1.ClusterRoleBinding{}
 	for kind, into := range map[string]any{"ClusterRole": role, "ClusterRoleBinding": binding} {
 		if docs[kind] == nil {
-			t.Fatalf("%s holds no %s", proxyRoleManifest, kind)
+			t.Fatalf("%s holds no %s", path, kind)
 		}
 		if err := json.Unmarshal(docs[kind], into); err != nil {
-			t.Fatalf("%s: %s: %v", proxyRoleManifest, kind, err)
+			t.Fatalf("%s: %s: %v", path, kind, err)
 		}
 	}
 	if len(docs) != 2 {
-		t.Fatalf("%s holds more than the role and its binding", proxyRoleManifest)
+		t.Fatalf("%s holds more than the role and its binding", path)
 	}
 	return role, binding
 }
