@@ -6,6 +6,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -15,6 +17,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
+)
+
+// Where what CheckAgentAccess finds missing comes from. The CRDs are in
+// config/crd. config/agent-controller leaves them out because
+// config/proxy-controller carries them, and both are applied together.
+const (
+	agentCRDInstall  = "config/crd"
+	agentRoleInstall = "config/agent-controller"
 )
 
 // agentAPIKeySecretIndex indexes SynapseAgents by the Secret their API key
@@ -140,4 +150,27 @@ func homeNetInputsPredicate(contribution func(client.Object) (string, bool)) pre
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
+}
+
+// CheckAgentAccess says why the SynapseAgent controller cannot run as whoever
+// c acts as, or returns nil. It is for use before there is a manager: the
+// controller indexes SynapseAgent resources, and a manager waits for the
+// cache of an indexed kind before it starts anything. One that cannot read
+// them starts no controller at all, and reports nothing but a failing watch
+// in its log.
+//
+// Only that one read is checked. A controller that is refused anything else
+// stops the manager with an error when its own cache does not fill.
+func CheckAgentAccess(ctx context.Context, c client.Reader, namespace string) error {
+	var agents synapsev1alpha1.SynapseAgentList
+	err := c.List(ctx, &agents, client.InNamespace(namespace), client.Limit(1))
+	switch {
+	case err == nil:
+		return nil
+	case meta.IsNoMatchError(err):
+		return fmt.Errorf("the SynapseAgent CRD is not installed; it is in %s: %w", agentCRDInstall, err)
+	case apierrors.IsForbidden(err):
+		return fmt.Errorf("not allowed to read SynapseAgent resources; the role that allows it is in %s: %w", agentRoleInstall, err)
+	}
+	return err
 }
