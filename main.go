@@ -88,6 +88,7 @@ func main() {
 	var edgeProducerInterval time.Duration
 	var clusterID string
 	var proxyController bool
+	var agentController bool
 
 	opts := zap.Options{
 		Development: true,
@@ -136,11 +137,17 @@ func main() {
 	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
 	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
 	flag.BoolVar(&proxyController, "proxy-controller", false, "Run SynapseProxy resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its Deployment, Service and ServiceAccount, and render the routes and certificates of the Ingresses whose IngressClass names it in spec.parameters. Needs the CRD and the role in config/proxy-controller. Composable with the config-hash controller and the resolvers; cannot be combined with --ingress-mode or --config-sync.")
+	flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its DaemonSet, Secret and ServiceAccount. Needs the CRD in config/crd and the role in config/agent-controller.")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	if conflict := proxyControllerConflict(proxyController, ingressMode, configSync); conflict != "" {
+		setupLog.Error(nil, conflict)
+		os.Exit(1)
+	}
+
+	if conflict := agentControllerConflict(agentController, ingressMode, configSync); conflict != "" {
 		setupLog.Error(nil, conflict)
 		os.Exit(1)
 	}
@@ -317,6 +324,19 @@ func main() {
 		}
 	}
 
+	if agentController {
+		// Before the manager, for the reason above.
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "--agent-controller: client")
+			os.Exit(1)
+		}
+		if err := controllers.CheckAgentAccess(context.Background(), cl, watchedNamespace); err != nil {
+			setupLog.Error(err, "--agent-controller cannot run")
+			os.Exit(1)
+		}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -420,6 +440,14 @@ func main() {
 		setupLog.Info("SynapseProxy controllers enabled")
 	}
 
+	if agentController {
+		if err = controllers.SetupAgentControllers(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "SynapseAgent")
+			os.Exit(1)
+		}
+		setupLog.Info("SynapseAgent controller enabled")
+	}
+
 	if upstreamsResolver {
 		ur := &controllers.UpstreamsResolverReconciler{
 			Client:        mgr.GetClient(),
@@ -513,6 +541,21 @@ func proxyControllerConflict(proxyController, ingressMode, configSync bool) stri
 	case configSync:
 		// A sidecar in a proxy's pod, with that pod's permissions.
 		return "--proxy-controller cannot be combined with --config-sync"
+	}
+	return ""
+}
+
+// agentControllerConflict says why --agent-controller cannot run with the
+// other modes chosen, or returns "".
+func agentControllerConflict(agentController, ingressMode, configSync bool) string {
+	switch {
+	case !agentController:
+		return ""
+	case ingressMode:
+		return "--agent-controller cannot be combined with --ingress-mode"
+	case configSync:
+		// A sidecar in a proxy's pod, with that pod's permissions.
+		return "--agent-controller cannot be combined with --config-sync"
 	}
 	return ""
 }

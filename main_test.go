@@ -324,6 +324,31 @@ func TestProxyControllerConflict(t *testing.T) {
 	}
 }
 
+func TestAgentControllerConflict(t *testing.T) {
+	tests := []struct {
+		name                                     string
+		agentController, ingressMode, configSync bool
+		want                                     string
+	}{
+		{name: "alone", agentController: true},
+		{name: "off, with ingress mode", ingressMode: true},
+		{name: "off, with config-sync", configSync: true},
+		{name: "with ingress mode", agentController: true, ingressMode: true, want: "--ingress-mode"},
+		{name: "with config-sync", agentController: true, configSync: true, want: "--config-sync"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := agentControllerConflict(tt.agentController, tt.ingressMode, tt.configSync)
+			if tt.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, "--agent-controller")
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}
+
 // config/crd/kustomization.yaml is written by hand, and what it lists is
 // generated. A kind added under api/ gets its CRD written to bases/ without
 // anything else noticing, and would then be missing from every install that

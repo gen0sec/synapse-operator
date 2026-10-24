@@ -113,18 +113,25 @@ func readManifest(t *testing.T, path string) map[string][]byte {
 
 func loadProxyRole(t *testing.T) (*rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding) {
 	t.Helper()
-	docs := readManifest(t, proxyRoleManifest)
+	return loadRole(t, proxyRoleManifest)
+}
+
+// loadRole reads a manifest that holds a ClusterRole and its binding, and
+// nothing else.
+func loadRole(t *testing.T, path string) (*rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding) {
+	t.Helper()
+	docs := readManifest(t, path)
 	role, binding := &rbacv1.ClusterRole{}, &rbacv1.ClusterRoleBinding{}
 	for kind, into := range map[string]any{"ClusterRole": role, "ClusterRoleBinding": binding} {
 		if docs[kind] == nil {
-			t.Fatalf("%s holds no %s", proxyRoleManifest, kind)
+			t.Fatalf("%s holds no %s", path, kind)
 		}
 		if err := json.Unmarshal(docs[kind], into); err != nil {
-			t.Fatalf("%s: %s: %v", proxyRoleManifest, kind, err)
+			t.Fatalf("%s: %s: %v", path, kind, err)
 		}
 	}
 	if len(docs) != 2 {
-		t.Fatalf("%s holds more than the role and its binding", proxyRoleManifest)
+		t.Fatalf("%s holds more than the role and its binding", path)
 	}
 	return role, binding
 }
@@ -194,6 +201,18 @@ func grantsOf(t *testing.T, role *rbacv1.ClusterRole) []grant {
 		}
 	}
 	return out
+}
+
+// ownCopy is the manifest's role, with its rules and nothing else, under a
+// name and a ServiceAccount of its own. The manifest's names are shared by
+// every test that loads it, and a grant bound to them stays in the API server
+// for the tests that follow: one that holds a second role would pass on the
+// strength of the first.
+func ownCopy(t *testing.T, role *rbacv1.ClusterRole) (*rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding) {
+	t.Helper()
+	name := fmt.Sprintf("held-%d", rbacTestRuns.Add(1))
+	own := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: name}, Rules: role.DeepCopy().Rules}
+	return own, bindingOf(name)
 }
 
 func roleOf(name string, grants []grant) *rbacv1.ClusterRole {
@@ -715,9 +734,10 @@ func TestProxyRole_IsBoundToTheOperator(t *testing.T) {
 // Holding the role and nothing else, the operator is refused nothing; and
 // there is nothing it may read that it does not.
 func TestProxyRole_IsEnoughToRunAProxy(t *testing.T) {
-	role, binding := loadProxyRole(t)
+	role, _ := loadProxyRole(t)
+	own, binding := ownCopy(t, role)
 	admin := rbacAdmin(t)
-	cfg, operator := operatorHolding(t, admin, role, binding)
+	cfg, operator := operatorHolding(t, admin, own, binding)
 	stop := runProxyControllers(t, cfg)
 
 	finished := newProxyStory(t, admin, operator).run()
@@ -750,7 +770,7 @@ func TestProxyRole_WithoutTheGatewayGrantsIngressesAreServed(t *testing.T) {
 		t.Skip("the API server has no Gateway API")
 	}
 	ctx := context.Background()
-	role, binding := loadProxyRole(t)
+	role, _ := loadProxyRole(t)
 	admin := rbacAdmin(t)
 	as := func(cfg *rest.Config) client.Client {
 		c, err := client.New(cfg, client.Options{Scheme: proxyTestScheme(t)})
@@ -760,7 +780,8 @@ func TestProxyRole_WithoutTheGatewayGrantsIngressesAreServed(t *testing.T) {
 		return c
 	}
 
-	current, _ := operatorHolding(t, admin, role, binding)
+	ownRole, ownBinding := ownCopy(t, role)
+	current, _ := operatorHolding(t, admin, ownRole, ownBinding)
 	if err := CheckGatewayAccess(ctx, as(current), ""); err != nil {
 		t.Fatalf("with the role as it is: %v", err)
 	}
