@@ -471,7 +471,7 @@ spec:
       readOnly: true
 ```
 
-This mounts the ConfigMap `my-rules` at `/etc/synapse/rules`. The default `ids.rule_paths` is `/etc/synapse/rules/*.rules`, so Synapse loads every `*.rules` file in it.
+This mounts the ConfigMap `my-rules` at `/etc/synapse/rules`. The default `ids.rule_paths` is `/etc/synapse/rules/*.rules`, so Synapse loads every `*.rules` file in it. A `rule_paths` in `spec.config` replaces that default, so it MUST list the mount path too, or the mounted rules are not loaded.
 
 The operator refuses the spec with `ConfigValid=False`, reason `InvalidVolumes`, when:
 
@@ -485,7 +485,7 @@ The message names the entry. What runs is left as it is.
 
 Adding, removing or changing a volume or a mount changes the pod template, so it rolls the DaemonSet. The operator does not check the volume sources. A missing ConfigMap or Secret keeps the pod from starting, and `READY` stays `False`.
 
-Rules from a mounted ConfigMap reload only on a restart. Synapse rebuilds its rules on a reload signal or when `config.yaml` changes, and an edit to a rule file does neither. After you change the ConfigMap, run `kubectl -n <ns> rollout restart daemonset/<name>`.
+An edit to a mounted rule file does not reload by itself: Synapse rebuilds its rules only on a reload signal or when `config.yaml` changes. It takes effect at the next restart, or at the next hot reload of any IDS setting, whichever comes first. A hot reload happens when `spec.ids.rules`, HOME_NET or another hot IDS field changes, and then every pod loads the mounted files as soon as its kubelet has synced the volume. So an edit staged in a mounted ConfigMap MAY go live on some nodes before you restart. To roll it out, run `kubectl -n <ns> rollout restart daemonset/<name>` right after the edit. Use `spec.ids.rules` when you want the edit to reload at once.
 
 ### Hot reload and rollouts
 
@@ -501,7 +501,7 @@ The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change neve
 
 | Condition | Meaning |
 |---|---|
-| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a rule of the extra volumes is broken), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a volume or mount the operator refuses), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
 | `Ready` | The DaemonSet runs the spec as it is written |
 
 Reasons of `Ready`:

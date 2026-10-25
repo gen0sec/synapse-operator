@@ -279,8 +279,9 @@ type AgentIDSSpec struct {
 	// Rules lists ConfigMaps and Secrets whose IDS rule files the agent loads
 	// next to the default rules and the ones managed on the platform. The
 	// operator copies each selected key into the agent's configuration
-	// Secret, so a change to a rule reloads in the running pods and rolls
-	// none of them. The rules may add up to 900 KiB.
+	// Secret. With the IDS on, a change to a rule reloads in the running pods
+	// and rolls none of them; with it off, a change rolls every pod. At most
+	// 256 files and 900 KiB of rules.
 	//
 	// +optional
 	// +kubebuilder:validation:MaxItems=16
