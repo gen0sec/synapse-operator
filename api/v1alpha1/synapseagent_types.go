@@ -118,6 +118,27 @@ type SynapseAgentSpec struct {
 	// +kubebuilder:validation:Enum=linux
 	OS string `json:"os,omitempty"`
 
+	// Volumes are added to the agent pod after the ones the operator sets up.
+	// A name the operator uses (config, data, bpffs, debugfs, modules,
+	// eve-log) is refused.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// VolumeMounts mount the volumes above into the Synapse container. Each
+	// names a volume of spec.volumes and has an absolute mountPath that does
+	// not equal, contain or sit inside a path the operator mounts. subPath and
+	// subPathExpr are refused, since kubelet does not refresh such a mount.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=mountPath
+	// +kubebuilder:validation:MaxItems=16
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+
 	// Logging configures the agent's own logs.
 	//
 	// +optional

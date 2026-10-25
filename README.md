@@ -455,6 +455,38 @@ spec:
 - **Nothing rotates the file,** and Synapse keeps it open. A logrotate rule for it MUST use `copytruncate`. Only one agent per node SHOULD write to a directory.
 - **Any change to `eve` rolls the DaemonSet.**
 
+### Extra volumes
+
+`spec.volumes` and `spec.volumeMounts` add volumes to the agent pod. The volumes follow the operator's own in the pod. The mounts go into the Synapse container, in spec order. Each list takes at most 16 entries. Volumes are keyed by `name` and mounts by `mountPath`, so one volume MAY be mounted at several paths, and two mounts on one path are refused when you create the resource.
+
+```yaml
+spec:
+  volumes:
+    - name: rules
+      configMap:
+        name: my-rules
+  volumeMounts:
+    - name: rules
+      mountPath: /etc/synapse/rules
+      readOnly: true
+```
+
+This mounts the ConfigMap `my-rules` at `/etc/synapse/rules`. The default `ids.rule_paths` is `/etc/synapse/rules/*.rules`, so Synapse loads every `*.rules` file in it.
+
+The operator refuses the spec with `ConfigValid=False`, reason `InvalidVolumes`, when:
+
+- a volume name is not a DNS label, or a volume sets no source or more than one;
+- a volume is named `config`, `data`, `bpffs`, `debugfs`, `modules` or `eve-log`, which the operator uses;
+- a mount names a volume that `spec.volumes` does not hold;
+- a mount path is not absolute, or equals, contains or lies inside `/etc/synapse/config`, `/var/lib/synapse`, `/sys/fs/bpf`, `/sys/kernel/debug`, `/lib/modules` or `/var/log/synapse-eve`;
+- a mount sets `subPath` or `subPathExpr`. Kubelet does not refresh such a mount, so a changed ConfigMap or Secret would never reach the pod.
+
+The message names the entry. What runs is left as it is.
+
+Adding, removing or changing a volume or a mount changes the pod template, so it rolls the DaemonSet. The operator does not check the volume sources. A missing ConfigMap or Secret keeps the pod from starting, and `READY` stays `False`.
+
+Rules from a mounted ConfigMap reload only on a restart. Synapse rebuilds its rules on a reload signal or when `config.yaml` changes, and an edit to a rule file does neither. After you change the ConfigMap, run `kubectl -n <ns> rollout restart daemonset/<name>`.
+
 ### Hot reload and rollouts
 
 Six IDS settings are hot: `rule_paths`, `address_vars` (HOME_NET included), `port_vars`, `flow_timeout_secs`, `max_flows` and `enforce_block`, under `ids` and `firewall.ids`. A change confined to them updates the config Secret in place. The pods are not replaced. Synapse reloads the file once kubelet has synced the mounted Secret, which takes up to about a minute.
@@ -469,7 +501,7 @@ The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change neve
 
 | Condition | Meaning |
 |---|---|
-| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a rule of the extra volumes is broken), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
 | `Ready` | The DaemonSet runs the spec as it is written |
 
 Reasons of `Ready`:

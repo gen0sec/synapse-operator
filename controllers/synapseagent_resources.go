@@ -165,6 +165,10 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 		volumes = append(volumes, hostPath("eve-log", dir))
 	}
 
+	// The user's, after the operator's and in spec order.
+	container.VolumeMounts = append(container.VolumeMounts, spec.VolumeMounts...)
+	volumes = append(volumes, spec.Volumes...)
+
 	return &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
 		ObjectMeta: agentObjectMeta(a, a.Name),
