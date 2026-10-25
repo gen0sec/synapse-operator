@@ -211,7 +211,10 @@ func TestAgent_AddingAVolumeRollsTheTemplate(t *testing.T) {
 }
 
 func TestAgentDaemonSet_ReservedListsCoverTheBuilder(t *testing.T) {
-	ds := buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(true) }), "h")
+	ds := buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.HostNetwork = kptr.To(true)
+		s.Logging = &synapsev1alpha1.AgentLoggingSpec{Eve: &synapsev1alpha1.EveLogSpec{Enabled: true, Output: "file"}}
+	}), "h")
 	names := map[string]bool{}
 	for _, n := range agentReservedVolumes {
 		names[n] = true
@@ -220,14 +223,28 @@ func TestAgentDaemonSet_ReservedListsCoverTheBuilder(t *testing.T) {
 	for _, p := range agentReservedPaths {
 		paths[p] = true
 	}
+	built := map[string]bool{}
 	for _, v := range agentPodSpec(ds).Volumes {
+		built[v.Name] = true
 		if !names[v.Name] {
 			t.Errorf("operator volume %q is not reserved", v.Name)
 		}
 	}
+	mounted := map[string]bool{}
 	for _, m := range agentContainer(t, ds).VolumeMounts {
+		mounted[m.MountPath] = true
 		if !paths[m.MountPath] {
 			t.Errorf("operator mount path %q is not reserved", m.MountPath)
+		}
+	}
+	for n := range names {
+		if !built[n] {
+			t.Errorf("reserved volume %q is not built here, so the test does not cover it", n)
+		}
+	}
+	for p := range paths {
+		if !mounted[p] {
+			t.Errorf("reserved path %q is not mounted here, so the test does not cover it", p)
 		}
 	}
 }

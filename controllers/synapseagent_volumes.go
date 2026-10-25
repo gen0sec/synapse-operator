@@ -23,7 +23,7 @@ var agentReservedVolumes = []string{"config", "data", "bpffs", "debugfs", "modul
 // agentReservedPaths are the paths the operator mounts. A user mount may not
 // equal, contain or sit inside one of them.
 var agentReservedPaths = []string{
-	agentConfigDir, agentDataDir, "/sys/fs/bpf", "/sys/kernel/debug", "/lib/modules", "/var/log/synapse-eve",
+	agentConfigDir, agentDataDir, "/sys/fs/bpf", "/sys/kernel/debug", "/lib/modules", agentEveDir,
 }
 
 // validateAgentVolumes returns what is wrong with the user's volumes and
