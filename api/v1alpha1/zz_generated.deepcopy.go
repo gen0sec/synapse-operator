@@ -315,6 +315,20 @@ func (in *SynapseAgentSpec) DeepCopyInto(out *SynapseAgentSpec) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.Volumes != nil {
+		in, out := &in.Volumes, &out.Volumes
+		*out = make([]v1.Volume, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+	if in.VolumeMounts != nil {
+		in, out := &in.VolumeMounts, &out.VolumeMounts
+		*out = make([]v1.VolumeMount, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.Logging != nil {
 		in, out := &in.Logging, &out.Logging
 		*out = new(LoggingSpec)
