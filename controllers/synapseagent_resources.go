@@ -65,13 +65,19 @@ func agentConfigSecretName(a *synapsev1alpha1.SynapseAgent) string {
 	return a.Name + "-config"
 }
 
-// buildAgentConfigSecret holds the rendered config. It is mutable on purpose.
-func buildAgentConfigSecret(a *synapsev1alpha1.SynapseAgent, yaml []byte) *corev1.Secret {
+// buildAgentConfigSecret holds the rendered config and the rule files it
+// lists. It is mutable on purpose. The file names follow the rules' content,
+// so a key that is no longer applied is one the apply drops.
+func buildAgentConfigSecret(a *synapsev1alpha1.SynapseAgent, yaml []byte, rules ...agentRuleFile) *corev1.Secret {
+	data := map[string][]byte{agentConfigKey: yaml}
+	for _, r := range rules {
+		data[r.Name] = r.Data
+	}
 	return &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: agentObjectMeta(a, agentConfigSecretName(a)),
 		Type:       corev1.SecretTypeOpaque,
-		Data:       map[string][]byte{agentConfigKey: yaml},
+		Data:       data,
 	}
 }
 
