@@ -202,14 +202,15 @@ type AgentLoggingSpec struct {
 // EveLogSpec configures where the EVE log goes.
 //
 // +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || self.output == 'file'",message="hostPath is only for output file"
-// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || (self.hostPath.startsWith('/var/log/') && !self.hostPath.split('/').exists(s, s == '..'))",message="hostPath must be an absolute path under /var/log/ with no .. segment"
+// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || (self.hostPath.matches('^/var/log/[^/]+(/[^/]+)*$') && !self.hostPath.split('/').exists(s, s == '.' || s == '..'))",message="hostPath must be an absolute path under /var/log/, with a directory name and no empty, . or .. segment"
 type EveLogSpec struct {
 	// Enabled turns the EVE log on.
 	Enabled bool `json:"enabled"`
 
 	// Output is where the log goes: the pod's stdout (the default), its
-	// stderr, or a file on the node. stdout shares its stream with the block
-	// events, and stderr with Synapse's own logs. Nothing rotates the file.
+	// stderr, or a file on the node. stdout carries little else by default.
+	// stderr carries Synapse's own logs and its block events. Filter on
+	// event_type. Nothing rotates the file.
 	//
 	// +optional
 	// +kubebuilder:default=stdout

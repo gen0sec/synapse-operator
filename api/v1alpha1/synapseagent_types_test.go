@@ -102,6 +102,31 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/../etc"})
 			},
 			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is the bare /var/log/",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a /var/log/. path",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/."})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a /var/log// path",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log//"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a path with a . segment",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/a/./b"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a path with an empty segment",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/a//b"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
 		{"an EVE hostPath longer than 200 characters",
 			func(a *v1alpha1.SynapseAgent) {
 				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/" + strings.Repeat("a", 200)})
@@ -234,7 +259,7 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 	a.Spec.Logging = &v1alpha1.AgentLoggingSpec{Level: "debug", Eve: &v1alpha1.EveLogSpec{
 		Enabled:    true,
 		Output:     "file",
-		HostPath:   "/var/log/synapse-agents",
+		HostPath:   "/var/log/a/b",
 		EventTypes: []string{"alert", "stats"},
 	}}
 	a.Spec.Platform = &v1alpha1.AgentPlatformSpec{
@@ -256,7 +281,7 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 	if a.Spec.HostNetwork == nil || *a.Spec.HostNetwork {
 		t.Errorf("hostNetwork = %v, want the explicit false kept", a.Spec.HostNetwork)
 	}
-	if eve := a.Spec.Logging.Eve; eve == nil || !eve.Enabled || eve.Output != "file" || eve.HostPath != "/var/log/synapse-agents" || len(eve.EventTypes) != 2 {
+	if eve := a.Spec.Logging.Eve; eve == nil || !eve.Enabled || eve.Output != "file" || eve.HostPath != "/var/log/a/b" || len(eve.EventTypes) != 2 {
 		t.Errorf("logging.eve = %+v, want it kept", eve)
 	}
 	if a.Spec.IDS == nil || len(a.Spec.IDS.HomeNet) != 2 {

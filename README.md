@@ -427,8 +427,8 @@ spec:
       eventTypes: [alert, stats]  # alert, http, stats; empty means all
 ```
 
-- **`stdout`** is the default. The pod's stdout also carries Synapse's block-event log, so filter on `event_type`.
-- **`stderr`** shares its stream with Synapse's own JSON logs. Filter on `event_type` here too.
+- **`stdout`** is the default. It carries little else by default.
+- **`stderr`** carries Synapse's own JSON logs and its block events. Filter on `event_type`.
 - **`file`** writes `eve.json` to a node directory, `/var/log/synapse` unless `hostPath` names another. The directory MUST be under `/var/log/`, and the operator creates it. For example, `hostPath: /var/log/synapse-agents`. `hostPath` is a guard against accidents, not a security boundary: the pod is privileged.
 - **Nothing rotates the file,** and Synapse keeps it open. A logrotate rule for it MUST use `copytruncate`. Only one agent per node SHOULD write to a directory.
 - **Any change to `eve` rolls the DaemonSet.**
