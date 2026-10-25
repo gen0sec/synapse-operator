@@ -66,6 +66,15 @@ rules:
       - watch
       - create
       - patch
+  # The rule files of spec.ids.rules. Secrets are read above.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
   # What HOME_NET is made of when an agent does not type it.
   - apiGroups:
       - ""
