@@ -55,6 +55,27 @@ func TestCheckAgentAccess_TheRoleIsBound(t *testing.T) {
 	}
 }
 
+// The rule sources are ConfigMaps. Without the read, the ConfigMap watch
+// never fills and the manager stops, so it is found out before there is one.
+func TestCheckAgentAccess_ConfigMapsAreNotReadable(t *testing.T) {
+	name := fmt.Sprintf("agent-no-configmaps-%d", rbacTestRuns.Add(1))
+	role := roleOf(name, []grant{{group: synapsev1alpha1.GroupVersion.Group, resource: "synapseagents", verb: readGrant}})
+	cfg, _ := operatorHolding(t, rbacAdmin(t), role, bindingOf(name))
+	operator, err := client.New(cfg, client.Options{Scheme: proxyTestScheme(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CheckAgentAccess(context.Background(), operator, "")
+	if err == nil {
+		t.Fatal("no error for an operator that may not list ConfigMaps")
+	}
+	for _, want := range []string{"not allowed", "ConfigMap", "config/agent-controller"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q: %v", want, err)
+		}
+	}
+}
+
 func TestCheckAgentAccess_TheCRDIsNotInstalled(t *testing.T) {
 	// The test API server has the CRD. So the kind is given, in this
 	// client's eyes only, a group the server has never heard of: what it

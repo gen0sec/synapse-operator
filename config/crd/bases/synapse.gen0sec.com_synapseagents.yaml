@@ -1044,6 +1044,56 @@ spec:
                       type: string
                     type: array
                     x-kubernetes-list-type: set
+                  rules:
+                    description: |-
+                      Rules lists ConfigMaps and Secrets whose IDS rule files the agent loads
+                      next to the default rules and the ones managed on the platform. The
+                      operator copies each selected key into the agent's configuration
+                      Secret, so a change to a rule reloads in the running pods and rolls
+                      none of them. The rules may add up to 900 KiB.
+                    items:
+                      description: |-
+                        AgentIDSRuleSource names a ConfigMap or a Secret in the agent's namespace
+                        that holds IDS rule files.
+                      properties:
+                        configMapRef:
+                          description: ConfigMapRef names the ConfigMap that holds
+                            the rules.
+                          properties:
+                            name:
+                              description: Name is the name of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        keys:
+                          description: |-
+                            Keys lists the keys to load, in order. A key the object lacks is an
+                            error. Empty means every key that ends in ".rules".
+                          items:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          maxItems: 64
+                          type: array
+                          x-kubernetes-list-type: set
+                        secretRef:
+                          description: SecretRef names the Secret that holds the rules.
+                          properties:
+                            name:
+                              description: Name is the name of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: set exactly one of configMapRef and secretRef
+                        rule: has(self.configMapRef) != has(self.secretRef)
+                    maxItems: 16
+                    type: array
                 type: object
               image:
                 description: Image is the Synapse container image, tag or digest included.

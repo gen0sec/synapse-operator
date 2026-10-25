@@ -148,6 +148,33 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{APIKeySecretRef: &v1alpha1.SecretKeyReference{Name: "creds"}}
 			},
 			"spec.platform.apiKeySecretRef.key"},
+		{"a rule source with both references",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{
+					ConfigMapRef: &v1alpha1.ObjectNameReference{Name: "rules"},
+					SecretRef:    &v1alpha1.ObjectNameReference{Name: "rules"},
+				}}}
+			},
+			"exactly one of configMapRef and secretRef"},
+		{"a rule source with no reference",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{Keys: []string{"a.rules"}}}}
+			},
+			"exactly one of configMapRef and secretRef"},
+		{"17 rule sources",
+			func(a *v1alpha1.SynapseAgent) {
+				var rules []v1alpha1.AgentIDSRuleSource
+				for i := 0; i < 17; i++ {
+					rules = append(rules, v1alpha1.AgentIDSRuleSource{ConfigMapRef: &v1alpha1.ObjectNameReference{Name: fmt.Sprintf("rules-%d", i)}})
+				}
+				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: rules}
+			},
+			"spec.ids.rules"},
+		{"a rule source with an empty name",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{ConfigMapRef: &v1alpha1.ObjectNameReference{}}}}
+			},
+			"spec.ids.rules[0].configMapRef.name"},
 		{"a config that is not an object",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.Config = &runtime.RawExtension{Raw: []byte(`"mode: agent"`)} },
 			"spec.config"},
@@ -271,6 +298,10 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 		Enabled:      ptr.To(true),
 		EnforceBlock: ptr.To(false),
 		HomeNet:      []string{"10.0.0.0/8", "fd00::/8"},
+		Rules: []v1alpha1.AgentIDSRuleSource{
+			{ConfigMapRef: &v1alpha1.ObjectNameReference{Name: "local-rules"}, Keys: []string{"web.rules"}},
+			{SecretRef: &v1alpha1.ObjectNameReference{Name: "private-rules"}},
+		},
 	}
 	a.Spec.Config = &runtime.RawExtension{Raw: []byte(`{"firewall":{"ids":{"rule_paths":["/rules"]}}}`)}
 	mustCreateAgent(t, a)
@@ -284,7 +315,7 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 	if eve := a.Spec.Logging.Eve; eve == nil || !eve.Enabled || eve.Output != "file" || eve.HostPath != "/var/log/a/b" || len(eve.EventTypes) != 2 {
 		t.Errorf("logging.eve = %+v, want it kept", eve)
 	}
-	if a.Spec.IDS == nil || len(a.Spec.IDS.HomeNet) != 2 {
+	if a.Spec.IDS == nil || len(a.Spec.IDS.HomeNet) != 2 || len(a.Spec.IDS.Rules) != 2 {
 		t.Errorf("ids = %+v, want it kept", a.Spec.IDS)
 	}
 }

@@ -47,6 +47,9 @@ type AgentConfigInput struct {
 	// Synapse's "[a,b]" form. spec.ids.homeNet wins over it. It comes from the
 	// operator, not from a user, so it is not validated here.
 	HomeNet string
+	// RuleFiles are the names of the rule files the controller copied into
+	// the config Secret, in the order they load.
+	RuleFiles []string
 }
 
 // AgentConfigOutput is a rendered config.yaml. It can carry the platform API
@@ -226,6 +229,18 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	}
 	if homeNet != "" {
 		setConfig(cfg, "ids.address_vars.HOME_NET", homeNet)
+	}
+	if len(in.RuleFiles) > 0 {
+		ids, _ := cfg["ids"].(map[string]any)
+		paths, isList := ids["rule_paths"].([]any)
+		if _, set := ids["rule_paths"]; set && !isList {
+			return AgentConfigOutput{}, field.ErrorList{field.Invalid(specPath.Child("config", "ids", "rule_paths"), "<value>",
+				"must be a list when spec.ids.rules is set")}.ToAggregate()
+		}
+		for _, name := range in.RuleFiles {
+			paths = append(paths, agentConfigDir+"/"+name)
+		}
+		setConfig(cfg, "ids.rule_paths", paths)
 	}
 
 	body, err := yaml.Marshal(cfg)

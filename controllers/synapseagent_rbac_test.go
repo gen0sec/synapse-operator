@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"k8s.io/client-go/util/retry"
 	"slices"
 	"strings"
 	"sync"
@@ -201,6 +202,39 @@ func (s *agentStory) run() bool {
 			return reason
 		}
 		return configHas("k-1")()
+	}) {
+		return false
+	}
+
+	// Rule sources are read from ConfigMaps and Secrets of the user's.
+	s.create(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "rules"},
+		Data: map[string]string{"web.rules": "from-cm"}})
+	s.create(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "secret-rules"},
+		Data: map[string][]byte{"s.rules": []byte("from-secret")}})
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := s.k8s.Get(s.ctx, key("edge"), agent); err != nil {
+			return err
+		}
+		agent.Spec.IDS = &synapsev1alpha1.AgentIDSSpec{Rules: []synapsev1alpha1.AgentIDSRuleSource{
+			fromConfigMap("rules"), fromSecret("secret-rules")}}
+		return s.k8s.Update(s.ctx, agent)
+	}); err != nil {
+		s.t.Fatal(err)
+	}
+	if !s.wait("the rule sources are copied", func() string {
+		var cfg corev1.Secret
+		if reason := get("edge-config", &cfg); reason != "" {
+			return reason
+		}
+		var got []string
+		for _, k := range ruleKeys(&cfg) {
+			got = append(got, string(cfg.Data[k]))
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"from-cm", "from-secret"}) {
+			return fmt.Sprintf("rule files hold %q", got)
+		}
+		return ""
 	}) {
 		return false
 	}

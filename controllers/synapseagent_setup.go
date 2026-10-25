@@ -27,6 +27,13 @@ const (
 	agentRoleInstall = "config/agent-controller"
 )
 
+// The rule sources of spec.ids.rules, by the names of the ConfigMaps and
+// Secrets they read.
+const (
+	agentRuleConfigMapIndex = "spec.ids.rules.configMapRef.name"
+	agentRuleSecretIndex    = "spec.ids.rules.secretRef.name"
+)
+
 // agentAPIKeySecretIndex indexes SynapseAgents by the Secret their API key
 // comes from, so a change to that Secret finds the agents that read it.
 const agentAPIKeySecretIndex = "spec.platform.apiKeySecretRef.name"
@@ -46,6 +53,9 @@ func SetupAgentControllers(mgr ctrl.Manager) error {
 
 // SetupWithManager registers the controller.
 func (r *SynapseAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RuleReader == nil {
+		r.RuleReader = mgr.GetAPIReader()
+	}
 	err := mgr.GetFieldIndexer().IndexField(context.Background(), &synapsev1alpha1.SynapseAgent{}, agentAPIKeySecretIndex,
 		func(obj client.Object) []string {
 			a := obj.(*synapsev1alpha1.SynapseAgent)
@@ -57,17 +67,47 @@ func (r *SynapseAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
-	// The Secret an API key comes from is the user's, not the agent's, so it
-	// is found through the index rather than through ownership.
-	readers := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, secret client.Object) []reconcile.Request {
-		var agents synapsev1alpha1.SynapseAgentList
-		if err := r.List(ctx, &agents, client.InNamespace(secret.GetNamespace()),
-			client.MatchingFields{agentAPIKeySecretIndex: secret.GetName()}); err != nil {
-			ctrl.LoggerFrom(ctx).Error(err, "list SynapseAgents reading a Secret")
-			return nil
+	for index, ref := range map[string]func(*synapsev1alpha1.AgentIDSRuleSource) *synapsev1alpha1.ObjectNameReference{
+		agentRuleConfigMapIndex: func(s *synapsev1alpha1.AgentIDSRuleSource) *synapsev1alpha1.ObjectNameReference {
+			return s.ConfigMapRef
+		},
+		agentRuleSecretIndex: func(s *synapsev1alpha1.AgentIDSRuleSource) *synapsev1alpha1.ObjectNameReference { return s.SecretRef },
+	} {
+		err := mgr.GetFieldIndexer().IndexField(context.Background(), &synapsev1alpha1.SynapseAgent{}, index,
+			func(obj client.Object) []string {
+				a := obj.(*synapsev1alpha1.SynapseAgent)
+				if a.Spec.IDS == nil {
+					return nil
+				}
+				var names []string
+				for i := range a.Spec.IDS.Rules {
+					if r := ref(&a.Spec.IDS.Rules[i]); r != nil {
+						names = append(names, r.Name)
+					}
+				}
+				return names
+			})
+		if err != nil {
+			return err
 		}
-		return agentRequests(agents.Items, func(*synapsev1alpha1.SynapseAgent) bool { return true })
-	})
+	}
+	// What an agent reads is the user's, not the agent's, so it is found
+	// through an index rather than through ownership.
+	readersOf := func(kind string, indexes ...string) handler.EventHandler {
+		return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			var reqs []reconcile.Request
+			for _, index := range indexes {
+				var agents synapsev1alpha1.SynapseAgentList
+				if err := r.List(ctx, &agents, client.InNamespace(obj.GetNamespace()),
+					client.MatchingFields{index: obj.GetName()}); err != nil {
+					ctrl.LoggerFrom(ctx).Error(err, "list SynapseAgents reading a "+kind)
+					return nil
+				}
+				reqs = append(reqs, agentRequests(agents.Items, func(*synapsev1alpha1.SynapseAgent) bool { return true })...)
+			}
+			return reqs
+		})
+	}
 	// Only an agent without a typed homeNet takes it from the cluster.
 	followCluster := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 		var agents synapsev1alpha1.SynapseAgentList
@@ -85,7 +125,8 @@ func (r *SynapseAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.DaemonSet{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Secret{}).
-		Watches(&corev1.Secret{}, readers).
+		Watches(&corev1.Secret{}, readersOf("Secret", agentAPIKeySecretIndex, agentRuleSecretIndex)).
+		Watches(&corev1.ConfigMap{}, readersOf("ConfigMap", agentRuleConfigMapIndex), builder.OnlyMetadata).
 		Watches(&corev1.Node{}, followCluster, builder.WithPredicates(agentNodePredicate())).
 		Watches(&corev1.Service{}, followCluster, builder.WithPredicates(agentServicePredicate())).
 		Complete(r)
@@ -159,14 +200,20 @@ func homeNetInputsPredicate(contribution func(client.Object) (string, bool)) pre
 // them starts no controller at all, and reports nothing but a failing watch
 // in its log.
 //
-// Only that one read is checked. A controller that is refused anything else
-// stops the manager with an error when its own cache does not fill.
+// Two reads are checked: the SynapseAgents, and the ConfigMaps the rule
+// sources are read from. A controller that is refused anything else stops
+// the manager with an error when its own cache does not fill.
 func CheckAgentAccess(ctx context.Context, c client.Reader, namespace string) error {
 	var agents synapsev1alpha1.SynapseAgentList
 	err := c.List(ctx, &agents, client.InNamespace(namespace), client.Limit(1))
 	switch {
 	case err == nil:
-		return nil
+		var configMaps corev1.ConfigMapList
+		err = c.List(ctx, &configMaps, client.InNamespace(namespace), client.Limit(1))
+		if apierrors.IsForbidden(err) {
+			return fmt.Errorf("not allowed to read ConfigMaps, which spec.ids.rules reads rules from; the role that allows it is in %s: %w", agentRoleInstall, err)
+		}
+		return err
 	case meta.IsNoMatchError(err):
 		return fmt.Errorf("the SynapseAgent CRD is not installed; it is in %s: %w", agentCRDInstall, err)
 	case apierrors.IsForbidden(err):
