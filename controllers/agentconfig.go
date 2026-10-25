@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -75,6 +76,7 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	// top-level `ids` section is there, and here it always is.
 	{"firewall.ids", "use the top-level key ids"},
 	{"logging.level", "use spec.logging.level"},
+	{"logging.eve_log", "use spec.logging.eve"},
 	{"platform.api_key", "use spec.platform.apiKeySecretRef"},
 	{"platform.identity.enabled", "use spec.platform.identity.enabled"},
 	{"platform.identity.cluster", "use spec.platform.identity.cluster"},
@@ -82,6 +84,21 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	{"ids.enabled", "use spec.ids.enabled"},
 	{"ids.enforce_block", "use spec.ids.enforceBlock"},
 	{"ids.address_vars.HOME_NET", "use spec.ids.homeNet"},
+}
+
+// agentEveDir is where a file EVE log lives in the pod.
+const agentEveDir = "/var/log/synapse-eve"
+
+// eveLogFile is the value of logging.eve_log.file: Synapse's own names for
+// the two streams, or the file in the pod.
+func eveLogFile(eve *synapsev1alpha1.EveLogSpec) string {
+	switch eve.Output {
+	case "stderr":
+		return "stderr"
+	case "file":
+		return agentEveDir + "/eve.json"
+	}
+	return "stdout"
 }
 
 // RenderAgentConfig renders the config.yaml of a SynapseAgent.
@@ -167,6 +184,16 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	setConfig(cfg, "daemon.enabled", false)
 	if spec.Logging != nil && spec.Logging.Level != "" {
 		setConfig(cfg, "logging.level", spec.Logging.Level)
+	}
+	if spec.Logging != nil && spec.Logging.Eve != nil && spec.Logging.Eve.Enabled {
+		eve := spec.Logging.Eve
+		setConfig(cfg, "logging.eve_log.enabled", true)
+		setConfig(cfg, "logging.eve_log.file", eveLogFile(eve))
+		if len(eve.EventTypes) > 0 {
+			types := slices.Clone(eve.EventTypes)
+			sort.Strings(types)
+			setConfig(cfg, "logging.eve_log.event_types", types)
+		}
 	}
 	if apiKey != "" {
 		setConfig(cfg, "platform.api_key", apiKey)
