@@ -142,7 +142,7 @@ type SynapseAgentSpec struct {
 	// Logging configures the agent's own logs.
 	//
 	// +optional
-	Logging *LoggingSpec `json:"logging,omitempty"`
+	Logging *AgentLoggingSpec `json:"logging,omitempty"`
 
 	// Platform connects the agent to the Gen0Sec platform.
 	//
@@ -205,6 +205,56 @@ type AgentCaptureSpec struct {
 	Interfaces []string `json:"interfaces,omitempty"`
 }
 
+// AgentLoggingSpec configures the agent's own logs and its EVE log.
+type AgentLoggingSpec struct {
+	// Level is the minimum severity logged. Empty leaves Synapse's default.
+	//
+	// +optional
+	// +kubebuilder:validation:Enum=error;warn;info;debug;trace
+	Level string `json:"level,omitempty"`
+
+	// Eve writes Synapse's EVE log: alert, http and stats events as JSON
+	// lines. Unset or disabled, nothing is written.
+	//
+	// +optional
+	Eve *EveLogSpec `json:"eve,omitempty"`
+}
+
+// EveLogSpec configures where the EVE log goes.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || self.output == 'file'",message="hostPath is only for output file"
+// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || (self.hostPath.matches('^/var/log/[^/]+(/[^/]+)*$') && !self.hostPath.split('/').exists(s, s == '.' || s == '..'))",message="hostPath must be an absolute path under /var/log/, with a directory name and no empty, . or .. segment"
+type EveLogSpec struct {
+	// Enabled turns the EVE log on.
+	Enabled bool `json:"enabled"`
+
+	// Output is where the log goes: the pod's stdout (the default), its
+	// stderr, or a file on the node. stdout carries little else by default.
+	// stderr carries Synapse's own logs and its block events. Filter on
+	// event_type. Nothing rotates the file.
+	//
+	// +optional
+	// +kubebuilder:default=stdout
+	// +kubebuilder:validation:Enum=stdout;stderr;file
+	Output string `json:"output,omitempty"`
+
+	// HostPath is the node directory that holds eve.json when output is
+	// file. Unset means /var/log/synapse. It is a guard against accidents,
+	// not a security boundary: the agent pod is privileged.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxLength=200
+	HostPath string `json:"hostPath,omitempty"`
+
+	// EventTypes selects the events written. Empty means all of them.
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:Enum=alert;http;stats
+	EventTypes []string `json:"eventTypes,omitempty"`
+}
+
 // AgentIDSSpec configures the intrusion detection of the agent.
 type AgentIDSSpec struct {
 	// Enabled turns the intrusion detection on or off. Empty means true.
@@ -225,6 +275,51 @@ type AgentIDSSpec struct {
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
 	HomeNet []string `json:"homeNet,omitempty"`
+
+	// Rules lists ConfigMaps and Secrets whose IDS rule files the agent loads
+	// next to the default rules and the ones managed on the platform. The
+	// operator copies each selected key into the agent's configuration
+	// Secret, so a change to a rule reloads in the running pods and rolls
+	// none of them. The rules may add up to 900 KiB.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	Rules []AgentIDSRuleSource `json:"rules,omitempty"`
+}
+
+// AgentIDSRuleSource names a ConfigMap or a Secret in the agent's namespace
+// that holds IDS rule files.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.configMapRef) != has(self.secretRef)",message="set exactly one of configMapRef and secretRef"
+type AgentIDSRuleSource struct {
+	// ConfigMapRef names the ConfigMap that holds the rules.
+	//
+	// +optional
+	ConfigMapRef *ObjectNameReference `json:"configMapRef,omitempty"`
+
+	// SecretRef names the Secret that holds the rules.
+	//
+	// +optional
+	SecretRef *ObjectNameReference `json:"secretRef,omitempty"`
+
+	// Keys lists the keys to load, in order. A key the object lacks is an
+	// error. Empty means every key that ends in ".rules".
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	Keys []string `json:"keys,omitempty"`
+}
+
+// ObjectNameReference names an object in the namespace of the resource that
+// refers to it.
+type ObjectNameReference struct {
+	// Name is the name of the object.
+	//
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 // SynapseAgentStatus is the observed state of a SynapseAgent.

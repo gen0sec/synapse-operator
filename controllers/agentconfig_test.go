@@ -26,6 +26,12 @@ func agentForConfig(mutate ...func(*synapsev1alpha1.SynapseAgentSpec)) *synapsev
 	return a
 }
 
+func withEve(e synapsev1alpha1.EveLogSpec) func(*synapsev1alpha1.SynapseAgentSpec) {
+	return func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Logging = &synapsev1alpha1.AgentLoggingSpec{Eve: &e}
+	}
+}
+
 func agentRawConfig(json string) func(*synapsev1alpha1.SynapseAgentSpec) {
 	return func(s *synapsev1alpha1.SynapseAgentSpec) {
 		s.Config = &runtime.RawExtension{Raw: []byte(json)}
@@ -59,7 +65,7 @@ func TestRenderAgentConfig_Golden(t *testing.T) {
 		"typed-fields": {
 			APIKey: "k-123",
 			Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
-				s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"}
+				s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
 				s.Platform = &synapsev1alpha1.AgentPlatformSpec{
 					APIKeySecretRef: &synapsev1alpha1.SecretKeyReference{Name: "synapse-credentials", Key: "API_KEY"},
 					Identity:        &synapsev1alpha1.AgentIdentitySpec{Enabled: boolPtr(true), Cluster: "prod-eu"},
@@ -80,6 +86,11 @@ func TestRenderAgentConfig_Golden(t *testing.T) {
 				s.IDS = &synapsev1alpha1.AgentIDSSpec{HomeNet: []string{"10.0.0.0/8", "fd00::/8"}}
 			}),
 		},
+		"eve-stdout": {Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true}))},
+		"eve-stderr": {Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stderr"}))},
+		"eve-file": {Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{
+			Enabled: true, Output: "file", HostPath: "/var/log/synapse-agents", EventTypes: []string{"stats", "alert"},
+		}))},
 		"scalars-survive": {Agent: agentForConfig(agentRawConfig(`{
 			"ids": {"max_flows": 18446744073709551615, "flow_timeout_secs": 9007199254740993},
 			"telemetry": {"resource": {"attributes": {"a": "yes", "b": "null", "c": "1e3", "d": "0x10", "e": "007", "f": ""}}}
@@ -155,6 +166,31 @@ func TestRenderAgentConfig_TypedFieldsAndInputs(t *testing.T) {
 	wantAt(t, tree, "ids.address_vars.EXTERNAL_NET", "!$HOME_NET")
 }
 
+func TestRenderAgentConfig_Eve(t *testing.T) {
+	t.Run("disabled gives the bytes of no block", func(t *testing.T) {
+		none := renderAgentOK(t, AgentConfigInput{Agent: agentForConfig()})
+		off := renderAgentOK(t, AgentConfigInput{Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: false, Output: "file"}))})
+		if string(none.YAML) != string(off.YAML) || none.Hash != off.Hash || none.RestartHash != off.RestartHash {
+			t.Errorf("a disabled EVE block changes the render:\n%s", off.YAML)
+		}
+	})
+	t.Run("types render sorted and only when set", func(t *testing.T) {
+		tree := agentTree(t, AgentConfigInput{Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true, EventTypes: []string{"stats", "alert"}}))})
+		if got, _ := at(tree, "logging.eve_log.event_types"); fmt.Sprint(got) != "[alert stats]" {
+			t.Errorf("event_types = %v, want [alert stats]", got)
+		}
+		tree = agentTree(t, AgentConfigInput{Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true}))})
+		wantAbsent(t, tree, "logging.eve_log.event_types")
+	})
+	t.Run("stdout to stderr moves RestartHash", func(t *testing.T) {
+		out := renderAgentOK(t, AgentConfigInput{Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stdout"}))})
+		err := renderAgentOK(t, AgentConfigInput{Agent: agentForConfig(withEve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stderr"}))})
+		if out.RestartHash == err.RestartHash || out.Hash == err.Hash {
+			t.Error("switching the EVE output did not change the hashes")
+		}
+	})
+}
+
 func TestRenderAgentConfig_OwnedKeys(t *testing.T) {
 	cases := map[string]struct{ raw, path, hint string }{
 		"mode":                      {`{"mode": "proxy"}`, "spec.config.mode", "agent mode"},
@@ -164,6 +200,8 @@ func TestRenderAgentConfig_OwnedKeys(t *testing.T) {
 		"arxignis":                  {`{"arxignis": {}}`, "spec.config.arxignis", "platform"},
 		"firewall.ids":              {`{"firewall": {"ids": {"enabled": true}}}`, "spec.config.firewall.ids", "ids"},
 		"logging.level":             {`{"logging": {"level": "debug"}}`, "spec.config.logging.level", "spec.logging.level"},
+		"logging.eve_log":           {`{"logging": {"eve_log": {"file": "/tmp/x"}}}`, "spec.config.logging.eve_log", "spec.logging.eve"},
+		"logging.eve_log.enabled":   {`{"logging": {"eve_log": {"enabled": true}}}`, "spec.config.logging.eve_log", "spec.logging.eve"},
 		"platform.api_key":          {`{"platform": {"api_key": "k"}}`, "spec.config.platform.api_key", "apiKeySecretRef"},
 		"platform.identity.enabled": {`{"platform": {"identity": {"enabled": true}}}`, "spec.config.platform.identity.enabled", "spec.platform.identity.enabled"},
 		"platform.identity.cluster": {`{"platform": {"identity": {"cluster": "c"}}}`, "spec.config.platform.identity.cluster", "spec.platform.identity.cluster"},
@@ -289,7 +327,9 @@ func TestRenderAgentConfig_RestartHash(t *testing.T) {
 	}
 
 	restart := map[string]func(*synapsev1alpha1.SynapseAgentSpec){
-		"logging.level": func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} },
+		"logging.level": func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
+		},
 		"capture.interfaces": func(s *synapsev1alpha1.SynapseAgentSpec) {
 			s.Capture = &synapsev1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0"}}
 		},

@@ -176,7 +176,9 @@ func TestAgent_ACacheBehindTheApplyIsRollingOut(t *testing.T) {
 	wantAgentCondition(t, a, ConditionReady, metav1.ConditionTrue, ReasonApplied)
 
 	e.agents.Client = staleDaemonSets{Client: e.k8s, stale: e.daemonSet()}
-	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} })
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
+	})
 	e.reconcile(a)
 	if now := e.daemonSet(); now.Generation == e.agents.Client.(staleDaemonSets).stale.Generation {
 		t.Fatal("the restart-field edit did not roll the template")

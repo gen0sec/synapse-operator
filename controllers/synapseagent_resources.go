@@ -65,13 +65,19 @@ func agentConfigSecretName(a *synapsev1alpha1.SynapseAgent) string {
 	return a.Name + "-config"
 }
 
-// buildAgentConfigSecret holds the rendered config. It is mutable on purpose.
-func buildAgentConfigSecret(a *synapsev1alpha1.SynapseAgent, yaml []byte) *corev1.Secret {
+// buildAgentConfigSecret holds the rendered config and the rule files it
+// lists. It is mutable on purpose. The file names follow the rules' content,
+// so a key that is no longer applied is one the apply drops.
+func buildAgentConfigSecret(a *synapsev1alpha1.SynapseAgent, yaml []byte, rules ...agentRuleFile) *corev1.Secret {
+	data := map[string][]byte{agentConfigKey: yaml}
+	for _, r := range rules {
+		data[r.Name] = r.Data
+	}
 	return &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: agentObjectMeta(a, agentConfigSecretName(a)),
 		Type:       corev1.SecretTypeOpaque,
-		Data:       map[string][]byte{agentConfigKey: yaml},
+		Data:       data,
 	}
 }
 
@@ -150,6 +156,14 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 		corev1.VolumeMount{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
 	)
 	volumes = append(volumes, hostPath("debugfs", "/sys/kernel/debug"), hostPath("modules", "/lib/modules"))
+	if eve := spec.Logging; eve != nil && eve.Eve != nil && eve.Eve.Enabled && eve.Eve.Output == "file" {
+		dir := eve.Eve.HostPath
+		if dir == "" {
+			dir = "/var/log/synapse"
+		}
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "eve-log", MountPath: agentEveDir})
+		volumes = append(volumes, hostPath("eve-log", dir))
+	}
 
 	// The user's, after the operator's and in spec order.
 	container.VolumeMounts = append(container.VolumeMounts, spec.VolumeMounts...)

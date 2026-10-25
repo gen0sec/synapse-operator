@@ -316,7 +316,9 @@ func TestAgent_RestartFieldRollsTemplate(t *testing.T) {
 	a := e.running()
 	secret, ds := e.configSecret(), e.daemonSet()
 
-	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} })
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
+	})
 	e.reconcile(a)
 
 	now := e.daemonSet()
@@ -363,6 +365,45 @@ func TestAgent_HostNetworkSwitch(t *testing.T) {
 	}
 	if v, m := bpffsOf(t, back); !v || !m {
 		t.Errorf("the bpffs did not come back: volume=%v mount=%v", v, m)
+	}
+}
+
+func TestAgent_EveOutputSwitch(t *testing.T) {
+	e := newAgentEnv(t)
+	a := e.running()
+	hash := func() string {
+		return e.daemonSet().Spec.Template.Annotations[agentRestartHashAnnotation]
+	}
+	setEve := func(eve *synapsev1alpha1.EveLogSpec) {
+		e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.AgentLoggingSpec{Eve: eve} })
+		e.reconcile(a)
+	}
+	if strings.Contains(e.config(), "eve_log") {
+		t.Fatalf("a new agent has an eve_log:\n%s", e.config())
+	}
+	prev := hash()
+
+	step := func(name string, eve *synapsev1alpha1.EveLogSpec, wantConfig string, wantVolume bool) {
+		t.Helper()
+		setEve(eve)
+		if !strings.Contains(e.config(), wantConfig) {
+			t.Errorf("%s: config lacks %q:\n%s", name, wantConfig, e.config())
+		}
+		if v, m := eveVolumeOf(t, e.daemonSet()); (v != nil) != wantVolume || (m != nil) != wantVolume {
+			t.Errorf("%s: eve-log volume %v, mount %v, want present=%v", name, v, m, wantVolume)
+		}
+		if now := hash(); now == prev {
+			t.Errorf("%s: the template annotation did not change", name)
+		} else {
+			prev = now
+		}
+	}
+	step("stdout", &synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stdout"}, "file: stdout", false)
+	step("stderr", &synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stderr"}, "file: stderr", false)
+	step("file", &synapsev1alpha1.EveLogSpec{Enabled: true, Output: "file"}, "file: /var/log/synapse-eve/eve.json", true)
+	step("off", nil, "level:", false)
+	if strings.Contains(e.config(), "eve_log") {
+		t.Errorf("EVE off still renders eve_log:\n%s", e.config())
 	}
 }
 

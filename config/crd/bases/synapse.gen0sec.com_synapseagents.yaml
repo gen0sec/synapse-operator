@@ -1044,6 +1044,56 @@ spec:
                       type: string
                     type: array
                     x-kubernetes-list-type: set
+                  rules:
+                    description: |-
+                      Rules lists ConfigMaps and Secrets whose IDS rule files the agent loads
+                      next to the default rules and the ones managed on the platform. The
+                      operator copies each selected key into the agent's configuration
+                      Secret, so a change to a rule reloads in the running pods and rolls
+                      none of them. The rules may add up to 900 KiB.
+                    items:
+                      description: |-
+                        AgentIDSRuleSource names a ConfigMap or a Secret in the agent's namespace
+                        that holds IDS rule files.
+                      properties:
+                        configMapRef:
+                          description: ConfigMapRef names the ConfigMap that holds
+                            the rules.
+                          properties:
+                            name:
+                              description: Name is the name of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        keys:
+                          description: |-
+                            Keys lists the keys to load, in order. A key the object lacks is an
+                            error. Empty means every key that ends in ".rules".
+                          items:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          maxItems: 64
+                          type: array
+                          x-kubernetes-list-type: set
+                        secretRef:
+                          description: SecretRef names the Secret that holds the rules.
+                          properties:
+                            name:
+                              description: Name is the name of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: set exactly one of configMapRef and secretRef
+                        rule: has(self.configMapRef) != has(self.secretRef)
+                    maxItems: 16
+                    type: array
                 type: object
               image:
                 description: Image is the Synapse container image, tag or digest included.
@@ -1071,6 +1121,56 @@ spec:
               logging:
                 description: Logging configures the agent's own logs.
                 properties:
+                  eve:
+                    description: |-
+                      Eve writes Synapse's EVE log: alert, http and stats events as JSON
+                      lines. Unset or disabled, nothing is written.
+                    properties:
+                      enabled:
+                        description: Enabled turns the EVE log on.
+                        type: boolean
+                      eventTypes:
+                        description: EventTypes selects the events written. Empty
+                          means all of them.
+                        items:
+                          enum:
+                          - alert
+                          - http
+                          - stats
+                          type: string
+                        maxItems: 3
+                        type: array
+                        x-kubernetes-list-type: set
+                      hostPath:
+                        description: |-
+                          HostPath is the node directory that holds eve.json when output is
+                          file. Unset means /var/log/synapse. It is a guard against accidents,
+                          not a security boundary: the agent pod is privileged.
+                        maxLength: 200
+                        type: string
+                      output:
+                        default: stdout
+                        description: |-
+                          Output is where the log goes: the pod's stdout (the default), its
+                          stderr, or a file on the node. stdout carries little else by default.
+                          stderr carries Synapse's own logs and its block events. Filter on
+                          event_type. Nothing rotates the file.
+                        enum:
+                        - stdout
+                        - stderr
+                        - file
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                    x-kubernetes-validations:
+                    - message: hostPath is only for output file
+                      rule: '!has(self.hostPath) || self.output == ''file'''
+                    - message: hostPath must be an absolute path under /var/log/,
+                        with a directory name and no empty, . or .. segment
+                      rule: '!has(self.hostPath) || (self.hostPath.matches(''^/var/log/[^/]+(/[^/]+)*$'')
+                        && !self.hostPath.split(''/'').exists(s, s == ''.'' || s ==
+                        ''..''))'
                   level:
                     description: Level is the minimum severity logged. Empty leaves
                       Synapse's default.

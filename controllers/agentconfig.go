@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -46,6 +47,9 @@ type AgentConfigInput struct {
 	// Synapse's "[a,b]" form. spec.ids.homeNet wins over it. It comes from the
 	// operator, not from a user, so it is not validated here.
 	HomeNet string
+	// RuleFiles are the names of the rule files the controller copied into
+	// the config Secret, in the order they load.
+	RuleFiles []string
 }
 
 // AgentConfigOutput is a rendered config.yaml. It can carry the platform API
@@ -75,6 +79,7 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	// top-level `ids` section is there, and here it always is.
 	{"firewall.ids", "use the top-level key ids"},
 	{"logging.level", "use spec.logging.level"},
+	{"logging.eve_log", "use spec.logging.eve"},
 	{"platform.api_key", "use spec.platform.apiKeySecretRef"},
 	{"platform.identity.enabled", "use spec.platform.identity.enabled"},
 	{"platform.identity.cluster", "use spec.platform.identity.cluster"},
@@ -82,6 +87,21 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	{"ids.enabled", "use spec.ids.enabled"},
 	{"ids.enforce_block", "use spec.ids.enforceBlock"},
 	{"ids.address_vars.HOME_NET", "use spec.ids.homeNet"},
+}
+
+// agentEveDir is where a file EVE log lives in the pod.
+const agentEveDir = "/var/log/synapse-eve"
+
+// eveLogFile is the value of logging.eve_log.file: Synapse's own names for
+// the two streams, or the file in the pod.
+func eveLogFile(eve *synapsev1alpha1.EveLogSpec) string {
+	switch eve.Output {
+	case "stderr":
+		return "stderr"
+	case "file":
+		return agentEveDir + "/eve.json"
+	}
+	return "stdout"
 }
 
 // RenderAgentConfig renders the config.yaml of a SynapseAgent.
@@ -168,6 +188,16 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	if spec.Logging != nil && spec.Logging.Level != "" {
 		setConfig(cfg, "logging.level", spec.Logging.Level)
 	}
+	if spec.Logging != nil && spec.Logging.Eve != nil && spec.Logging.Eve.Enabled {
+		eve := spec.Logging.Eve
+		setConfig(cfg, "logging.eve_log.enabled", true)
+		setConfig(cfg, "logging.eve_log.file", eveLogFile(eve))
+		if len(eve.EventTypes) > 0 {
+			types := slices.Clone(eve.EventTypes)
+			sort.Strings(types)
+			setConfig(cfg, "logging.eve_log.event_types", types)
+		}
+	}
 	if apiKey != "" {
 		setConfig(cfg, "platform.api_key", apiKey)
 	}
@@ -199,6 +229,18 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	}
 	if homeNet != "" {
 		setConfig(cfg, "ids.address_vars.HOME_NET", homeNet)
+	}
+	if len(in.RuleFiles) > 0 {
+		ids, _ := cfg["ids"].(map[string]any)
+		paths, isList := ids["rule_paths"].([]any)
+		if _, set := ids["rule_paths"]; set && !isList {
+			return AgentConfigOutput{}, field.ErrorList{field.Invalid(specPath.Child("config", "ids", "rule_paths"), "<value>",
+				"must be a list when spec.ids.rules is set")}.ToAggregate()
+		}
+		for _, name := range in.RuleFiles {
+			paths = append(paths, agentConfigDir+"/"+name)
+		}
+		setConfig(cfg, "ids.rule_paths", paths)
 	}
 
 	body, err := yaml.Marshal(cfg)

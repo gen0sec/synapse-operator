@@ -406,13 +406,54 @@ Where the `SynapseProxy` controller is installed too, `config/proxy-controller` 
   - `spec.updateStrategy` unset is a rolling update with `maxUnavailable: 1`, one node at a time.
   - `spec.nodeSelector` always gets `kubernetes.io/os: linux`. A selector that says another value is refused.
 - **`spec.hostNetwork: false` takes the agent off the node's network.** The pod gets its own network namespace and no bpffs of the node. With `network.iface: auto` the agent picks the pod's own interface. It inspects and protects only the traffic of that pod. Synapse's XDP dispatcher always pins under `/sys/fs/bpf/hillock/xdp`, so without a bpffs XDP never attaches. Capture uses AF_PACKET and the firewall uses nftables or iptables. IDS hot changes, HOME_NET changes from node churn included, take effect only at the next restart. Switching an existing agent leaves the XDP link, tc programs and pinned maps of the earlier pod on the node. To clear them, wait until the switch has rolled that node (its pod runs with `hostNetwork: false`), then drain the node and reboot it. Before that, kubelet restarts the old pod after the reboot and it pins again. The bpffs lives in memory, and XDP and tc attachments do not survive a reboot. `synapse --force-stop`, run once the node has rolled, is an alternative only on a node where no CNI uses tc or XDP. It sweeps the whole node. It detaches every XDP program and removes every clsact qdisc, with all its tc filters, on every interface, the CNI's included. It removes all Synapse and hillock pins. It stops every Synapse process on the node, proxies included (SIGTERM, then SIGKILL after 10 s if one is still alive). Run it in the node's network and PID namespaces with the node's `/sys/fs/bpf`: a node shell, or a privileged pod with `hostNetwork`, `hostPID` and a `/sys/fs/bpf` hostPath. HOME_NET is still computed cluster-wide.
-- **`spec.config` takes the Synapse settings that have no field,** in the shape of Synapse's own configuration file. A key the operator owns is refused and reported in the `ConfigValid` condition. It is never silently overridden. An invalid configuration changes nothing that is running. The owned keys are `mode`, `daemon.enabled`, `proxy` and its alias `pingora`, `arxignis` (use `platform`), `firewall.ids` (use the top-level `ids`), `logging.level`, `platform.api_key`, `platform.identity.enabled`, `platform.identity.cluster`, `network.ifaces`, `ids.enabled`, `ids.enforce_block` and `ids.address_vars.HOME_NET`. Other keys under these sections, such as `ids.address_vars.CUSTOM`, are allowed.
+- **`spec.config` takes the Synapse settings that have no field,** in the shape of Synapse's own configuration file. A key the operator owns is refused and reported in the `ConfigValid` condition. It is never silently overridden. An invalid configuration changes nothing that is running. The owned keys are `mode`, `daemon.enabled`, `proxy` and its alias `pingora`, `arxignis` (use `platform`), `firewall.ids` (use the top-level `ids`), `logging.level`, `logging.eve_log` (use `spec.logging.eve`), `platform.api_key`, `platform.identity.enabled`, `platform.identity.cluster`, `network.ifaces`, `ids.enabled`, `ids.enforce_block` and `ids.address_vars.HOME_NET`. Other keys under these sections, such as `ids.address_vars.CUSTOM`, are allowed.
 - **`network.ip_version` has no field.** Synapse does not act on it. It MAY be set in `spec.config`.
 - **`spec.capture.interfaces` writes `network.ifaces`.** Synapse ignores `network.iface` beside it, so a raw `network.iface` in `spec.config` is refused when interfaces are set.
 - **HOME_NET.** A typed `spec.ids.homeNet` wins. Its entries MUST be IP addresses or CIDRs; the operator refuses anything else, such as `any`, a comma or a bracket, and names the entry. Without it the operator computes HOME_NET from the nodes' addresses, their PodCIDRs and the LoadBalancer IPs of Services, plus the private-network supernets, and follows the cluster as it changes. With `ids.enabled` false, every such change (a node joins or leaves, a load balancer IP changes) rolls the DaemonSet on every node. A typed `spec.ids.homeNet` stops that.
 - **A typed `spec.ids.homeNet` replaces the computed list.** HOME_NET also feeds Synapse's never-ban guard. A short list can let `enforceBlock` ban the cluster's own nodes or a load balancer IP. The list SHOULD cover the nodes, the pods and the load balancers.
-- **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
+- **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The agent controller caches Secrets whole and ConfigMaps as metadata only. It reads a rule ConfigMap from the API server at each reconcile. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
 - **The agent owns three objects:** the Secret `<name>-config`, the ServiceAccount `<name>` and the DaemonSet `<name>`. Each has an owner reference to the agent, and they go with it.
+
+### Custom IDS rules
+
+`spec.ids.rules` lists up to 16 sources of rule files. Each source is a `configMapRef` or a `secretRef` in the agent's namespace, and may name `keys`. Without `keys`, every key that ends in `.rules` is used.
+
+```yaml
+spec:
+  ids:
+    rules:
+      - configMapRef: {name: local-rules}
+        keys: [web.rules]
+      - secretRef: {name: paid-rules}
+```
+
+- **The operator copies the files into the config Secret.** Each one is listed in `ids.rule_paths` after the configured `rule_paths`, as `/etc/synapse/config/rules.<n>.<key>.<hash>.rules`. The hash is of the content.
+- **`spec.config.ids.rule_paths` still works** for paths the operator does not manage. A `rule_paths` there replaces the default glob, and the copied files follow that list.
+- **A source MUST NOT be a SynapseAgent's own config Secret,** or any Secret a SynapseAgent controls. It holds copies of rules. The operator refuses it with `RulesSourceInvalid`.
+- **A ConfigMap's `binaryData` keys count** like its `data` keys.
+- **An edit is hot.** The rules change the config Secret in place and no pod is replaced. See "Hot reload and rollouts" for the delay and for AF_PACKET.
+- **At most 256 files, and 900 KiB together.** The config Secret also holds `config.yaml`, which lists every file, so the two together stay under 1,000,000 bytes. Keep larger sets in the platform's rules.
+- **A source the operator cannot read changes nothing that runs.** `ConfigValid` is false with `RulesSourceNotFound` (a missing ConfigMap or Secret), `RulesKeyNotFound` (a named key that is absent), `RulesSourceInvalid` or `RulesTooLarge`.
+- **The operator needs `get`, `list` and `watch` on ConfigMaps.** `config/agent-controller/rbac.yaml` grants it.
+
+### EVE log
+
+`spec.logging.eve` turns on Synapse's EVE log: alert, http and stats events as JSON lines. It is off unless `enabled` is true. `spec.config.logging.eve_log` is refused.
+
+```yaml
+spec:
+  logging:
+    eve:
+      enabled: true
+      output: stdout            # stdout (the default), stderr or file
+      eventTypes: [alert, stats]  # alert, http, stats; empty means all
+```
+
+- **`stdout`** is the default. It carries little else by default.
+- **`stderr`** carries Synapse's own JSON logs and its block events. Filter on `event_type`.
+- **`file`** writes `eve.json` to a node directory, `/var/log/synapse` unless `hostPath` names another. The directory MUST be under `/var/log/`, and the operator creates it. For example, `hostPath: /var/log/synapse-agents`. `hostPath` is a guard against accidents, not a security boundary: the pod is privileged.
+- **Nothing rotates the file,** and Synapse keeps it open. A logrotate rule for it MUST use `copytruncate`. Only one agent per node SHOULD write to a directory.
+- **Any change to `eve` rolls the DaemonSet.**
 
 ### Extra volumes
 
@@ -460,7 +501,7 @@ The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change neve
 
 | Condition | Meaning |
 |---|---|
-| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a rule of the extra volumes is broken), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference) |
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a rule of the extra volumes is broken), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
 | `Ready` | The DaemonSet runs the spec as it is written |
 
 Reasons of `Ready`:
