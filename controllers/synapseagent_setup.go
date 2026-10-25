@@ -53,6 +53,9 @@ func SetupAgentControllers(mgr ctrl.Manager) error {
 
 // SetupWithManager registers the controller.
 func (r *SynapseAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RuleReader == nil {
+		r.RuleReader = mgr.GetAPIReader()
+	}
 	err := mgr.GetFieldIndexer().IndexField(context.Background(), &synapsev1alpha1.SynapseAgent{}, agentAPIKeySecretIndex,
 		func(obj client.Object) []string {
 			a := obj.(*synapsev1alpha1.SynapseAgent)
@@ -123,7 +126,7 @@ func (r *SynapseAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Secret{}).
 		Watches(&corev1.Secret{}, readersOf("Secret", agentAPIKeySecretIndex, agentRuleSecretIndex)).
-		Watches(&corev1.ConfigMap{}, readersOf("ConfigMap", agentRuleConfigMapIndex)).
+		Watches(&corev1.ConfigMap{}, readersOf("ConfigMap", agentRuleConfigMapIndex), builder.OnlyMetadata).
 		Watches(&corev1.Node{}, followCluster, builder.WithPredicates(agentNodePredicate())).
 		Watches(&corev1.Service{}, followCluster, builder.WithPredicates(agentServicePredicate())).
 		Complete(r)

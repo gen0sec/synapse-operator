@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -316,4 +320,97 @@ func TestAgent_RulesTooLarge(t *testing.T) {
 		t.Errorf("message: %s", c.Message)
 	}
 	e.wantNothingApplied()
+}
+
+func TestAgent_RulesTooManyFiles(t *testing.T) {
+	e := newAgentEnv(t)
+	files := map[string]string{}
+	for i := 0; i < 257; i++ {
+		files[fmt.Sprintf("r%03d.rules", i)] = "x"
+	}
+	e.ruleConfigMap("many", files)
+	a := e.agent(rulesFrom(fromConfigMap("many")))
+	e.reconcile(a)
+
+	c := wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonRulesTooLarge)
+	if !strings.Contains(c.Message, "257") || !strings.Contains(c.Message, "256") {
+		t.Errorf("message names neither the count nor the limit: %s", c.Message)
+	}
+	e.wantNothingApplied()
+}
+
+// The Secret holds config.yaml as well, and the API server caps all of it.
+func TestAgent_RulesAndConfigTogetherAreTooLarge(t *testing.T) {
+	e := newAgentEnv(t)
+	e.ruleConfigMap("big", map[string]string{"a.rules": strings.Repeat("x", 800<<10)})
+	a := e.agent(rulesFrom(fromConfigMap("big")), func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Config = &runtime.RawExtension{Raw: []byte(`{"ids":{"address_vars":{"CUSTOM":"` + strings.Repeat("y", 250000) + `"}}}`)}
+	})
+	e.reconcile(a)
+
+	c := wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonRulesTooLarge)
+	if !strings.Contains(c.Message, "config.yaml") || !strings.Contains(c.Message, "rule files (819200 bytes)") {
+		t.Errorf("message does not give both sizes: %s", c.Message)
+	}
+	e.wantNothingApplied()
+}
+
+func TestAgent_RulesMayNotReadAnAgentsConfigSecret(t *testing.T) {
+	e := newAgentEnv(t)
+	other := newAgentEnvIn(t, e.ns, "other")
+	other.running()
+	a := e.running()
+
+	for _, name := range []string{e.name + "-config", "other-config"} {
+		e.edit(a, rulesFrom(fromSecret(name)))
+		e.reconcile(a)
+		c := wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonRulesSourceInvalid)
+		if !strings.Contains(c.Message, name) {
+			t.Errorf("message does not name %s: %s", name, c.Message)
+		}
+	}
+}
+
+func TestAgent_RulesFromBinaryData(t *testing.T) {
+	e := newAgentEnv(t)
+	cm := e.ruleConfigMap("local-rules", map[string]string{"text.rules": "t"})
+	change(t, e.k8s, cm, func() { cm.BinaryData = map[string][]byte{"bin.rules": []byte("b")} })
+
+	a := e.running(rulesFrom(fromConfigMap("local-rules")))
+	wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
+	if keys := ruleKeys(e.configSecret()); len(keys) != 2 {
+		t.Errorf("rule keys = %v, want the text and the binary one", keys)
+	}
+
+	e.edit(a, rulesFrom(fromConfigMap("local-rules", "bin.rules")))
+	e.reconcile(a)
+	wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
+	keys := ruleKeys(e.configSecret())
+	if len(keys) != 1 || string(e.configSecret().Data[keys[0]]) != "b" {
+		t.Errorf("a named binaryData key was not found: %v", keys)
+	}
+}
+
+type getCountingReader struct {
+	client.Reader
+	configMaps int
+}
+
+func (c *getCountingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.ConfigMap); ok {
+		c.configMaps++
+	}
+	return c.Reader.Get(ctx, key, obj, opts...)
+}
+
+// ConfigMaps are many and not the agent's, so they are not cached whole.
+func TestAgent_RuleConfigMapsAreReadLive(t *testing.T) {
+	e := newAgentEnv(t)
+	live := &getCountingReader{Reader: e.k8s}
+	e.agents.RuleReader = live
+	e.ruleConfigMap("local-rules", map[string]string{"a.rules": "alert"})
+	e.running(rulesFrom(fromConfigMap("local-rules")))
+	if live.configMaps != 1 {
+		t.Errorf("rule ConfigMap reads through the live reader = %d, want 1", live.configMaps)
+	}
 }

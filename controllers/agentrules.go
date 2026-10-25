@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
@@ -20,12 +21,17 @@ const (
 	ReasonRulesSourceNotFound = "RulesSourceNotFound"
 	ReasonRulesKeyNotFound    = "RulesKeyNotFound"
 	ReasonRulesTooLarge       = "RulesTooLarge"
+	ReasonRulesSourceInvalid  = "RulesSourceInvalid"
 )
 
 const (
 	// agentRulesLimit caps the rule files together. They live in the config
 	// Secret beside config.yaml, and a Secret may not reach 1 MiB.
 	agentRulesLimit = 900 << 10
+	// agentRuleFileLimit keeps config.yaml, which lists them all, small.
+	agentRuleFileLimit = 256
+	// agentSecretLimit is under the 1 MiB the API server allows a Secret.
+	agentSecretLimit = 1_000_000
 
 	agentRuleSuffix = ".rules"
 	// agentRuleStemLimit keeps a file name, which is a Secret key, under the
@@ -52,40 +58,65 @@ func agentRuleFileName(index int, key string, data []byte) string {
 	return fmt.Sprintf("rules.%d.%s.%s%s", index, stem, hex.EncodeToString(sum[:])[:12], agentRuleSuffix)
 }
 
-// resolveAgentRules reads the sources of spec.ids.rules, in order. A reason
-// other than "" is something the user has to fix; an error is worth a retry.
-func resolveAgentRules(ctx context.Context, c client.Reader, namespace string, sources []synapsev1alpha1.AgentIDSRuleSource) (files []agentRuleFile, reason, message string, err error) {
+// ruleReaders are where the sources are read from: ConfigMaps live, since
+// they are many and not the agent's, and Secrets from the cache that the API
+// key already needs.
+type ruleReaders struct {
+	configMaps, secrets client.Reader
+}
+
+// readRuleSource returns the keys of one source. A reason other than "" is
+// something the user has to fix; an error is worth a retry.
+func readRuleSource(ctx context.Context, rd ruleReaders, agent *synapsev1alpha1.SynapseAgent, src synapsev1alpha1.AgentIDSRuleSource) (kind, name string, data map[string][]byte, reason, message string, err error) {
+	data = map[string][]byte{}
+	switch {
+	case src.ConfigMapRef != nil:
+		kind, name = "ConfigMap", src.ConfigMapRef.Name
+		var cm corev1.ConfigMap
+		if err := rd.configMaps.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: name}, &cm); err != nil {
+			if apierrors.IsNotFound(err) {
+				return kind, name, nil, ReasonRulesSourceNotFound, fmt.Sprintf("ConfigMap %q not found", name), nil
+			}
+			return kind, name, nil, "", "", err
+		}
+		for k, v := range cm.Data {
+			data[k] = []byte(v)
+		}
+		for k, v := range cm.BinaryData {
+			data[k] = v
+		}
+	case src.SecretRef != nil:
+		kind, name = "Secret", src.SecretRef.Name
+		var secret corev1.Secret
+		if err := rd.secrets.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: name}, &secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				return kind, name, nil, ReasonRulesSourceNotFound, fmt.Sprintf("Secret %q not found", name), nil
+			}
+			return kind, name, nil, "", "", err
+		}
+		// An agent's config Secret holds copies of rule files: copying it
+		// again would grow it on every reconcile.
+		if owner := metav1.GetControllerOf(&secret); name == agentConfigSecretName(agent) ||
+			(owner != nil && owner.Kind == "SynapseAgent" && owner.APIVersion == synapsev1alpha1.GroupVersion.String()) {
+			return kind, name, nil, ReasonRulesSourceInvalid,
+				fmt.Sprintf("Secret %q is the configuration of a SynapseAgent, which holds copies of rules; name the Secret or ConfigMap the rules come from", name), nil
+		}
+		data = secret.Data
+	}
+	return kind, name, data, "", "", nil
+}
+
+// resolveAgentRules reads the sources of spec.ids.rules, in order.
+func resolveAgentRules(ctx context.Context, rd ruleReaders, agent *synapsev1alpha1.SynapseAgent, sources []synapsev1alpha1.AgentIDSRuleSource) (files []agentRuleFile, reason, message string, err error) {
 	seen := map[string]bool{}
-	total := 0
 	for i, src := range sources {
 		at := fmt.Sprintf("spec.ids.rules[%d]", i)
-		var kind, name string
-		data := map[string][]byte{}
-		switch {
-		case src.ConfigMapRef != nil:
-			kind, name = "ConfigMap", src.ConfigMapRef.Name
-			var cm corev1.ConfigMap
-			if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &cm); err != nil {
-				if apierrors.IsNotFound(err) {
-					return nil, ReasonRulesSourceNotFound, fmt.Sprintf("%s: ConfigMap %q not found", at, name), nil
-				}
-				return nil, "", "", err
-			}
-			for k, v := range cm.Data {
-				data[k] = []byte(v)
-			}
-		case src.SecretRef != nil:
-			kind, name = "Secret", src.SecretRef.Name
-			var secret corev1.Secret
-			if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &secret); err != nil {
-				if apierrors.IsNotFound(err) {
-					return nil, ReasonRulesSourceNotFound, fmt.Sprintf("%s: Secret %q not found", at, name), nil
-				}
-				return nil, "", "", err
-			}
-			data = secret.Data
-		default:
-			continue
+		kind, name, data, reason, message, err := readRuleSource(ctx, rd, agent, src)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if reason != "" {
+			return nil, reason, at + ": " + message, nil
 		}
 
 		keys := src.Keys
@@ -107,14 +138,36 @@ func resolveAgentRules(ctx context.Context, c client.Reader, namespace string, s
 				continue
 			}
 			seen[fileName] = true
-			total += len(content)
 			files = append(files, agentRuleFile{Name: fileName, Data: content})
 		}
 	}
-	if total > agentRulesLimit {
+	if len(files) > agentRuleFileLimit {
+		return nil, ReasonRulesTooLarge, fmt.Sprintf("spec.ids.rules: %d rule files, over the limit of %d", len(files), agentRuleFileLimit), nil
+	}
+	if total := ruleBytes(files); total > agentRulesLimit {
 		return nil, ReasonRulesTooLarge, fmt.Sprintf("spec.ids.rules: the rule files add up to %d KiB, over the limit of %d KiB; move the rest to rules managed on the platform", total>>10, agentRulesLimit>>10), nil
 	}
 	return files, "", "", nil
+}
+
+func ruleBytes(files []agentRuleFile) int {
+	total := 0
+	for _, f := range files {
+		total += len(f.Data)
+	}
+	return total
+}
+
+// checkAgentSecretSize is for after the render. The API server caps the sum
+// of a Secret's values at 1 MiB, and config.yaml, which lists every rule
+// file, is one of them.
+func checkAgentSecretSize(config []byte, files []agentRuleFile) (reason, message string) {
+	rules := ruleBytes(files)
+	if len(config)+rules <= agentSecretLimit {
+		return "", ""
+	}
+	return ReasonRulesTooLarge, fmt.Sprintf("spec.ids.rules: the config.yaml (%d bytes) and the rule files (%d bytes) add up to %d bytes, over the limit of %d bytes for the Secret that holds them",
+		len(config), rules, len(config)+rules, agentSecretLimit)
 }
 
 // agentRuleFileNames lists the names of files, for the render.

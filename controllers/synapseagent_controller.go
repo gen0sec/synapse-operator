@@ -42,6 +42,17 @@ type SynapseAgentReconciler struct {
 	client.Client
 	// Recorder emits Events on the SynapseAgent. May be nil.
 	Recorder record.EventRecorder
+	// RuleReader reads the ConfigMaps of spec.ids.rules. They are many and
+	// not the agent's, so they are read live and not cached whole. Nil means
+	// Client.
+	RuleReader client.Reader
+}
+
+func (r *SynapseAgentReconciler) ruleReader() client.Reader {
+	if r.RuleReader != nil {
+		return r.RuleReader
+	}
+	return r.Client
 }
 
 // agentOutcome is what one reconcile concluded, to be written to status.
@@ -109,7 +120,7 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 	if agent.Spec.IDS != nil {
 		ruleSources = agent.Spec.IDS.Rules
 	}
-	rules, reason, message, err := resolveAgentRules(ctx, r.Client, agent.Namespace, ruleSources)
+	rules, reason, message, err := resolveAgentRules(ctx, ruleReaders{configMaps: r.ruleReader(), secrets: r.Client}, agent, ruleSources)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +141,10 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 	cfg, err := RenderAgentConfig(AgentConfigInput{Agent: agent, APIKey: apiKey, HomeNet: homeNet, RuleFiles: agentRuleFileNames(rules)})
 	if err != nil {
 		o.invalid(ReasonInvalidConfig, err.Error())
+		return o, nil
+	}
+	if reason, message := checkAgentSecretSize(cfg.YAML, rules); reason != "" {
+		o.invalid(reason, message)
 		return o, nil
 	}
 	o.configValid = metav1.Condition{Type: ConditionConfigValid, Status: metav1.ConditionTrue, Reason: ReasonRendered,
