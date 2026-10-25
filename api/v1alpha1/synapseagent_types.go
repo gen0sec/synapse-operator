@@ -204,6 +204,51 @@ type AgentIDSSpec struct {
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
 	HomeNet []string `json:"homeNet,omitempty"`
+
+	// Rules lists ConfigMaps and Secrets whose IDS rule files the agent loads
+	// next to the default rules and the ones managed on the platform. The
+	// operator copies each selected key into the agent's configuration
+	// Secret, so a change to a rule reloads in the running pods and rolls
+	// none of them. The rules may add up to 900 KiB.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	Rules []AgentIDSRuleSource `json:"rules,omitempty"`
+}
+
+// AgentIDSRuleSource names a ConfigMap or a Secret in the agent's namespace
+// that holds IDS rule files.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.configMapRef) != has(self.secretRef)",message="set exactly one of configMapRef and secretRef"
+type AgentIDSRuleSource struct {
+	// ConfigMapRef names the ConfigMap that holds the rules.
+	//
+	// +optional
+	ConfigMapRef *ObjectNameReference `json:"configMapRef,omitempty"`
+
+	// SecretRef names the Secret that holds the rules.
+	//
+	// +optional
+	SecretRef *ObjectNameReference `json:"secretRef,omitempty"`
+
+	// Keys lists the keys to load, in order. A key the object lacks is an
+	// error. Empty means every key that ends in ".rules".
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	Keys []string `json:"keys,omitempty"`
+}
+
+// ObjectNameReference names an object in the namespace of the resource that
+// refers to it.
+type ObjectNameReference struct {
+	// Name is the name of the object.
+	//
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 // SynapseAgentStatus is the observed state of a SynapseAgent.
