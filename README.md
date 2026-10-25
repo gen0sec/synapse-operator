@@ -411,8 +411,30 @@ Where the `SynapseProxy` controller is installed too, `config/proxy-controller` 
 - **`spec.capture.interfaces` writes `network.ifaces`.** Synapse ignores `network.iface` beside it, so a raw `network.iface` in `spec.config` is refused when interfaces are set.
 - **HOME_NET.** A typed `spec.ids.homeNet` wins. Its entries MUST be IP addresses or CIDRs; the operator refuses anything else, such as `any`, a comma or a bracket, and names the entry. Without it the operator computes HOME_NET from the nodes' addresses, their PodCIDRs and the LoadBalancer IPs of Services, plus the private-network supernets, and follows the cluster as it changes. With `ids.enabled` false, every such change (a node joins or leaves, a load balancer IP changes) rolls the DaemonSet on every node. A typed `spec.ids.homeNet` stops that.
 - **A typed `spec.ids.homeNet` replaces the computed list.** HOME_NET also feeds Synapse's never-ban guard. A short list can let `enforceBlock` ban the cluster's own nodes or a load balancer IP. The list SHOULD cover the nodes, the pods and the load balancers.
-- **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
+- **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The agent controller caches Secrets whole and ConfigMaps as metadata only. It reads a rule ConfigMap from the API server at each reconcile. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
 - **The agent owns three objects:** the Secret `<name>-config`, the ServiceAccount `<name>` and the DaemonSet `<name>`. Each has an owner reference to the agent, and they go with it.
+
+### Custom IDS rules
+
+`spec.ids.rules` lists up to 16 sources of rule files. Each source is a `configMapRef` or a `secretRef` in the agent's namespace, and may name `keys`. Without `keys`, every key that ends in `.rules` is used.
+
+```yaml
+spec:
+  ids:
+    rules:
+      - configMapRef: {name: local-rules}
+        keys: [web.rules]
+      - secretRef: {name: paid-rules}
+```
+
+- **The operator copies the files into the config Secret.** Each one is listed in `ids.rule_paths` after the configured `rule_paths`, as `/etc/synapse/config/rules.<n>.<key>.<hash>.rules`. The hash is of the content.
+- **`spec.config.ids.rule_paths` still works** for paths the operator does not manage. A `rule_paths` there replaces the default glob, and the copied files follow that list.
+- **A source MUST NOT be a SynapseAgent's own config Secret,** or any Secret a SynapseAgent controls. It holds copies of rules. The operator refuses it with `RulesSourceInvalid`.
+- **A ConfigMap's `binaryData` keys count** like its `data` keys.
+- **An edit is hot.** The rules change the config Secret in place and no pod is replaced. See "Hot reload and rollouts" for the delay and for AF_PACKET.
+- **At most 256 files, and 900 KiB together.** The config Secret also holds `config.yaml`, which lists every file, so the two together stay under 1,000,000 bytes. Keep larger sets in the platform's rules.
+- **A source the operator cannot read changes nothing that runs.** `ConfigValid` is false with `RulesSourceNotFound` (a missing ConfigMap or Secret), `RulesKeyNotFound` (a named key that is absent), `RulesSourceInvalid` or `RulesTooLarge`.
+- **The operator needs `get`, `list` and `watch` on ConfigMaps.** `config/agent-controller/rbac.yaml` grants it.
 
 ### EVE log
 
@@ -433,6 +455,38 @@ spec:
 - **Nothing rotates the file,** and Synapse keeps it open. A logrotate rule for it MUST use `copytruncate`. Only one agent per node SHOULD write to a directory.
 - **Any change to `eve` rolls the DaemonSet.**
 
+### Extra volumes
+
+`spec.volumes` and `spec.volumeMounts` add volumes to the agent pod. The volumes follow the operator's own in the pod. The mounts go into the Synapse container, in spec order. Each list takes at most 16 entries. Volumes are keyed by `name` and mounts by `mountPath`, so one volume MAY be mounted at several paths, and two mounts on one path are refused when you create the resource.
+
+```yaml
+spec:
+  volumes:
+    - name: rules
+      configMap:
+        name: my-rules
+  volumeMounts:
+    - name: rules
+      mountPath: /etc/synapse/rules
+      readOnly: true
+```
+
+This mounts the ConfigMap `my-rules` at `/etc/synapse/rules`. The default `ids.rule_paths` is `/etc/synapse/rules/*.rules`, so Synapse loads every `*.rules` file in it.
+
+The operator refuses the spec with `ConfigValid=False`, reason `InvalidVolumes`, when:
+
+- a volume name is not a DNS label, or a volume sets no source or more than one;
+- a volume is named `config`, `data`, `bpffs`, `debugfs`, `modules` or `eve-log`, which the operator uses;
+- a mount names a volume that `spec.volumes` does not hold;
+- a mount path is not absolute, or equals, contains or lies inside `/etc/synapse/config`, `/var/lib/synapse`, `/sys/fs/bpf`, `/sys/kernel/debug`, `/lib/modules` or `/var/log/synapse-eve`;
+- a mount sets `subPath` or `subPathExpr`. Kubelet does not refresh such a mount, so a changed ConfigMap or Secret would never reach the pod.
+
+The message names the entry. What runs is left as it is.
+
+Adding, removing or changing a volume or a mount changes the pod template, so it rolls the DaemonSet. The operator does not check the volume sources. A missing ConfigMap or Secret keeps the pod from starting, and `READY` stays `False`.
+
+Rules from a mounted ConfigMap reload only on a restart. Synapse rebuilds its rules on a reload signal or when `config.yaml` changes, and an edit to a rule file does neither. After you change the ConfigMap, run `kubectl -n <ns> rollout restart daemonset/<name>`.
+
 ### Hot reload and rollouts
 
 Six IDS settings are hot: `rule_paths`, `address_vars` (HOME_NET included), `port_vars`, `flow_timeout_secs`, `max_flows` and `enforce_block`, under `ids` and `firewall.ids`. A change confined to them updates the config Secret in place. The pods are not replaced. Synapse reloads the file once kubelet has synced the mounted Secret, which takes up to about a minute.
@@ -447,7 +501,7 @@ The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change neve
 
 | Condition | Meaning |
 |---|---|
-| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference) |
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `InvalidVolumes` (a rule of the extra volumes is broken), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound`, `RulesSourceInvalid` or `RulesTooLarge` (`spec.ids.rules`) |
 | `Ready` | The DaemonSet runs the spec as it is written |
 
 Reasons of `Ready`:

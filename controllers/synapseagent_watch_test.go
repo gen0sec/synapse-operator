@@ -164,6 +164,43 @@ func TestAgent_FollowsItsInputs(t *testing.T) {
 	change(t, e.k8s, &creds, func() { creds.Data["API_KEY"] = []byte("k-2") })
 	configHas("a rotated API key is re-rendered", "k-2")
 
+	// A rule source is the user's, like the API key Secret: its edits, and its
+	// late arrival, reach the agent through the watches. The content is in the
+	// file's name, so a changed rule shows as a new key.
+	ruleFile := func(what, content string) {
+		t.Helper()
+		eventually(t, what, func() string {
+			var s corev1.Secret
+			if err := e.k8s.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: "agent-config"}, &s); err != nil {
+				return err.Error()
+			}
+			for _, k := range ruleKeys(&s) {
+				if string(s.Data[k]) == content {
+					return ""
+				}
+			}
+			return "no rule file holds " + content
+		})
+	}
+	cm := e.ruleConfigMap("cm-rules", map[string]string{"web.rules": "from-cm-1"})
+	e.edit(a, rulesFrom(fromConfigMap("cm-rules"), fromSecret("secret-rules")))
+	eventually(t, "a missing rule source is reported", func() string {
+		if err := e.k8s.Get(ctx, e.key(), a); err != nil {
+			return err.Error()
+		}
+		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionConfigValid); c == nil || c.Reason != ReasonRulesSourceNotFound {
+			return fmt.Sprintf("ConfigValid is %+v", c)
+		}
+		return ""
+	})
+	ruleSecret := e.ruleSecret("secret-rules", map[string]string{"s.rules": "from-secret-1"})
+	ruleFile("the rule Secret's arrival is followed", "from-secret-1")
+	ruleFile("the rule ConfigMap is copied", "from-cm-1")
+	change(t, e.k8s, cm, func() { cm.Data["web.rules"] = "from-cm-2" })
+	ruleFile("an edit of the rule ConfigMap is followed", "from-cm-2")
+	change(t, e.k8s, ruleSecret, func() { ruleSecret.Data["s.rules"] = []byte("from-secret-2") })
+	ruleFile("an edit of the rule Secret is followed", "from-secret-2")
+
 	e.createNode(testNode("agent-follow-node", "192.0.2.201", "198.51.100.0/24"))
 	configHas("a node joining is followed", "192.0.2.201/32")
 
