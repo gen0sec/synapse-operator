@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/discovery"
@@ -69,8 +70,68 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 			},
 			"agents run on Linux nodes only"},
 		{"an unknown log level",
-			func(a *v1alpha1.SynapseAgent) { a.Spec.Logging = &v1alpha1.LoggingSpec{Level: "verbose"} },
+			func(a *v1alpha1.SynapseAgent) { a.Spec.Logging = &v1alpha1.AgentLoggingSpec{Level: "verbose"} },
 			"spec.logging.level"},
+		{"an unknown EVE output",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "syslog"})
+			},
+			"spec.logging.eve.output"},
+		{"an unknown EVE event type",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, EventTypes: []string{"flow"}})
+			},
+			"spec.logging.eve.eventTypes"},
+		{"an EVE hostPath with stdout",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, HostPath: "/var/log/x"})
+			},
+			"hostPath is only for output file"},
+		{"a relative EVE hostPath",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "var/log/x"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath outside /var/log",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/etc/synapse"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath with a .. segment",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/../etc"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is the bare /var/log/",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a /var/log/. path",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/."})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a /var/log// path",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log//"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a path with a . segment",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/a/./b"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath that is a path with an empty segment",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/a//b"})
+			},
+			"hostPath must be an absolute path under /var/log/"},
+		{"an EVE hostPath longer than 200 characters",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/" + strings.Repeat("a", 200)})
+			},
+			"hostPath"},
 		{"an unknown os",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.OS = "freebsd" },
 			"spec.os"},
@@ -107,6 +168,40 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				t.Errorf("message does not mention %q:\n%v", tc.want, err)
 			}
 		})
+	}
+}
+
+func eveLogging(e v1alpha1.EveLogSpec) *v1alpha1.AgentLoggingSpec {
+	return &v1alpha1.AgentLoggingSpec{Eve: &e}
+}
+
+// The Go type always sends enabled, so a missing one needs raw JSON.
+func TestSynapseAgent_RejectsEveWithoutEnabled(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": v1alpha1.GroupVersion.String(),
+		"kind":       "SynapseAgent",
+		"metadata":   map[string]any{"name": fmt.Sprintf("agent-%d", nameSeq.Add(1)), "namespace": "default"},
+		"spec": map[string]any{
+			"image":   "example.test/synapse:1.0.0",
+			"logging": map[string]any{"eve": map[string]any{"output": "stderr"}},
+		},
+	}}
+	err := k8s.Create(context.Background(), u)
+	if err == nil {
+		_ = k8s.Delete(context.Background(), u)
+		t.Fatal("accepted, want it rejected")
+	}
+	if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "spec.logging.eve.enabled") {
+		t.Errorf("err = %v, want Invalid naming spec.logging.eve.enabled", err)
+	}
+}
+
+func TestSynapseAgent_EveOutputDefaultsToStdout(t *testing.T) {
+	a := validAgent()
+	a.Spec.Logging = eveLogging(v1alpha1.EveLogSpec{Enabled: true})
+	mustCreateAgent(t, a)
+	if got := a.Spec.Logging.Eve.Output; got != "stdout" {
+		t.Errorf("eve.output = %q, want the default stdout", got)
 	}
 }
 
@@ -161,7 +256,12 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 	a.Spec.HostPID = ptr.To(false)
 	a.Spec.HostNetwork = ptr.To(false)
 	a.Spec.OS = "linux"
-	a.Spec.Logging = &v1alpha1.LoggingSpec{Level: "debug"}
+	a.Spec.Logging = &v1alpha1.AgentLoggingSpec{Level: "debug", Eve: &v1alpha1.EveLogSpec{
+		Enabled:    true,
+		Output:     "file",
+		HostPath:   "/var/log/a/b",
+		EventTypes: []string{"alert", "stats"},
+	}}
 	a.Spec.Platform = &v1alpha1.AgentPlatformSpec{
 		APIKeySecretRef: &v1alpha1.SecretKeyReference{Name: "synapse-credentials", Key: "API_KEY"},
 		Identity:        &v1alpha1.AgentIdentitySpec{Enabled: ptr.To(true), Cluster: "prod-eu"},
@@ -180,6 +280,9 @@ func TestSynapseAgent_FullSpecIsAccepted(t *testing.T) {
 	}
 	if a.Spec.HostNetwork == nil || *a.Spec.HostNetwork {
 		t.Errorf("hostNetwork = %v, want the explicit false kept", a.Spec.HostNetwork)
+	}
+	if eve := a.Spec.Logging.Eve; eve == nil || !eve.Enabled || eve.Output != "file" || eve.HostPath != "/var/log/a/b" || len(eve.EventTypes) != 2 {
+		t.Errorf("logging.eve = %+v, want it kept", eve)
 	}
 	if a.Spec.IDS == nil || len(a.Spec.IDS.HomeNet) != 2 {
 		t.Errorf("ids = %+v, want it kept", a.Spec.IDS)

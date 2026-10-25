@@ -1071,6 +1071,56 @@ spec:
               logging:
                 description: Logging configures the agent's own logs.
                 properties:
+                  eve:
+                    description: |-
+                      Eve writes Synapse's EVE log: alert, http and stats events as JSON
+                      lines. Unset or disabled, nothing is written.
+                    properties:
+                      enabled:
+                        description: Enabled turns the EVE log on.
+                        type: boolean
+                      eventTypes:
+                        description: EventTypes selects the events written. Empty
+                          means all of them.
+                        items:
+                          enum:
+                          - alert
+                          - http
+                          - stats
+                          type: string
+                        maxItems: 3
+                        type: array
+                        x-kubernetes-list-type: set
+                      hostPath:
+                        description: |-
+                          HostPath is the node directory that holds eve.json when output is
+                          file. Unset means /var/log/synapse. It is a guard against accidents,
+                          not a security boundary: the agent pod is privileged.
+                        maxLength: 200
+                        type: string
+                      output:
+                        default: stdout
+                        description: |-
+                          Output is where the log goes: the pod's stdout (the default), its
+                          stderr, or a file on the node. stdout carries little else by default.
+                          stderr carries Synapse's own logs and its block events. Filter on
+                          event_type. Nothing rotates the file.
+                        enum:
+                        - stdout
+                        - stderr
+                        - file
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                    x-kubernetes-validations:
+                    - message: hostPath is only for output file
+                      rule: '!has(self.hostPath) || self.output == ''file'''
+                    - message: hostPath must be an absolute path under /var/log/,
+                        with a directory name and no empty, . or .. segment
+                      rule: '!has(self.hostPath) || (self.hostPath.matches(''^/var/log/[^/]+(/[^/]+)*$'')
+                        && !self.hostPath.split(''/'').exists(s, s == ''.'' || s ==
+                        ''..''))'
                   level:
                     description: Level is the minimum severity logged. Empty leaves
                       Synapse's default.

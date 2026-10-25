@@ -307,6 +307,58 @@ func TestAgentDaemonSet_HostNetworkOff(t *testing.T) {
 	}
 }
 
+// eveVolumeOf returns the eve-log volume and its mount, nil when absent.
+func eveVolumeOf(t *testing.T, d *appsv1.DaemonSet) (*corev1.Volume, *corev1.VolumeMount) {
+	t.Helper()
+	var volume *corev1.Volume
+	var mount *corev1.VolumeMount
+	for i, v := range agentPodSpec(d).Volumes {
+		if v.Name == "eve-log" {
+			volume = &agentPodSpec(d).Volumes[i]
+		}
+	}
+	c := agentContainer(t, d)
+	for i, m := range c.VolumeMounts {
+		if m.Name == "eve-log" {
+			mount = &c.VolumeMounts[i]
+		}
+	}
+	return volume, mount
+}
+
+func TestAgentDaemonSet_EveFile(t *testing.T) {
+	eve := func(e synapsev1alpha1.EveLogSpec) *appsv1.DaemonSet {
+		return buildAgentDaemonSet(nodeAgent(withEve(e)), "rh")
+	}
+
+	v, m := eveVolumeOf(t, eve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "file", HostPath: "/var/log/agents"}))
+	if v == nil || m == nil {
+		t.Fatalf("volume %v, mount %v, want both", v, m)
+	}
+	if v.HostPath == nil || v.HostPath.Path != "/var/log/agents" || v.HostPath.Type == nil || *v.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+		t.Errorf("volume = %+v, want a DirectoryOrCreate hostPath at /var/log/agents", v.VolumeSource)
+	}
+	if m.MountPath != "/var/log/synapse-eve" || m.ReadOnly || m.SubPath != "" {
+		t.Errorf("mount = %+v, want read-write at /var/log/synapse-eve, no subPath", m)
+	}
+
+	v, _ = eveVolumeOf(t, eve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "file"}))
+	if v == nil || v.HostPath == nil || v.HostPath.Path != "/var/log/synapse" {
+		t.Errorf("an unset hostPath gives %+v, want /var/log/synapse", v)
+	}
+
+	for name, d := range map[string]*appsv1.DaemonSet{
+		"stdout": eve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stdout"}),
+		"stderr": eve(synapsev1alpha1.EveLogSpec{Enabled: true, Output: "stderr"}),
+		"off":    eve(synapsev1alpha1.EveLogSpec{Enabled: false, Output: "file"}),
+		"unset":  buildAgentDaemonSet(nodeAgent(), "rh"),
+	} {
+		if v, m := eveVolumeOf(t, d); v != nil || m != nil {
+			t.Errorf("%s: eve-log volume %v, mount %v, want none", name, v, m)
+		}
+	}
+}
+
 func TestAgentDaemonSet_HostNetworkUnsetIsOn(t *testing.T) {
 	d := buildAgentDaemonSet(nodeAgent(), "rh")
 	pod := agentPodSpec(d)
