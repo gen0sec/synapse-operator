@@ -414,6 +414,25 @@ Where the `SynapseProxy` controller is installed too, `config/proxy-controller` 
 - **With `--namespace`, only that namespace is seen.** An agent elsewhere is not run, and nothing reports it. The computed HOME_NET counts only the LoadBalancer Services of that namespace.
 - **The agent owns three objects:** the Secret `<name>-config`, the ServiceAccount `<name>` and the DaemonSet `<name>`. Each has an owner reference to the agent, and they go with it.
 
+### Custom IDS rules
+
+`spec.ids.rules` lists up to 16 sources of rule files. Each source is a `configMapRef` or a `secretRef` in the agent's namespace, and may name `keys`. Without `keys`, every key that ends in `.rules` is used.
+
+```yaml
+spec:
+  ids:
+    rules:
+      - configMapRef: {name: local-rules}
+        keys: [web.rules]
+      - secretRef: {name: paid-rules}
+```
+
+- **The operator copies the files into the config Secret.** Each one is listed in `ids.rule_paths` after the default glob, as `/etc/synapse/config/rules.<n>.<key>.<hash>.rules`. The hash is of the content.
+- **An edit is hot.** The rules change the config Secret in place and no pod is replaced. See "Hot reload and rollouts" for the delay and for AF_PACKET.
+- **The files add up to 900 KiB at most.** Keep larger sets in the platform's rules.
+- **A source the operator cannot read changes nothing that runs.** `ConfigValid` is false with `RulesSourceNotFound` (a missing ConfigMap or Secret), `RulesKeyNotFound` (a named key that is absent) or `RulesTooLarge`.
+- **The operator needs `get`, `list` and `watch` on ConfigMaps.** `config/agent-controller/rbac.yaml` grants it.
+
 ### Hot reload and rollouts
 
 Six IDS settings are hot: `rule_paths`, `address_vars` (HOME_NET included), `port_vars`, `flow_timeout_secs`, `max_flows` and `enforce_block`, under `ids` and `firewall.ids`. A change confined to them updates the config Secret in place. The pods are not replaced. Synapse reloads the file once kubelet has synced the mounted Secret, which takes up to about a minute.
@@ -428,7 +447,7 @@ The hot swap runs only in the XDP IDS worker. Under AF_PACKET, a hot change neve
 
 | Condition | Meaning |
 |---|---|
-| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference) |
+| `ConfigValid` | `True` (`Rendered`) when the spec renders to a Synapse configuration. `False` carries `InvalidConfig` (a refused key, an entry that is not an address, bad text), `SecretNotFound` or `SecretKeyNotFound` (the API-key reference), `RulesSourceNotFound`, `RulesKeyNotFound` or `RulesTooLarge` (`spec.ids.rules`) |
 | `Ready` | The DaemonSet runs the spec as it is written |
 
 Reasons of `Ready`:
