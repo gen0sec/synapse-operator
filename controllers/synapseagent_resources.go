@@ -156,6 +156,14 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 		corev1.VolumeMount{Name: "modules", MountPath: "/lib/modules", ReadOnly: true},
 	)
 	volumes = append(volumes, hostPath("debugfs", "/sys/kernel/debug"), hostPath("modules", "/lib/modules"))
+	if eve := spec.Logging; eve != nil && eve.Eve != nil && eve.Eve.Enabled && eve.Eve.Output == "file" {
+		dir := eve.Eve.HostPath
+		if dir == "" {
+			dir = "/var/log/synapse"
+		}
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "eve-log", MountPath: agentEveDir})
+		volumes = append(volumes, hostPath("eve-log", dir))
+	}
 
 	return &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
