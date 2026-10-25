@@ -114,6 +114,11 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 		}
 	}
 
+	if message := validateAgentVolumes(&agent.Spec); message != "" {
+		o.invalid(ReasonInvalidVolumes, message)
+		return o, nil
+	}
+
 	cfg, err := RenderAgentConfig(AgentConfigInput{Agent: agent, APIKey: apiKey, HomeNet: homeNet})
 	if err != nil {
 		o.invalid(ReasonInvalidConfig, err.Error())
