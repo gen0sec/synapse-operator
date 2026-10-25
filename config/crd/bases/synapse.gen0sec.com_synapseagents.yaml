@@ -1383,7 +1383,7 @@ spec:
                 maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
-                - name
+                - mountPath
                 x-kubernetes-list-type: map
               volumes:
                 description: |-

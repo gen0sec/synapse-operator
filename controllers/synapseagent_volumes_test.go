@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kptr "k8s.io/utils/ptr"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -101,6 +102,22 @@ func TestValidateAgentVolumes(t *testing.T) {
 		{name: "child of data dir", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/var/lib/synapse/rules")}, want: "/var/lib/synapse"},
 		{name: "child of config dir", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/etc/synapse/config/extra")}, want: "/etc/synapse/config"},
 		{name: "child of eve dir", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/var/log/synapse-eve/x")}, want: "/var/log/synapse-eve"},
+		{name: "sibling of bpffs", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/sys/fs/bpfx")}},
+		{name: "child of bpffs", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/sys/fs/bpf/x")}, want: "/sys/fs/bpf"},
+		{name: "child of debugfs", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/sys/kernel/debug/x")}, want: "/sys/kernel/debug"},
+		{name: "child of modules", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/lib/modules/x")}, want: "/lib/modules"},
+		{name: "parent of data dir", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/var/lib")}, want: "/var/lib/synapse"},
+		{name: "parent of debugfs", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/sys/kernel")}, want: "/sys/kernel/debug"},
+		{name: "parent of modules", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/lib")}, want: "/lib/modules"},
+		{name: "parent of eve dir", vols: []corev1.Volume{vol("a")}, mounts: []corev1.VolumeMount{mount("a", "/var/log")}, want: "/var/log/synapse-eve"},
+		{name: "name not a DNS label", vols: []corev1.Volume{vol("Bad_Name")}, want: `"Bad_Name"`},
+		{name: "no source", vols: []corev1.Volume{{Name: "a"}}, want: `"a"`},
+		{name: "two sources", vols: []corev1.Volume{{Name: "a", VolumeSource: corev1.VolumeSource{
+			EmptyDir:  &corev1.EmptyDirVolumeSource{},
+			ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "c"}},
+		}}}, want: `"a"`},
+		{name: "one volume at two paths", vols: []corev1.Volume{vol("a")},
+			mounts: []corev1.VolumeMount{mount("a", "/mnt/one"), mount("a", "/mnt/two")}},
 		{name: "subPath", vols: []corev1.Volume{vol("a")},
 			mounts: []corev1.VolumeMount{{Name: "a", MountPath: "/mnt/a", SubPath: "f"}}, want: "subPath"},
 		{name: "subPathExpr", vols: []corev1.Volume{vol("a")},
@@ -191,4 +208,73 @@ func TestAgent_AddingAVolumeRollsTheTemplate(t *testing.T) {
 		t.Error("the DaemonSet generation did not change: the pods will not roll")
 	}
 	agentVolume(t, after, "scratch")
+}
+
+func TestAgentDaemonSet_ReservedListsCoverTheBuilder(t *testing.T) {
+	ds := buildAgentDaemonSet(nodeAgent(func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(true) }), "h")
+	names := map[string]bool{}
+	for _, n := range agentReservedVolumes {
+		names[n] = true
+	}
+	paths := map[string]bool{}
+	for _, p := range agentReservedPaths {
+		paths[p] = true
+	}
+	for _, v := range agentPodSpec(ds).Volumes {
+		if !names[v.Name] {
+			t.Errorf("operator volume %q is not reserved", v.Name)
+		}
+	}
+	for _, m := range agentContainer(t, ds).VolumeMounts {
+		if !paths[m.MountPath] {
+			t.Errorf("operator mount path %q is not reserved", m.MountPath)
+		}
+	}
+}
+
+func TestAgent_DuplicateMountPathRefusedAtAdmission(t *testing.T) {
+	e := newAgentEnv(t)
+	a := &synapsev1alpha1.SynapseAgent{
+		ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: e.name},
+		Spec:       synapsev1alpha1.SynapseAgentSpec{Image: "example.test/synapse:1.0.0"},
+	}
+	withVolumes([]corev1.Volume{emptyDirVolume("a"), emptyDirVolume("b")},
+		[]corev1.VolumeMount{{Name: "a", MountPath: "/mnt/x"}, {Name: "b", MountPath: "/mnt/x"}})(&a.Spec)
+	if err := e.k8s.Create(e.ctx, a); err == nil {
+		t.Fatal("two mounts on one mountPath were admitted")
+	}
+}
+
+func TestAgent_OneVolumeAtTwoPaths(t *testing.T) {
+	e := newAgentEnv(t)
+	a := e.running(withVolumes([]corev1.Volume{emptyDirVolume("a")},
+		[]corev1.VolumeMount{{Name: "a", MountPath: "/mnt/one"}, {Name: "a", MountPath: "/mnt/two", ReadOnly: true}}))
+	wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
+	c := agentContainer(t, e.daemonSet())
+	agentMountAt(t, c, "/mnt/one")
+	if m := agentMountAt(t, c, "/mnt/two"); m.Name != "a" || !m.ReadOnly {
+		t.Errorf("second mount = %+v", m)
+	}
+}
+
+func TestAgent_InvalidVolumeKeepsTheSecretWithAHomeNetChange(t *testing.T) {
+	e := newAgentEnv(t)
+	a := e.running()
+	secret := e.configSecret()
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.IDS = &synapsev1alpha1.AgentIDSSpec{HomeNet: []string{"203.0.113.0/24"}}
+		s.Volumes = []corev1.Volume{emptyDirVolume("Bad_Name")}
+	})
+	e.reconcile(a)
+
+	c := wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonInvalidVolumes)
+	if !strings.Contains(c.Message, `"Bad_Name"`) {
+		t.Errorf("message: %s", c.Message)
+	}
+	if c.ObservedGeneration != a.Generation {
+		t.Errorf("observedGeneration = %d, want %d", c.ObservedGeneration, a.Generation)
+	}
+	if e.configSecret().ResourceVersion != secret.ResourceVersion {
+		t.Error("the config Secret was written")
+	}
 }

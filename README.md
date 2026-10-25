@@ -416,7 +416,7 @@ Where the `SynapseProxy` controller is installed too, `config/proxy-controller` 
 
 ### Extra volumes
 
-`spec.volumes` and `spec.volumeMounts` add volumes to the agent pod. The volumes follow the operator's own in the pod. The mounts go into the Synapse container, in spec order. Each list takes at most 16 entries and is keyed by `name`, so a volume is mounted once.
+`spec.volumes` and `spec.volumeMounts` add volumes to the agent pod. The volumes follow the operator's own in the pod. The mounts go into the Synapse container, in spec order. Each list takes at most 16 entries. Volumes are keyed by `name` and mounts by `mountPath`, so one volume MAY be mounted at several paths, and two mounts on one path are refused when you create the resource.
 
 ```yaml
 spec:
@@ -434,6 +434,7 @@ This mounts the ConfigMap `my-rules` at `/etc/synapse/rules`. The default `ids.r
 
 The operator refuses the spec with `ConfigValid=False`, reason `InvalidVolumes`, when:
 
+- a volume name is not a DNS label, or a volume sets no source or more than one;
 - a volume is named `config`, `data`, `bpffs`, `debugfs`, `modules` or `eve-log`, which the operator uses;
 - a mount names a volume that `spec.volumes` does not hold;
 - a mount path is not absolute, or equals, contains or lies inside `/etc/synapse/config`, `/var/lib/synapse`, `/sys/fs/bpf`, `/sys/kernel/debug`, `/lib/modules` or `/var/log/synapse-eve`;

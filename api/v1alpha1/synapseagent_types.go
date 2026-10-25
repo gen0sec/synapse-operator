@@ -135,7 +135,7 @@ type SynapseAgentSpec struct {
 	//
 	// +optional
 	// +listType=map
-	// +listMapKey=name
+	// +listMapKey=mountPath
 	// +kubebuilder:validation:MaxItems=16
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 

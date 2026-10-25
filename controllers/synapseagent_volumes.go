@@ -1,9 +1,14 @@
 package controllers
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	corev1 "k8s.io/api/core/v1"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -30,6 +35,12 @@ func validateAgentVolumes(spec *synapsev1alpha1.SynapseAgentSpec) string {
 			if v.Name == r {
 				return fmt.Sprintf("spec.volumes: the name %q is used by the operator", v.Name)
 			}
+		}
+		if errs := validation.IsDNS1123Label(v.Name); len(errs) > 0 {
+			return fmt.Sprintf("spec.volumes: the name %q is not valid: %s", v.Name, errs[0])
+		}
+		if n := volumeSources(v.VolumeSource); n != 1 {
+			return fmt.Sprintf("spec.volumes: %q sets %d volume sources, want exactly 1", v.Name, n)
 		}
 		declared[v.Name] = true
 	}
@@ -61,4 +72,18 @@ func validateAgentVolumes(spec *synapsev1alpha1.SynapseAgentSpec) string {
 // inside the other.
 func pathsOverlap(a, b string) bool {
 	return a == b || strings.HasPrefix(a, strings.TrimSuffix(b, "/")+"/") || strings.HasPrefix(b, strings.TrimSuffix(a, "/")+"/")
+}
+
+// volumeSources counts the sources a volume sets. Every field of
+// VolumeSource is a pointer with omitempty, so the JSON form holds the set ones.
+func volumeSources(src corev1.VolumeSource) int {
+	raw, err := json.Marshal(src)
+	if err != nil {
+		return 0
+	}
+	var set map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &set); err != nil {
+		return 0
+	}
+	return len(set)
 }
