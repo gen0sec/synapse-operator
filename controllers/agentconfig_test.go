@@ -59,7 +59,7 @@ func TestRenderAgentConfig_Golden(t *testing.T) {
 		"typed-fields": {
 			APIKey: "k-123",
 			Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
-				s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"}
+				s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
 				s.Platform = &synapsev1alpha1.AgentPlatformSpec{
 					APIKeySecretRef: &synapsev1alpha1.SecretKeyReference{Name: "synapse-credentials", Key: "API_KEY"},
 					Identity:        &synapsev1alpha1.AgentIdentitySpec{Enabled: boolPtr(true), Cluster: "prod-eu"},
@@ -289,7 +289,7 @@ func TestRenderAgentConfig_RestartHash(t *testing.T) {
 	}
 
 	restart := map[string]func(*synapsev1alpha1.SynapseAgentSpec){
-		"logging.level": func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} },
+		"logging.level": func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"} },
 		"capture.interfaces": func(s *synapsev1alpha1.SynapseAgentSpec) {
 			s.Capture = &synapsev1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0"}}
 		},

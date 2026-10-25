@@ -316,7 +316,9 @@ func TestAgent_RestartFieldRollsTemplate(t *testing.T) {
 	a := e.running()
 	secret, ds := e.configSecret(), e.daemonSet()
 
-	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Logging = &synapsev1alpha1.LoggingSpec{Level: "debug"} })
+	e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Logging = &synapsev1alpha1.AgentLoggingSpec{Level: "debug"}
+	})
 	e.reconcile(a)
 
 	now := e.daemonSet()

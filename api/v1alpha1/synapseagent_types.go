@@ -121,7 +121,7 @@ type SynapseAgentSpec struct {
 	// Logging configures the agent's own logs.
 	//
 	// +optional
-	Logging *LoggingSpec `json:"logging,omitempty"`
+	Logging *AgentLoggingSpec `json:"logging,omitempty"`
 
 	// Platform connects the agent to the Gen0Sec platform.
 	//
@@ -182,6 +182,55 @@ type AgentCaptureSpec struct {
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
 	Interfaces []string `json:"interfaces,omitempty"`
+}
+
+// AgentLoggingSpec configures the agent's own logs and its EVE log.
+type AgentLoggingSpec struct {
+	// Level is the minimum severity logged. Empty leaves Synapse's default.
+	//
+	// +optional
+	// +kubebuilder:validation:Enum=error;warn;info;debug;trace
+	Level string `json:"level,omitempty"`
+
+	// Eve writes Synapse's EVE log: alert, http and stats events as JSON
+	// lines. Unset or disabled, nothing is written.
+	//
+	// +optional
+	Eve *EveLogSpec `json:"eve,omitempty"`
+}
+
+// EveLogSpec configures where the EVE log goes.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || self.output == 'file'",message="hostPath is only for output file"
+// +kubebuilder:validation:XValidation:rule="!has(self.hostPath) || (self.hostPath.startsWith('/var/log/') && !self.hostPath.split('/').exists(s, s == '..'))",message="hostPath must be an absolute path under /var/log/ with no .. segment"
+type EveLogSpec struct {
+	// Enabled turns the EVE log on.
+	Enabled bool `json:"enabled"`
+
+	// Output is where the log goes: the pod's stdout (the default), its
+	// stderr, or a file on the node. stdout shares its stream with the block
+	// events, and stderr with Synapse's own logs. Nothing rotates the file.
+	//
+	// +optional
+	// +kubebuilder:default=stdout
+	// +kubebuilder:validation:Enum=stdout;stderr;file
+	Output string `json:"output,omitempty"`
+
+	// HostPath is the node directory that holds eve.json when output is
+	// file. Unset means /var/log/synapse. It is a guard against accidents,
+	// not a security boundary: the agent pod is privileged.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxLength=200
+	HostPath string `json:"hostPath,omitempty"`
+
+	// EventTypes selects the events written. Empty means all of them.
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:Enum=alert;http;stats
+	EventTypes []string `json:"eventTypes,omitempty"`
 }
 
 // AgentIDSSpec configures the intrusion detection of the agent.
