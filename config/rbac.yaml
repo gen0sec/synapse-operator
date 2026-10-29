@@ -9,6 +9,7 @@ kind: ClusterRole
 metadata:
   name: synapse-operator
 rules:
+  # Includes a proxy's host claim ledger, `<proxy>-host-claims`.
   - apiGroups:
       - ""
     resources:

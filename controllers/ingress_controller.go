@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +86,35 @@ type IngressReconciler struct {
 	// for the long-running sidecar; off for the --render-once
 	// initContainer (synapse isn't running yet).
 	SignalReload bool
+	// RenderExtra, when set, is called on every render with the routes and
+	// certificates of the Ingresses already in the model, to add its own
+	// before anything is written. It is how a SynapseProxy's Gateways get
+	// into the same output as its Ingresses.
+	RenderExtra func(ctx context.Context, m *renderModel) error
+	// HostOwnership gives a host to the namespace whose object claimed it
+	// first: another namespace's rule, server-alias or TLS host for it is
+	// left out and reported. Off, the first source in render order wins.
+	HostOwnership bool
+	// ExtraClaims, when set, is called when HostOwnership is on, for the
+	// claims of what RenderExtra brings, so that they are resolved with
+	// the Ingresses'.
+	ExtraClaims func() []hostClaim
+	// HostClaims, when named, is the ConfigMap that says when each claim
+	// was first seen, so that a claim is aged by that and not by the
+	// creationTimestamp of the object that makes it; see host_claims.go.
+	// Used when HostOwnership is on.
+	HostClaims types.NamespacedName
+	// LedgerReader reads the ledger without a cache. nil ⇒ Client.
+	LedgerReader client.Reader
+	// RecordClaims says this reconciler writes the ledger. Without it the
+	// ledger is read, and a claim it does not hold is aged as new.
+	RecordClaims bool
+	// EventsOn is the object the ledger's events are about: the proxy. nil
+	// ⇒ the ledger ConfigMap, which may not exist yet.
+	EventsOn runtime.Object
+	// Clock is where "now" comes from. nil ⇒ time.Now.
+	Clock func() time.Time
+
 	// GatewayAPI: also reconcile Gateway API (GatewayClass/Gateway/
 	// HTTPRoute) into the same upstreams.yaml. Requires the Gateway
 	// API CRDs to be installed.
@@ -133,6 +163,17 @@ type IngressReconciler struct {
 	// than waiting out synapse's DNS cache TTL. Falls back to ClusterIP/FQDN
 	// whenever the endpoint set is missing or empty.
 	ResolveBackendEndpoints bool
+	// IngressClassMatch, when set, decides which class names are served, in
+	// place of the comparison with IngressClassName. It is a function and
+	// not a list so that "serves no class" is a matcher returning false,
+	// never an empty value that falls back to IngressClassName.
+	IngressClassMatch func(className string) bool
+	// OwnerRef, when set, is made the controller of the upstreams ConfigMap
+	// and the certs Secret, so both are removed with their owner. An object
+	// that already exists under either name without that controller is left
+	// alone and the render fails, and the render reports on per-owner gauges
+	// rather than the process-wide ones.
+	OwnerRef *metav1.OwnerReference
 
 	ready      atomic.Bool
 	reloadOnce sync.Once
@@ -151,13 +192,18 @@ func (r *IngressReconciler) usesConfigMapOutput() bool {
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
-	changed, n, h, err := r.render(ctx)
+	var certsFailed int
+	var claimsNotRecorded bool
+	changed, n, h, err := r.renderCounting(ctx, &certsFailed, &claimsNotRecorded)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if changed {
 		logger.Info("rendered synapse upstreams",
 			"ingresses", n, "hosts", h, "path", r.UpstreamsOutPath)
+	}
+	if certsFailed > 0 || claimsNotRecorded {
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -175,9 +221,23 @@ func (r *IngressReconciler) RenderOnce(ctx context.Context) error {
 	return nil
 }
 
+// ingressWithSettings is one of our Ingresses with its annotations read.
+type ingressWithSettings struct {
+	ing *networkingv1.Ingress
+	a   annSettings
+}
+
 // render lists all matching Ingresses and rewrites upstreams.yaml.
 // Returns (changed, matchedIngresses, hosts, err).
 func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) {
+	return r.renderCounting(ctx, new(int), new(bool))
+}
+
+// renderCounting is render that also reports in *certsFailed how many
+// certificates it could not write, and in *claimsNotRecorded whether the claim
+// ledger could not be written. The caller owns both, so renders that run at
+// the same time cannot hide each other's failures.
+func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int, claimsNotRecorded *bool) (bool, int, int, error) {
 	mRenderTotal.Inc()
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
@@ -187,11 +247,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	// Whole config is rebuilt from scratch every reconcile:
 	// idempotent and self-healing. ACME HTTP-01 challenge paths are
-	// special-cased into `internal_paths` (see routes.go) because
-	// synapse registers a built-in default `/.well-known/
-	// acme-challenge/* -> (empty) internal ACME server` matched BEFORE
-	// host `upstreams:` routes; cert-manager's ephemeral solver lands
-	// there. Per-Ingress annotations configure upstream settings.
+	// special-cased into solvers (see routes.go): each is written as a
+	// path of the host that serves its name, since synapse tries
+	// `internal_paths` BEFORE any host and one entry there would send
+	// every challenge to one solver. Per-Ingress annotations configure
+	// upstream settings.
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
 
@@ -211,6 +271,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 
 	matched := 0
 	var matchedIngs []*networkingv1.Ingress
+	var ours []ingressWithSettings
 	for i := range list.Items {
 		ing := &list.Items[i]
 		if !r.isOurs(ing, defaultOurs) {
@@ -222,6 +283,52 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if a.sticky {
 			m.sticky = true
 		}
+		ours = append(ours, ingressWithSettings{ing: ing, a: a})
+	}
+
+	if r.HostOwnership {
+		var claims []hostClaim
+		for _, o := range ours {
+			claims = append(claims, ingressClaims(o.ing, o.a)...)
+		}
+		if r.ExtraClaims != nil {
+			claims = append(claims, r.ExtraClaims()...)
+		}
+		var err error
+		if claims, err = r.ageClaims(ctx, claims, claimsNotRecorded); err != nil {
+			mRenderErrTotal.Inc()
+			return false, 0, 0, err
+		}
+		m.owners = resolveHostOwners(claims)
+	}
+	var served, refusedIngs []*networkingv1.Ingress
+	for _, ing := range matchedIngs {
+		if m.fullyRefused(ing) {
+			refusedIngs = append(refusedIngs, ing)
+		} else {
+			served = append(served, ing)
+		}
+	}
+
+	for _, o := range ours {
+		ing, a := o.ing, o.a
+		refused := map[string]bool{}
+		allowed := func(host string) bool { return r.hostAllowed(logger, m, ing, host, refused) }
+		// An alias that is no host name Synapse's v2 file takes is left out
+		// here, `*` and `www.*` included.
+		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool {
+			problem := hostProblem(alias)
+			if alias == "" || problem == "" {
+				return false
+			}
+			logger.Info("server-alias ignored: not a host name Synapse takes",
+				"alias", alias, "ingress", ing.Namespace+"/"+ing.Name, "problem", problem)
+			r.emit(ing, corev1.EventTypeWarning, "InvalidServerAlias",
+				"server-alias %s cannot be used as a host: %s; this alias is ignored", alias, problem)
+			return true
+		})
+		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
+		r.reportRedirectCode(ctx, ing, a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -238,20 +345,23 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			}
 			if len(hosts) == 0 {
 				stem, _ := certStem("", ing.Namespace, t.SecretName)
-				m.addCert("", stem, ing.Namespace, t.SecretName)
+				m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				continue
 			}
 			for _, h := range hosts {
+				if !allowed(h) {
+					continue
+				}
 				if stem, bound := certStem(h, ing.Namespace, t.SecretName); bound {
-					m.addCert(h, stem, ing.Namespace, t.SecretName)
+					m.addCert(h, stem, ing.Namespace, t.SecretName, ing)
 				} else {
-					m.addCert("", stem, ing.Namespace, t.SecretName)
+					m.addCert("", stem, ing.Namespace, t.SecretName, ing)
 				}
 			}
 		}
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
-			if host == "" || rule.HTTP == nil {
+			if host == "" || rule.HTTP == nil || !allowed(host) {
 				continue
 			}
 			// ssl-passthrough: synapse routes the raw TLS stream to a
@@ -298,6 +408,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				// render a synapse match_expr regex route (under the primary host
 				// and any server-aliases). Otherwise fall through to prefix/Exact.
 				if a.useRegex {
+					// As Synapse's engine will read it, or not at all: an
+					// expression it cannot compile is an error in a v2 file,
+					// and the file is every route there is.
+					written, ok := r.canonicalRegexPath(logger, ing, path, " on host "+host)
+					if !ok {
+						continue
+					}
+					path = written
 					if !m.addRegexRoute(host, path, servers, a, nil, nil) {
 						logger.Info("regex route conflict ignored (first-writer-wins)",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
@@ -320,19 +438,18 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 					continue
 				}
 				if p.PathType != nil && *p.PathType == networkingv1.PathTypeExact {
-					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse v1 matches longest-prefix)",
+					logger.Info("Ingress Exact pathType is approximated as a prefix (synapse matches longest-prefix)",
 						"ingress", ing.Namespace+"/"+ing.Name, "host", host, "path", path)
 					mUnsupportedMatch.Inc()
 					r.emit(ing, corev1.EventTypeWarning, "UnsupportedMatch",
-						"Exact pathType on host %s path %s is approximated as a prefix (synapse v1 matches longest-prefix)", host, path)
+						"Exact pathType on host %s path %s is approximated as a prefix (synapse matches longest-prefix)", host, path)
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
-					// m.acme is a single address, so the solver keeps
-					// Service addressing rather than pinning one pod.
-					if m.acme == "" {
-						if a, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
-							m.acme = a
-						}
+					// The solver keeps Service addressing rather than
+					// pinning one pod.
+					if addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
+						m.addSolver(host, path, addr)
+						m.solverFrom(ing, host)
 					}
 					continue
 				}
@@ -365,6 +482,25 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	if r.GatewayAPI {
 		matched += r.renderGateways(ctx, m)
 	}
+	if r.RenderExtra != nil {
+		if err := r.RenderExtra(ctx, m); err != nil {
+			mRenderErrTotal.Inc()
+			return false, 0, 0, err
+		}
+	}
+
+	m.holdOwnedHosts(logger)
+
+	// A solver that the file has no place for, now that every host is
+	// known.
+	for _, s := range m.solverSources {
+		if by, ok := m.solverHost(s.host); !ok {
+			logger.Info("solver ignored: its host is passed through",
+				"host", s.host, "passthrough_host", by, "from", s.obj.GetNamespace()+"/"+s.obj.GetName())
+			r.emit(s.obj, corev1.EventTypeWarning, "SolverUnreachable",
+				"host %s is passed through as %s, and no path of a passthrough host is served; this challenge is not answered", s.host, by)
+		}
+	}
 
 	// Project referenced TLS Secrets. Central mode (CertsOutSecret set)
 	// writes them into a Secret the separate proxy pod mounts; sidecar
@@ -376,9 +512,11 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 			mRenderErrTotal.Inc()
 			return false, matched, len(m.hosts), fmt.Errorf("project certs to secret: %w", cerr)
 		}
-	} else if _, _, cerr := r.projectCerts(ctx, m); cerr != nil {
+	} else if _, _, failed, cerr := r.writeCerts(ctx, m); cerr != nil {
 		mRenderErrTotal.Inc()
 		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
+	} else {
+		*certsFailed = failed
 	}
 
 	hosts, routes := 0, 0
@@ -388,16 +526,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 	}
 	hosts += len(m.passthroughHosts)
 
-	// Schema selection: any SNI passthrough host forces v2 emission
-	// (the v1 schema has no passthrough representation). Otherwise
-	// keep emitting v1 so unrelated deployments see zero behaviour
-	// change.
-	var yaml string
-	if len(m.passthroughHosts) > 0 {
-		yaml = renderUpstreamsV2(m)
-	} else {
-		yaml = renderUpstreams(m)
-	}
+	yaml := renderUpstreamsV2(m)
 	var (
 		changed bool
 		err     error
@@ -417,9 +546,14 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		}
 	}
 
-	mHosts.Set(float64(hosts))
-	mRoutes.Set(float64(routes))
-	mLastRenderTS.SetToCurrentTime()
+	if r.OwnerRef != nil {
+		mProxyHosts.WithLabelValues(r.UpstreamsOutConfigMap.Namespace, r.OwnerRef.Name).Set(float64(hosts))
+		mProxyRoutes.WithLabelValues(r.UpstreamsOutConfigMap.Namespace, r.OwnerRef.Name).Set(float64(routes))
+	} else {
+		mHosts.Set(float64(hosts))
+		mRoutes.Set(float64(routes))
+		mLastRenderTS.SetToCurrentTime()
+	}
 	if changed {
 		mRenderChangedTotal.Inc()
 		// SignalReload only makes sense in sidecar mode — central mode
@@ -428,17 +562,67 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 		if r.SignalReload && !r.usesConfigMapOutput() {
 			r.signalReload(ctx)
 		}
-		for _, ing := range matchedIngs {
+		for _, ing := range served {
 			r.emit(ing, corev1.EventTypeNormal, "Programmed",
 				"programmed into synapse upstreams (%d hosts, %d routes)", hosts, routes)
 		}
 	}
-	r.publishStatus(ctx, matchedIngs)
+	r.publishStatus(ctx, served, refusedIngs)
 
-	if r.ready.CompareAndSwap(false, true) {
+	if r.ready.CompareAndSwap(false, true) && r.OwnerRef == nil {
 		mReady.Set(1)
 	}
 	return changed, matched, hosts, nil
+}
+
+// fullyRefused reports whether ing names a host in its rules and the
+// namespace of ing may use none of them. Such an Ingress has no route in the
+// file; one that keeps any host is served.
+func (m *renderModel) fullyRefused(ing *networkingv1.Ingress) bool {
+	named := false
+	for _, rule := range ing.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		named = true
+		if m.owners.allows(rule.Host, ing.Namespace) {
+			return false
+		}
+	}
+	return named
+}
+
+// hostAllowed reports whether the namespace of ing may use host. A host it
+// may not use is said once per Ingress, to the Ingress, in the log and in the
+// counter.
+func (r *IngressReconciler) hostAllowed(logger logr.Logger, m *renderModel, ing *networkingv1.Ingress, host string, said map[string]bool) bool {
+	if m.owners != nil && host != "" && !validClaimHost(host) {
+		// Not a host name, and so no claim to compare: it is not passed as
+		// unowned either.
+		if said[host] {
+			return false
+		}
+		said[host] = true
+		logger.Info("host ignored: not a host name", "host", host, "ingress", ing.Namespace+"/"+ing.Name)
+		r.emit(ing, corev1.EventTypeWarning, "InvalidHostname",
+			"host %q is not a host name; this Ingress's use of it is ignored", host)
+		return false
+	}
+	if m.owners.allows(host, ing.Namespace) {
+		return true
+	}
+	key := hostKey(host)
+	if said[key] {
+		return false
+	}
+	said[key] = true
+	owner, _ := m.owners.owner(host)
+	logger.Info("host ignored: it belongs to another namespace",
+		"host", host, "owner", owner, "ingress", ing.Namespace+"/"+ing.Name)
+	mHostConflicts.Inc()
+	r.emit(ing, corev1.EventTypeWarning, "HostnameConflict",
+		"host %s belongs to namespace %s, which had it first; this Ingress's use of it is ignored", host, owner)
+	return false
 }
 
 // isOurs reports whether this Ingress is served by us. Precedence
@@ -448,18 +632,27 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 // IngressClass (defaultOurs, resolved once per render).
 func (r *IngressReconciler) isOurs(ing *networkingv1.Ingress, defaultOurs bool) bool {
 	if ing.Spec.IngressClassName != nil {
-		return *ing.Spec.IngressClassName == r.IngressClassName
+		return r.servesClass(*ing.Spec.IngressClassName)
 	}
 	if v := strings.TrimSpace(ing.Annotations["kubernetes.io/ingress.class"]); v != "" {
-		return v == r.IngressClassName
+		return r.servesClass(v)
 	}
 	return defaultOurs
+}
+
+// servesClass reports whether Ingresses of the named class are ours.
+func (r *IngressReconciler) servesClass(name string) bool {
+	if r.IngressClassMatch != nil {
+		return r.IngressClassMatch(name)
+	}
+	return name == r.IngressClassName
 }
 
 // defaultClassIsOurs is true when an IngressClass annotated
 // ingressclass.kubernetes.io/is-default-class=true is controlled by
 // us (spec.controller == ControllerName) — so Ingresses with neither
-// spec.ingressClassName nor the legacy annotation are ours.
+// spec.ingressClassName nor the legacy annotation are ours. With
+// IngressClassMatch set, that default class must also be one it serves.
 func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 	var icl networkingv1.IngressClassList
 	if err := r.List(ctx, &icl); err != nil {
@@ -470,7 +663,10 @@ func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 		if ic.Spec.Controller != ControllerName {
 			continue
 		}
-		if ic.Annotations["ingressclass.kubernetes.io/is-default-class"] == "true" {
+		if ic.Annotations["ingressclass.kubernetes.io/is-default-class"] != "true" {
+			continue
+		}
+		if r.IngressClassMatch == nil || r.IngressClassMatch(ic.Name) {
 			return true
 		}
 	}
@@ -483,6 +679,34 @@ func (r *IngressReconciler) leader() bool {
 	return r.IsLeader == nil || r.IsLeader()
 }
 
+// reportRedirectCode tells obj that its redirect code was refused, when it was.
+func (r *IngressReconciler) reportRedirectCode(ctx context.Context, obj client.Object, a annSettings) {
+	if a.redirectCodeRefused == "" {
+		return
+	}
+	ctrl.LoggerFrom(ctx).Info("redirect code ignored: not one Synapse serves",
+		"code", a.redirectCodeRefused, "object", obj.GetNamespace()+"/"+obj.GetName())
+	r.emit(obj, corev1.EventTypeWarning, "InvalidRedirectCode",
+		"redirect code %q is not one of 301, 302, 303, 307, 308; the redirect uses its default", a.redirectCodeRefused)
+}
+
+// canonicalRegexPath returns the regex path as Synapse's engine will read it.
+// An expression it cannot compile is reported as UnsupportedMatch on obj and
+// not returned: one such expression makes Synapse refuse the whole file.
+// where is appended to the event text.
+func (r *IngressReconciler) canonicalRegexPath(logger logr.Logger, obj client.Object, path, where string) (string, bool) {
+	written, err := canonicalRegex(path)
+	if err != nil {
+		logger.Info("regex path ignored: not a regular expression Synapse takes",
+			"regex", path, "object", obj.GetNamespace()+"/"+obj.GetName(), "error", err.Error())
+		mUnsupportedMatch.Inc()
+		r.emit(obj, corev1.EventTypeWarning, "UnsupportedMatch",
+			"path %s%s cannot be used as a regular expression: %v; this path is ignored", path, where, err)
+		return "", false
+	}
+	return written, true
+}
+
 // emit records a Kubernetes Event on obj (no-op when there is no
 // recorder, e.g. --render-once).
 func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
@@ -492,10 +716,11 @@ func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt strin
 	r.Recorder.Eventf(obj, etype, reason, msgFmt, args...)
 }
 
-// publishStatus writes StatusAddresses onto each matched Ingress's
-// .status.loadBalancer.ingress (idempotent: only patches on change).
-// No-op when StatusAddresses is empty.
-func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkingv1.Ingress) {
+// publishStatus writes StatusAddresses onto each served Ingress's
+// .status.loadBalancer.ingress (idempotent: only patches on change). An
+// Ingress in refused has none of its hosts served, so it shows no address, and
+// loses one it had. No-op when StatusAddresses is empty.
+func (r *IngressReconciler) publishStatus(ctx context.Context, ings, refused []*networkingv1.Ingress) {
 	if len(r.StatusAddresses) == 0 || !r.leader() {
 		return
 	}
@@ -512,14 +737,20 @@ func (r *IngressReconciler) publishStatus(ctx context.Context, ings []*networkin
 		}
 	}
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
-	for _, ing := range ings {
+	set := func(ing *networkingv1.Ingress, want []networkingv1.IngressLoadBalancerIngress) {
 		if apiequality.Semantic.DeepEqual(ing.Status.LoadBalancer.Ingress, want) {
-			continue
+			return
 		}
 		ing.Status.LoadBalancer.Ingress = want
 		if err := r.Status().Update(ctx, ing); err != nil {
 			logger.Error(err, "publish Ingress status", "ingress", ing.Namespace+"/"+ing.Name)
 		}
+	}
+	for _, ing := range ings {
+		set(ing, want)
+	}
+	for _, ing := range refused {
+		set(ing, nil)
 	}
 }
 
@@ -590,7 +821,7 @@ const acmeChallengePrefix = "/.well-known/acme-challenge"
 // (synapse-utils filewatch.rs `is_reload_event`) matches
 // Modify(Name) alongside Modify(Data)/Create/Remove, so a rename IS
 // seen. (The CERT watcher is the one that ignores renames — see
-// writeFileIfChanged in certs.go.) The reload is additionally driven
+// certTempName in certs.go.) The reload is additionally driven
 // explicitly by SIGHUP (see signalReload), which makes the re-read
 // deterministic and bypasses the watcher's content-digest gate.
 func writeIfChanged(path, content string) (bool, error) {
@@ -627,6 +858,9 @@ func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content
 	}
 	var changed bool
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if err := r.claimOutput(cm); err != nil {
+			return err
+		}
 		if cm.Labels == nil {
 			cm.Labels = map[string]string{}
 		}
@@ -653,6 +887,25 @@ func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content
 		// changed was already set inside the mutate fn
 	}
 	return changed, nil
+}
+
+// claimOutput makes OwnerRef the controller of an output object that is about
+// to be created, and refuses one that already exists under another controller
+// or none: it is somebody else's, and the routes and private keys do not
+// belong in it. A no-op without OwnerRef.
+func (r *IngressReconciler) claimOutput(obj client.Object) error {
+	if r.OwnerRef == nil {
+		return nil
+	}
+	if obj.GetResourceVersion() == "" {
+		obj.SetOwnerReferences([]metav1.OwnerReference{*r.OwnerRef})
+		return nil
+	}
+	if ref := metav1.GetControllerOf(obj); ref == nil || ref.UID != r.OwnerRef.UID {
+		return fmt.Errorf("%s/%s already exists and is not controlled by %s %s",
+			obj.GetNamespace(), obj.GetName(), r.OwnerRef.Kind, r.OwnerRef.Name)
+	}
+	return nil
 }
 
 // ingressUpstreamsManagedLabel marks a ConfigMap as written by the

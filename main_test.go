@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -10,6 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/yaml"
+
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +38,11 @@ func TestSchemeInitialization(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Deployment", gvk.Kind)
 	assert.Equal(t, "apps/v1", gvk.GroupVersion().String())
+
+	gvk, err = apiutil.GVKForObject(&synapsev1alpha1.SynapseProxy{}, scheme)
+	require.NoError(t, err)
+	assert.Equal(t, "SynapseProxy", gvk.Kind)
+	assert.Equal(t, "synapse.gen0sec.com/v1alpha1", gvk.GroupVersion().String())
 }
 
 func TestSchemeKnownTypes(t *testing.T) {
@@ -71,7 +80,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -83,7 +92,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -95,7 +104,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":9091",
 			expectedElect:     false,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -107,7 +116,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     true,
 			expectedNamespace: "",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -119,7 +128,7 @@ func TestParseFlags(t *testing.T) {
 			expectedProbe:     ":8081",
 			expectedElect:     false,
 			expectedNamespace: "test-ns",
-			expectedSelector:  "app.kubernetes.io/name=synapse",
+			expectedSelector:  defaultLabelSelector,
 			expectedAnnot:     "synapse.gen0sec.com/config-hash",
 			expectedCMKeys:    "upstreams.yaml",
 			expectedSecretKey: "",
@@ -156,7 +165,7 @@ func TestParseFlags(t *testing.T) {
 			flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 			flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 			flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
-			flag.StringVar(&selector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads.")
+			flag.StringVar(&selector, "label-selector", defaultLabelSelector, "Label selector for config sources and workloads.")
 			flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 			flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 			flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
@@ -288,4 +297,90 @@ func TestParseKeySet(t *testing.T) {
 	assert.True(t, ok)
 
 	assert.Nil(t, parseKeySet(""))
+}
+
+func TestProxyControllerConflict(t *testing.T) {
+	tests := []struct {
+		name                                     string
+		proxyController, ingressMode, configSync bool
+		want                                     string
+	}{
+		{name: "alone", proxyController: true},
+		{name: "off, with ingress mode", ingressMode: true},
+		{name: "off, with config-sync", configSync: true},
+		{name: "with ingress mode", proxyController: true, ingressMode: true, want: "--ingress-mode"},
+		{name: "with config-sync", proxyController: true, configSync: true, want: "--config-sync"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := proxyControllerConflict(tt.proxyController, tt.ingressMode, tt.configSync)
+			if tt.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, "--proxy-controller")
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}
+
+func TestAgentControllerConflict(t *testing.T) {
+	tests := []struct {
+		name                                     string
+		agentController, ingressMode, configSync bool
+		want                                     string
+	}{
+		{name: "alone", agentController: true},
+		{name: "off, with ingress mode", ingressMode: true},
+		{name: "off, with config-sync", configSync: true},
+		{name: "with ingress mode", agentController: true, ingressMode: true, want: "--ingress-mode"},
+		{name: "with config-sync", agentController: true, configSync: true, want: "--config-sync"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := agentControllerConflict(tt.agentController, tt.ingressMode, tt.configSync)
+			if tt.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, "--agent-controller")
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}
+
+// config/crd/kustomization.yaml is written by hand, and what it lists is
+// generated. A kind added under api/ gets its CRD written to bases/ without
+// anything else noticing, and would then be missing from every install that
+// goes through the kustomization.
+func TestCRDKustomizationListsEveryCRD(t *testing.T) {
+	raw, err := os.ReadFile("config/crd/kustomization.yaml")
+	require.NoError(t, err)
+	var kustomization struct {
+		Resources []string `json:"resources"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &kustomization))
+
+	generated, err := filepath.Glob("config/crd/bases/*.yaml")
+	require.NoError(t, err)
+	require.NotEmpty(t, generated)
+	want := make([]string, 0, len(generated))
+	for _, file := range generated {
+		want = append(want, "bases/"+filepath.Base(file))
+	}
+	assert.ElementsMatch(t, want, kustomization.Resources)
+}
+
+func TestDefaultLabelSelector(t *testing.T) {
+	selector, err := parseLabelSelector(defaultLabelSelector)
+	require.NoError(t, err)
+
+	const key = "app.kubernetes.io/name"
+	for _, name := range []string{"synapse", "synapse-proxy", "synapse-agent"} {
+		assert.True(t, selector.Matches(labels.Set{key: name}), name)
+	}
+	for _, name := range []string{"synapse-operator", "other"} {
+		assert.False(t, selector.Matches(labels.Set{key: name}), name)
+	}
+	assert.False(t, selector.Matches(labels.Set{"app": "synapse"}), "missing label")
 }

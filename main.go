@@ -24,7 +24,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
+	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 	"synapse-operator/controllers"
 )
 
@@ -39,7 +41,13 @@ func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(networkingv1.AddToScheme(scheme))
 	utilruntime.Must(gwv1.AddToScheme(scheme))
+	utilruntime.Must(gwv1beta1.AddToScheme(scheme))
+	utilruntime.Must(synapsev1alpha1.AddToScheme(scheme))
 }
+
+// defaultLabelSelector keeps the legacy "synapse" name and adds the names the
+// synapse-stack chart sets through nameOverride.
+const defaultLabelSelector = "app.kubernetes.io/name in (synapse,synapse-proxy,synapse-agent)"
 
 func main() {
 	var metricsAddr string
@@ -83,6 +91,8 @@ func main() {
 	var edgeProducer bool
 	var edgeProducerInterval time.Duration
 	var clusterID string
+	var proxyController bool
+	var agentController bool
 
 	opts := zap.Options{
 		Development: true,
@@ -93,7 +103,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
-	flag.StringVar(&labelSelector, "label-selector", "app.kubernetes.io/name=synapse", "Label selector for config sources and workloads.")
+	flag.StringVar(&labelSelector, "label-selector", defaultLabelSelector, "Label selector for config sources and workloads. Objects controlled by one of the operator's own resources are left alone even when they match.")
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
 	flag.StringVar(&ignoredConfigMapKeys, "ignore-configmap-keys", "upstreams.yaml", "Comma-separated ConfigMap keys to ignore when hashing.")
 	flag.StringVar(&ignoredSecretKeys, "ignore-secret-keys", "", "Comma-separated Secret keys to ignore when hashing.")
@@ -130,9 +140,21 @@ func main() {
 	flag.StringVar(&ensureFiles, "ensure-files", "upstreams.yaml", "config-sync: comma-separated filenames that must exist in --out-dir before synapse starts. Missing ones get a minimal valid document, because synapse-proxy aborts its whole background service (and never establishes a file watch) if the initial upstreams read fails.")
 	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
 	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
+	flag.BoolVar(&proxyController, "proxy-controller", false, "Run SynapseProxy resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its Deployment, Service and ServiceAccount, and render the routes and certificates of the Ingresses whose IngressClass names it in spec.parameters. Needs the CRD and the role in config/proxy-controller. Composable with the config-hash controller and the resolvers; cannot be combined with --ingress-mode or --config-sync.")
+	flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its DaemonSet, Secret and ServiceAccount. Needs the CRD in config/crd and the role in config/agent-controller.")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if conflict := proxyControllerConflict(proxyController, ingressMode, configSync); conflict != "" {
+		setupLog.Error(nil, conflict)
+		os.Exit(1)
+	}
+
+	if conflict := agentControllerConflict(agentController, ingressMode, configSync); conflict != "" {
+		setupLog.Error(nil, conflict)
+		os.Exit(1)
+	}
 
 	outCM, err := parseNamespacedName(upstreamsOutConfigMap)
 	if err != nil {
@@ -292,6 +314,33 @@ func main() {
 		}
 	}
 
+	if proxyController {
+		// Before the manager: one that cannot read SynapseProxy resources
+		// would wait for them forever and start nothing.
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "--proxy-controller: client")
+			os.Exit(1)
+		}
+		if err := controllers.CheckProxyAccess(context.Background(), cl, watchedNamespace); err != nil {
+			setupLog.Error(err, "--proxy-controller cannot run")
+			os.Exit(1)
+		}
+	}
+
+	if agentController {
+		// Before the manager, for the reason above.
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "--agent-controller: client")
+			os.Exit(1)
+		}
+		if err := controllers.CheckAgentAccess(context.Background(), cl, watchedNamespace); err != nil {
+			setupLog.Error(err, "--agent-controller cannot run")
+			os.Exit(1)
+		}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -387,6 +436,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	if proxyController {
+		if err = controllers.SetupProxyControllers(context.Background(), mgr, clusterDomain, watchedNamespace); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "SynapseProxy")
+			os.Exit(1)
+		}
+		setupLog.Info("SynapseProxy controllers enabled")
+	}
+
+	if agentController {
+		if err = controllers.SetupAgentControllers(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "SynapseAgent")
+			os.Exit(1)
+		}
+		setupLog.Info("SynapseAgent controller enabled")
+	}
+
 	if upstreamsResolver {
 		ur := &controllers.UpstreamsResolverReconciler{
 			Client:        mgr.GetClient(),
@@ -465,6 +530,38 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// proxyControllerConflict says why --proxy-controller cannot run with the
+// other modes chosen, or returns "".
+func proxyControllerConflict(proxyController, ingressMode, configSync bool) string {
+	switch {
+	case !proxyController:
+		return ""
+	case ingressMode:
+		// Both render Ingresses, into different places, and would each
+		// publish an address on the same ones.
+		return "--proxy-controller cannot be combined with --ingress-mode"
+	case configSync:
+		// A sidecar in a proxy's pod, with that pod's permissions.
+		return "--proxy-controller cannot be combined with --config-sync"
+	}
+	return ""
+}
+
+// agentControllerConflict says why --agent-controller cannot run with the
+// other modes chosen, or returns "".
+func agentControllerConflict(agentController, ingressMode, configSync bool) string {
+	switch {
+	case !agentController:
+		return ""
+	case ingressMode:
+		return "--agent-controller cannot be combined with --ingress-mode"
+	case configSync:
+		// A sidecar in a proxy's pod, with that pod's permissions.
+		return "--agent-controller cannot be combined with --config-sync"
+	}
+	return ""
 }
 
 func parseLabelSelector(value string) (labels.Selector, error) {

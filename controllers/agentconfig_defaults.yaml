@@ -1,0 +1,52 @@
+# Synapse settings the operator applies to a SynapseAgent unless spec.config
+# says otherwise. Keys the operator owns outright are not here: see
+# agentOwnedConfigKeys in agentconfig.go.
+#
+# Only settings that differ from Synapse's built-in defaults are listed, plus
+# the ones the pod depends on.
+#
+# The `platform` and `logging` sections must always be rendered. When either
+# is missing altogether, Synapse does not apply its per-key defaults to it:
+# telemetry, the threat feed and GeoIP all come up disabled.
+
+mode: agent
+
+multi_thread: true
+
+daemon:
+  enabled: false
+  # Synapse keeps its cached copy of the platform configuration here. Its own
+  # default is "/"; the pod mounts a volume at this path instead.
+  working_directory: /var/lib/synapse
+
+network:
+  iface: auto
+
+firewall:
+  mode: auto
+
+ids:
+  enabled: true
+  enforce_block: false
+  # A rule path is what starts the engine, even when it matches no file. The
+  # rules managed on the platform load next to whatever is found here.
+  rule_paths:
+    - /etc/synapse/rules/*.rules
+  address_vars:
+    EXTERNAL_NET: "!$HOME_NET"
+
+logging:
+  level: info
+  # Log to stdout, where `kubectl logs` reads.
+  file_logging_enabled: false
+
+platform:
+  # Both feeds are enabled by default in Synapse, but download nothing until
+  # they are told where from and where to.
+  threat:
+    url: https://download.gen0sec.com/v1
+    path: /var/lib/synapse
+  geoip:
+    country:
+      url: https://github.com/gen0sec/geoip-databases/raw/download/ipinfo_lite.mmdb
+      path: /var/lib/synapse/ipinfo_lite.mmdb

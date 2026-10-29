@@ -20,7 +20,7 @@ import (
 const ControllerName = "gen0sec.com/synapse"
 
 // renderGateways merges HTTPRoutes (attached to Gateways of a
-// GatewayClass we control) into the same host/path map + acmeBackend
+// GatewayClass we control) into the same host/path map + solvers
 // the Ingress path uses, and sets the GatewayClass/Gateway/HTTPRoute
 // status conditions cert-manager's gatewayHTTPRoute solver waits on.
 // Tolerant of the Gateway API CRDs being absent (returns silently).
@@ -85,9 +85,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					ns = string(*cr.Namespace)
 				}
 				if stem, bound := certStem(host, ns, string(cr.Name)); bound {
-					m.addCert(host, stem, ns, string(cr.Name))
+					m.addCert(host, stem, ns, string(cr.Name), gw)
 				} else {
-					m.addCert("", stem, ns, string(cr.Name))
+					m.addCert("", stem, ns, string(cr.Name), gw)
 				}
 			}
 		}
@@ -138,6 +138,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		}
 		matched++
 		a := parseAnnotations(rt.Annotations)
+		r.reportRedirectCode(ctx, rt, a)
 		if a.sticky {
 			m.sticky = true
 		}
@@ -150,7 +151,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)
 			for _, w := range warns {
-				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
+				logger.Info("HTTPRoute match feature not representable in synapse (best-effort)",
 					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
 				mUnsupportedMatch.Inc()
 				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", "%s", w)
@@ -159,9 +160,8 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				for _, h := range hostnames {
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
-						if m.acme == "" {
-							m.acme = servers[0].addr
-						}
+						m.addSolver(host, path, servers[0].addr)
+						m.solverFrom(rt, host)
 						continue
 					}
 					if !m.addRoute(host, path, servers, a, req, resp) {
@@ -173,7 +173,11 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					}
 				}
 			}
-			for _, rx := range regexes {
+			for _, raw := range regexes {
+				rx, ok := r.canonicalRegexPath(logger, rt, raw, "")
+				if !ok {
+					continue
+				}
 				for _, h := range hostnames {
 					host := string(h)
 					if !m.addRegexRoute(host, rx, servers, a, req, resp) {
@@ -197,7 +201,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 // headerFilters maps HTTPRoute Request/ResponseHeaderModifier filters
 // to synapse request_headers/response_headers injection lines
 // ("Name: value"). Header `remove` and `URLRewrite`/`RequestMirror`
-// have no equivalent in synapse's v1 per-path schema and are left
+// have no equivalent in synapse's per-path schema and are left
 // unmodified (not silently faked).
 func headerFilters(filters []gwv1.HTTPRouteFilter) (req, resp []string) {
 	conv := func(f *gwv1.HTTPHeaderFilter) []string {
@@ -284,7 +288,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 	for _, mt := range rule.Matches {
 		if len(mt.Headers) > 0 || mt.Method != nil || len(mt.QueryParams) > 0 {
 			warnings = append(warnings,
-				"header/method/queryParam match conditions are ignored (synapse v1 routes on host+path only)")
+				"header/method/queryParam match conditions are ignored (synapse routes on host+path only)")
 		}
 		pv := "/"
 		pt := gwv1.PathMatchPathPrefix
@@ -303,7 +307,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 			continue
 		case gwv1.PathMatchExact:
 			warnings = append(warnings,
-				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse v1 matches longest-prefix)", pv))
+				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse matches longest-prefix)", pv))
 		}
 		paths = append(paths, pv)
 	}
