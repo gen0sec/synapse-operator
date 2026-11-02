@@ -80,6 +80,11 @@ type IngressReconciler struct {
 	CertsOutSecret types.NamespacedName
 	// ClusterDomain for backend FQDNs (default cluster.local).
 	ClusterDomain string
+	// StickySecretFile is the path, in the proxy's pods, of the key sticky
+	// sessions sign with. Empty, there is none: Synapse refuses a file that
+	// turns sticky sessions on without one, so the annotation is ignored and
+	// said so on the object that carries it.
+	StickySecretFile string
 	// SignalReload: after a changed render, SIGHUP the co-located
 	// synapse process to deterministically trigger an upstreams
 	// re-read (requires the pod's shareProcessNamespace:true). Set
@@ -256,6 +261,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	// upstream settings.
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
+	m.stickySecretFile = r.StickySecretFile
 
 	// Deterministic source order: Ingresses sorted by ns/name and
 	// processed BEFORE HTTPRoutes (first-writer-wins in addRoute), so
@@ -282,6 +288,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		matched++
 		matchedIngs = append(matchedIngs, ing)
 		a := parseAnnotations(ing.Annotations)
+		r.dropStickyWithoutKey(ing, &a)
 		if a.sticky {
 			m.sticky = true
 		}
@@ -705,6 +712,17 @@ func (r *IngressReconciler) defaultClassIsOurs(ctx context.Context) bool {
 // status. nil gate ⇒ always leader (unchanged single-writer behavior).
 func (r *IngressReconciler) leader() bool {
 	return r.IsLeader == nil || r.IsLeader()
+}
+
+// dropStickyWithoutKey turns sticky sessions off for an object when there is
+// no key file to name, and says so on the object.
+func (r *IngressReconciler) dropStickyWithoutKey(obj client.Object, a *annSettings) {
+	if !a.sticky || r.StickySecretFile != "" {
+		return
+	}
+	a.sticky = false
+	r.emit(obj, corev1.EventTypeWarning, "StickySessionsUnavailable",
+		"sticky sessions need a signing key file the proxy mounts; this deployment mode has none, so the annotation is ignored")
 }
 
 // reportRedirectCode tells obj that its redirect code was refused, when it was.

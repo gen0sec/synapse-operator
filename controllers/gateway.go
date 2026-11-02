@@ -142,6 +142,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		r.reportRedirectCode(ctx, rt, a)
 		r.reportUpstreamTLS(ctx, rt, a)
 		r.resolveUpstreamCA(ctx, m, rt, &a)
+		r.dropStickyWithoutKey(rt, &a)
 		if a.sticky {
 			m.sticky = true
 		}

@@ -25,7 +25,8 @@ type v2File struct {
 			Forward *bool `json:"forward"`
 		} `json:"fingerprints"`
 		StickySessions struct {
-			Enabled bool `json:"enabled"`
+			Enabled    bool   `json:"enabled"`
+			SecretFile string `json:"secret_file"`
 		} `json:"sticky_sessions"`
 	} `json:"proxy"`
 	UpstreamTLS *v2TLSOf `json:"upstream_tls"`
