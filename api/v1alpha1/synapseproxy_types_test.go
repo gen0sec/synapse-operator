@@ -521,3 +521,36 @@ func TestSynapseProxy_IsDiscoverableByShortNameAndCategory(t *testing.T) {
 	}
 	t.Fatalf("synapseproxies not served; got %+v", list.APIResources)
 }
+
+func TestSynapseProxy_UpstreamTLS(t *testing.T) {
+	t.Run("the CA key defaults to ca.crt", func(t *testing.T) {
+		p := validProxy()
+		p.Spec.UpstreamTLS = &v1alpha1.UpstreamTLSSpec{CASecretRef: &v1alpha1.CASecretReference{Name: "internal-ca"}}
+		mustCreate(t, p)
+		var got v1alpha1.SynapseProxy
+		if err := k8s.Get(context.Background(), client.ObjectKeyFromObject(p), &got); err != nil {
+			t.Fatal(err)
+		}
+		if ref := got.Spec.UpstreamTLS.CASecretRef; ref == nil || ref.Key != "ca.crt" {
+			t.Errorf("caSecretRef = %+v, want the key defaulted to ca.crt", ref)
+		}
+	})
+	t.Run("verify alone is accepted", func(t *testing.T) {
+		f := false
+		p := validProxy()
+		p.Spec.UpstreamTLS = &v1alpha1.UpstreamTLSSpec{Verify: &f}
+		mustCreate(t, p)
+	})
+	t.Run("a CA reference without a Secret name is rejected", func(t *testing.T) {
+		p := validProxy()
+		p.Spec.UpstreamTLS = &v1alpha1.UpstreamTLSSpec{CASecretRef: &v1alpha1.CASecretReference{Key: "ca.crt"}}
+		err := k8s.Create(context.Background(), p)
+		if err == nil {
+			_ = k8s.Delete(context.Background(), p)
+			t.Fatal("accepted, want it rejected")
+		}
+		if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "spec.upstreamTLS.caSecretRef.name") {
+			t.Errorf("got %v, want an Invalid error naming spec.upstreamTLS.caSecretRef.name", err)
+		}
+	})
+}

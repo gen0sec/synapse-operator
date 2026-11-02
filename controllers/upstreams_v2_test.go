@@ -25,10 +25,12 @@ type v2File struct {
 			Forward *bool `json:"forward"`
 		} `json:"fingerprints"`
 		StickySessions struct {
-			Enabled bool `json:"enabled"`
+			Enabled    bool   `json:"enabled"`
+			SecretFile string `json:"secret_file"`
 		} `json:"sticky_sessions"`
 	} `json:"proxy"`
-	Internal []struct {
+	UpstreamTLS *v2TLSOf `json:"upstream_tls"`
+	Internal    []struct {
 		Path     string `json:"path"`
 		Upstream string `json:"upstream"`
 	} `json:"internal"`
@@ -68,8 +70,9 @@ type v2Route struct {
 		Status   int    `json:"status"`
 		Location string `json:"location"`
 	} `json:"redirect"`
-	Timeouts v2Timeouts `json:"timeouts"`
-	Headers  struct {
+	UpstreamTLS *v2TLSOf   `json:"upstream_tls"`
+	Timeouts    v2Timeouts `json:"timeouts"`
+	Headers     struct {
 		Request  []string `json:"request"`
 		Response []string `json:"response"`
 	} `json:"headers"`
