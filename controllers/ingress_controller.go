@@ -405,7 +405,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				// its Service unless the Ingress names another.
 				a := a
 				if a.upstreamTLS.sni == "" {
-					a.upstreamTLS.sni = serviceFQDN(ing.Namespace, p.Backend.Service.Name, r.ClusterDomain)
+					a.upstreamTLS.sni = defaultSNI(ing.Namespace, p.Backend.Service.Name, r.ClusterDomain)
 				}
 				path := p.Path
 				if path == "" {

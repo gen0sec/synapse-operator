@@ -12,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -935,16 +936,22 @@ func usableSNI(sni string) bool {
 			}
 		}
 	}
-	// A URL parser reads a name that ends in a number as an IPv4 address and
-	// rewrites it.
+	// A URL parser reads a name that ends in a number as an IPv4 address, of
+	// any length, and rewrites it or refuses it.
 	last := strings.ToLower(labels[len(labels)-1])
-	if rest, ok := strings.CutPrefix(last, "0x"); ok {
-		if _, err := strconv.ParseUint("0"+rest, 16, 64); err == nil {
-			return false
-		}
-	}
-	if _, err := strconv.ParseUint(last, 10, 64); err == nil {
+	if rest, ok := strings.CutPrefix(last, "0x"); ok && strings.Trim(rest, "0123456789abcdef") == "" {
 		return false
+	}
+	if strings.Trim(last, "0123456789") == "" {
+		return false
+	}
+	// A URL parser decodes an xn-- label and refuses one that does not decode.
+	for _, l := range labels {
+		if len(l) >= 4 && strings.EqualFold(l[:4], "xn--") {
+			if _, err := idna.Lookup.ToUnicode(l); err != nil {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -1451,4 +1458,13 @@ func writeTransformsV2(b *strings.Builder, rc *routeCfg) {
 	b.WriteString("        transforms:\n")
 	rule("request_headers", rc.reqRemove, rc.reqAdd)
 	rule("response_headers", rc.respRemove, rc.respAdd)
+}
+
+// defaultSNI is the name a back-end of Service svc is checked against when
+// the route names none. It is empty when Synapse could not use it.
+func defaultSNI(ns, svc, clusterDomain string) string {
+	if name := serviceFQDN(ns, svc, clusterDomain); usableSNI(name) {
+		return name
+	}
+	return ""
 }

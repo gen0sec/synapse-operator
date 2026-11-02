@@ -365,7 +365,10 @@ func (r *IngressReconciler) ruleServiceNames(rt *gwv1.HTTPRoute, rule gwv1.HTTPR
 		if !ok {
 			continue
 		}
-		fqdn := serviceFQDN(ns, name, r.ClusterDomain)
+		fqdn := defaultSNI(ns, name, r.ClusterDomain)
+		if fqdn == "" {
+			continue
+		}
 		if !slices.Contains(names, fqdn) {
 			names = append(names, fqdn)
 		}

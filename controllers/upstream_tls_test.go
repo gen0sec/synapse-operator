@@ -77,9 +77,21 @@ func TestUsableSNI(t *testing.T) {
 		"a.test/x", "a/b", "a.test?x", "a?b", "a.test#x", "a#b", "u@host", "a@b", "a%41.test", "a%b",
 		"a.test b", "a b", " a.test", "a.test:80", "a:443",
 		"127.1", "0x7f.1", "2130706433", "bücher.test", "bücher.example", "*.example.com",
+		"a.99999999999999999999999", "a.0xFFFFFFFFFFFFFFFFFFFF", "a.0x", "a.1.", "xn--a", "xn--zzzzzz.test", "XN--A.test",
 	} {
 		if usableSNI(sni) {
 			t.Errorf("%q cannot be used as written", sni)
+		}
+	}
+}
+
+func TestDefaultSNI_IsDroppedWhenSynapseCannotUseIt(t *testing.T) {
+	if got := defaultSNI("shop", "app", ""); got != "app.shop.svc.cluster.local" {
+		t.Errorf("usable default: %q", got)
+	}
+	for _, cd := range []string{"k8s.1", "bücher.test", "xn--a"} {
+		if got := defaultSNI("shop", "app", cd); got != "" {
+			t.Errorf("cluster domain %q: default SNI %q, want none", cd, got)
 		}
 	}
 }
