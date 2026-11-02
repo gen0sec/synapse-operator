@@ -49,7 +49,7 @@ type SynapseProxyList struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.hostNetwork) || !self.hostNetwork || !has(self.service) || !has(self.service.type) || self.service.type == 'ClusterIP'",message="hostNetwork needs a Service of type ClusterIP: the pods are reached on the node's own ports"
 type SynapseProxySpec struct {
 	// Image is the Synapse container image, tag or digest included. It has
-	// to be Synapse 0.8.5 or newer: older releases do not read the listeners
+	// to be Synapse 0.8.9 or newer: older releases do not read the listeners
 	// this resource renders, and would start without binding any.
 	//
 	// +kubebuilder:validation:MinLength=1
@@ -157,6 +157,12 @@ type SynapseProxySpec struct {
 	//
 	// +optional
 	Platform *PlatformSpec `json:"platform,omitempty"`
+
+	// UpstreamTLS is how the proxy checks the certificates of back-ends it
+	// reaches over TLS, for every route that does not say otherwise.
+	//
+	// +optional
+	UpstreamTLS *UpstreamTLSSpec `json:"upstreamTLS,omitempty"`
 
 	// HostOwnership decides who owns a host name among the namespaces whose
 	// Ingresses this proxy serves. With Namespace, a host goes to the
@@ -275,6 +281,39 @@ type SecretKeyReference struct {
 	//
 	// +kubebuilder:validation:MinLength=1
 	Key string `json:"key"`
+}
+
+// UpstreamTLSSpec is the proxy-wide default for TLS to back-ends. An Ingress
+// or HTTPRoute annotation for one route overrides it.
+type UpstreamTLSSpec struct {
+	// Verify says whether back-end certificates are checked. Unset leaves
+	// it to Synapse, which checks them.
+	//
+	// +optional
+	Verify *bool `json:"verify,omitempty"`
+
+	// CASecretRef names the Secret key, in the namespace of the proxy, that
+	// holds the PEM certificates a back-end's certificate is checked against.
+	// Without it they are checked against the system roots.
+	//
+	// +optional
+	CASecretRef *CASecretReference `json:"caSecretRef,omitempty"`
+}
+
+// CASecretReference names one key of a Secret in the same namespace that
+// holds a CA bundle.
+type CASecretReference struct {
+	// Name is the name of the Secret.
+	//
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Key is the key within the Secret.
+	//
+	// +optional
+	// +kubebuilder:default=ca.crt
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key,omitempty"`
 }
 
 // SynapseProxyStatus is the observed state of a SynapseProxy.
