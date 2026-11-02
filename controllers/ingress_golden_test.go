@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -70,12 +71,19 @@ func olderModeObjects() []client.Object {
 // returns the routes file and a sorted listing of the certificates dir.
 func renderOlderMode(t *testing.T, objs []client.Object) string {
 	t.Helper()
+	return renderOlderModeWith(t, objs, nil)
+}
+
+// renderOlderModeWith is renderOlderMode with events sent to recorder.
+func renderOlderModeWith(t *testing.T, objs []client.Object, recorder record.EventRecorder) string {
+	t.Helper()
 	dir := t.TempDir()
 	r := &IngressReconciler{
 		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).
 			WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build(),
 		IngressClassName: "synapse", ClusterDomain: "cluster.local", GatewayAPI: true,
 		UpstreamsOutPath: filepath.Join(t.TempDir(), "upstreams.yaml"), CertsOutDir: dir,
+		Recorder: recorder,
 	}
 	if _, _, _, err := r.render(context.Background()); err != nil {
 		t.Fatalf("render: %v", err)

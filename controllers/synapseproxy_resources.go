@@ -22,9 +22,20 @@ const (
 	// proxyPartLabel tells the owned objects of one proxy apart.
 	proxyPartLabel  = "synapse.gen0sec.com/part"
 	proxyPartConfig = "config"
+	// proxyPartStickyKey marks the signing key Secret. It is not "config",
+	// so that pruning the config Secrets never selects it.
+	proxyPartStickyKey = "sticky-key"
 
 	proxyConfigDir = "/etc/synapse/config"
 	proxyConfigKey = "config.yaml"
+	// The signing key of sticky sessions is mounted from its own Secret and
+	// named in the routes file; it is in no file the operator renders.
+	proxyStickyDir     = "/etc/synapse/sticky"
+	proxyStickyKey     = "sticky.key"
+	proxyStickyKeyFile = proxyStickyDir + "/" + proxyStickyKey
+	// proxyStickyKeyLen is the length Synapse requires of a key, in bytes.
+	proxyStickyKeyLen = 32
+
 	// proxyDataDir is Synapse's working directory and where it downloads the
 	// threat feed and GeoIP database; see proxyconfig_defaults.yaml.
 	proxyDataDir = "/var/lib/synapse"
@@ -79,6 +90,23 @@ func buildProxyConfigSecret(p *synapsev1alpha1.SynapseProxy, cfg ProxyConfigOutp
 		Immutable:  kptr.To(true),
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{proxyConfigKey: cfg.YAML},
+	}
+}
+
+// proxyStickyKeyName is the Secret that holds the key sticky sessions sign
+// their cookies with. All pods of the proxy mount it, so they agree.
+func proxyStickyKeyName(p *synapsev1alpha1.SynapseProxy) string {
+	return p.Name + "-sticky-key"
+}
+
+func buildProxyStickyKeySecret(p *synapsev1alpha1.SynapseProxy, key []byte) *corev1.Secret {
+	meta := proxyObjectMeta(p, proxyStickyKeyName(p))
+	meta.Labels[proxyPartLabel] = proxyPartStickyKey
+	return &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: meta,
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{proxyStickyKey: key},
 	}
 }
 
@@ -178,6 +206,7 @@ func buildProxyDeployment(p *synapsev1alpha1.SynapseProxy, configSecret string) 
 			{Name: "config", MountPath: proxyConfigDir, ReadOnly: true},
 			{Name: "upstreams", MountPath: path.Dir(proxyUpstreamsFile), ReadOnly: true},
 			{Name: "certs", MountPath: proxyCertsDir, ReadOnly: true},
+			{Name: "sticky-key", MountPath: proxyStickyDir, ReadOnly: true},
 			{Name: "data", MountPath: proxyDataDir},
 		},
 	}
@@ -223,6 +252,9 @@ func buildProxyDeployment(p *synapsev1alpha1.SynapseProxy, configSecret string) 
 						}},
 						{Name: "certs", VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: proxyCertsName(p).Name},
+						}},
+						{Name: "sticky-key", VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{SecretName: proxyStickyKeyName(p), DefaultMode: kptr.To(int32(0o400))},
 						}},
 						{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					},
