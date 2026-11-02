@@ -336,6 +336,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		})
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
 		r.reportRedirectCode(ctx, ing, a)
+		r.reportUpstreamTLS(ctx, ing, a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -406,6 +407,12 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					r.emit(ing, corev1.EventTypeWarning, "BackendUnresolved",
 						"Ingress backend on host %q could not be resolved (no Service, or named port not found)", host)
 					continue
+				}
+				// A back-end that is verified is checked against the name of
+				// its Service unless the Ingress names another.
+				a := a
+				if a.upstreamTLS.sni == "" {
+					a.upstreamTLS.sni = defaultSNI(ing.Namespace, p.Backend.Service.Name, r.ClusterDomain)
 				}
 				path := p.Path
 				if path == "" {
@@ -708,6 +715,17 @@ func (r *IngressReconciler) reportRedirectCode(ctx context.Context, obj client.O
 		"redirect code %q is not one of 301, 302, 303, 307, 308; the redirect uses its default", a.redirectCodeRefused)
 }
 
+// reportUpstreamTLS says which upstream-tls annotations of obj were refused.
+// The route keeps the default for each.
+func (r *IngressReconciler) reportUpstreamTLS(ctx context.Context, obj client.Object, a annSettings) {
+	for _, refused := range a.upstreamTLS.refused {
+		ctrl.LoggerFrom(ctx).Info("upstream TLS annotation ignored",
+			"annotation", refused, "object", obj.GetNamespace()+"/"+obj.GetName())
+		r.emit(obj, corev1.EventTypeWarning, "InvalidUpstreamTLS",
+			"annotation %s cannot be used; the route keeps the default", refused)
+	}
+}
+
 // canonicalRegexPath returns the regex path as Synapse's engine will read it.
 // An expression it cannot compile is reported as UnsupportedMatch on obj and
 // not returned: one such expression makes Synapse refuse the whole file.
@@ -782,11 +800,7 @@ func (r *IngressReconciler) backendAddr(ctx context.Context, ns string, b networ
 	if b.Service == nil {
 		return "", false
 	}
-	cd := r.ClusterDomain
-	if cd == "" {
-		cd = "cluster.local"
-	}
-	fqdn := fmt.Sprintf("%s.%s.svc.%s", b.Service.Name, ns, cd)
+	fqdn := serviceFQDN(ns, b.Service.Name, r.ClusterDomain)
 
 	// Whether we need a Service lookup at all: any of port-by-name or
 	// ResolveBackendClusterIPs forces it. Port-by-number with no

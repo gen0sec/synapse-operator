@@ -69,8 +69,9 @@ type v2Route struct {
 		Status   int    `json:"status"`
 		Location string `json:"location"`
 	} `json:"redirect"`
-	Timeouts v2Timeouts `json:"timeouts"`
-	Headers  struct {
+	UpstreamTLS *v2TLSOf   `json:"upstream_tls"`
+	Timeouts    v2Timeouts `json:"timeouts"`
+	Headers     struct {
 		Request  []string `json:"request"`
 		Response []string `json:"response"`
 	} `json:"headers"`

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"regexp/syntax"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -23,6 +25,8 @@ import (
 // compatibility subset:
 //
 //   backend-protocol     HTTP|HTTPS  -> ssl_enabled (TLS to upstream)
+//   upstream-tls-verify  bool        -> upstream_tls.verify (nginx: proxy-ssl-verify on|off)
+//   upstream-tls-sni     name|IP     -> upstream_tls.sni (nginx: proxy-ssl-name)
 //   http2                bool        -> http2_enabled
 //   force-https|ssl-redirect bool    -> https_proxy_enabled (force_https)
 //   connect-timeout      uint(sec)   -> connection_timeout
@@ -100,6 +104,8 @@ type routeCfg struct {
 	// key, which becomes just a unique label. Populated from a Gateway
 	// RegularExpression path match or an nginx `use-regex` Ingress path.
 	matchExpr string
+	// upstreamTLS is the route's `upstream_tls`; only set on an HTTPS route.
+	upstreamTLS *upstreamTLSCfg
 }
 
 // annSettings is the subset parsed from an object's annotations,
@@ -141,6 +147,32 @@ type annSettings struct {
 	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
 	// regex routes rather than longest-prefix paths.
 	useRegex bool
+	// upstreamTLS is what the object says about verifying and naming its
+	// TLS back-ends. It only reaches the file on a route that is HTTPS.
+	upstreamTLS upstreamTLSAnn
+}
+
+// upstreamTLSAnn is the parsed upstream-tls-verify and upstream-tls-sni.
+type upstreamTLSAnn struct {
+	verify *bool
+	sni    string
+	// refused lists each annotation that was dropped, as `key: "value"`.
+	refused []string
+}
+
+// upstreamTLSCfg is the per-route `upstream_tls` block.
+type upstreamTLSCfg struct {
+	verify *bool
+	sni    string
+}
+
+// upstreamTLSCfg is the route's upstream_tls: nothing unless the route is
+// HTTPS and has a name or a verify setting to say.
+func (a annSettings) upstreamTLSCfg() *upstreamTLSCfg {
+	if a.ssl == nil || !*a.ssl || (a.upstreamTLS.sni == "" && a.upstreamTLS.verify == nil) {
+		return nil
+	}
+	return &upstreamTLSCfg{verify: a.upstreamTLS.verify, sni: a.upstreamTLS.sni}
 }
 
 // certProjection is one TLS Secret to materialize into the synapse
@@ -463,6 +495,7 @@ func (m *renderModel) addRoute(host, path string, servers []backend, a annSettin
 		respHeaders:      append(append([]string{}, a.respHeaders...), extraResp...),
 		redirectStatus:   a.redirectStatus,
 		redirectLocation: a.redirectLocation,
+		upstreamTLS:      a.upstreamTLSCfg(),
 	}
 	m.hosts[host][path] = rc
 	if a.sticky {
@@ -807,6 +840,7 @@ func (m *renderModel) addRegexRoute(host, regex string, servers []backend, a ann
 		redirectStatus:   a.redirectStatus,
 		redirectLocation: a.redirectLocation,
 		matchExpr:        pathRegexExpr(regex),
+		upstreamTLS:      a.upstreamTLSCfg(),
 	}
 	m.hosts[host][key] = rc
 	if a.sticky {
@@ -856,6 +890,108 @@ func (m *renderModel) addPassthroughHost(host, upstream string) bool {
 	}
 	m.passthroughHosts[host] = upstream
 	return true
+}
+
+// serviceFQDN is the DNS name of a Service inside the cluster. An empty
+// clusterDomain is cluster.local.
+func serviceFQDN(ns, name, clusterDomain string) string {
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	return fmt.Sprintf("%s.%s.svc.%s", name, ns, clusterDomain)
+}
+
+// usableSNI reports whether Synapse takes sni as written for the name it
+// checks a TLS back-end's certificate against. It mirrors Synapse's
+// sni_is_usable: an IP address (an IPv6 one may be bracketed), or an ASCII
+// host name that a URL parser keeps as it is. A name it would rewrite, such
+// as 127.1, 0x7f.1 or an IDN, is refused; an IDN is written xn--.
+func usableSNI(sni string) bool {
+	if sni == "" {
+		return false
+	}
+	if inner, ok := strings.CutPrefix(sni, "["); ok {
+		inner, ok = strings.CutSuffix(inner, "]")
+		if !ok {
+			return false
+		}
+		ip := net.ParseIP(inner)
+		return ip != nil && strings.Contains(inner, ":")
+	}
+	if ip := net.ParseIP(sni); ip != nil {
+		return true
+	}
+	name := strings.TrimSuffix(sni, ".")
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	labels := strings.Split(name, ".")
+	for _, l := range labels {
+		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			c := l[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	// A URL parser reads a name that ends in a number as an IPv4 address, of
+	// any length, and rewrites it or refuses it.
+	last := strings.ToLower(labels[len(labels)-1])
+	if rest, ok := strings.CutPrefix(last, "0x"); ok && strings.Trim(rest, "0123456789abcdef") == "" {
+		return false
+	}
+	if strings.Trim(last, "0123456789") == "" {
+		return false
+	}
+	// A URL parser decodes an xn-- label and refuses one that does not decode.
+	for _, l := range labels {
+		if len(l) >= 4 && strings.EqualFold(l[:4], "xn--") {
+			if _, err := idna.Lookup.ToUnicode(l); err != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// parseUpstreamTLS reads upstream-tls-verify and upstream-tls-sni. The
+// synapse key wins over the nginx one, even when its value is refused.
+func parseUpstreamTLS(ann map[string]string) upstreamTLSAnn {
+	var u upstreamTLSAnn
+	pick := func(synapseKey, nginxKey string) (key, val string, ok bool) {
+		if v, ok := ann[annPrefix+synapseKey]; ok {
+			return annPrefix + synapseKey, v, true
+		}
+		if v, ok := ann[nginxPrefix+nginxKey]; ok {
+			return nginxPrefix + nginxKey, v, true
+		}
+		return "", "", false
+	}
+	if key, v, ok := pick("upstream-tls-verify", "proxy-ssl-verify"); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "on":
+			t := true
+			u.verify = &t
+		case "false", "off":
+			f := false
+			u.verify = &f
+		default:
+			u.refused = append(u.refused, fmt.Sprintf("%s: %q", key, v))
+		}
+	}
+	if key, v, ok := pick("upstream-tls-sni", "proxy-ssl-name"); ok {
+		if usableSNI(v) {
+			u.sni = v
+		} else {
+			u.refused = append(u.refused, fmt.Sprintf("%s: %q", key, v))
+		}
+	}
+	return u
 }
 
 func parseBool(s string) *bool {
@@ -943,6 +1079,7 @@ func parseAnnotations(ann map[string]string) annSettings {
 		return "", false
 	}
 	var s annSettings
+	s.upstreamTLS = parseUpstreamTLS(ann)
 
 	// backend-protocol: HTTPS ⇒ TLS to upstream. synapse-compat key
 	// first, then nginx-compat.
@@ -1221,6 +1358,15 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 	default:
 		b.WriteString("        ssl_enabled: false\n")
 	}
+	if t := rc.upstreamTLS; t != nil {
+		b.WriteString("        upstream_tls:\n")
+		if t.verify != nil {
+			fmt.Fprintf(b, "          verify: %t\n", *t.verify)
+		}
+		if t.sni != "" {
+			fmt.Fprintf(b, "          sni: %s\n", strconv.Quote(t.sni))
+		}
+	}
 	if rc.http2 != nil {
 		fmt.Fprintf(b, "        http2_enabled: %t\n", *rc.http2)
 	}
@@ -1318,4 +1464,13 @@ func writeTransformsV2(b *strings.Builder, rc *routeCfg) {
 	b.WriteString("        transforms:\n")
 	rule("request_headers", rc.reqRemove, rc.reqAdd)
 	rule("response_headers", rc.respRemove, rc.respAdd)
+}
+
+// defaultSNI is the name a back-end of Service svc is checked against when
+// the route names none. It is empty when Synapse could not use it.
+func defaultSNI(ns, svc, clusterDomain string) string {
+	if name := serviceFQDN(ns, svc, clusterDomain); usableSNI(name) {
+		return name
+	}
+	return ""
 }
