@@ -262,6 +262,11 @@ func TestProxyDeployment_Volumes(t *testing.T) {
 	if src := volumeNamed(t, d, certs.Name); !certs.ReadOnly || src.Secret == nil || src.Secret.SecretName != proxyCertsName(p).Name {
 		t.Errorf("certs: mount %+v, source %+v", certs, src)
 	}
+	sticky := mountAt(t, c, "/etc/synapse/sticky")
+	if src := volumeNamed(t, d, sticky.Name); sticky.Name != "sticky-key" || !sticky.ReadOnly || src.Secret == nil ||
+		src.Secret.SecretName != "edge-sticky-key" || src.Secret.DefaultMode == nil || *src.Secret.DefaultMode != 0o400 {
+		t.Errorf("sticky key: mount %+v, source %+v", sticky, src)
+	}
 	data := mountAt(t, c, "/var/lib/synapse")
 	if src := volumeNamed(t, d, data.Name); data.ReadOnly || src.EmptyDir == nil {
 		t.Errorf("data: mount %+v, source %+v", data, src)

@@ -141,6 +141,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		a := parseAnnotations(rt.Annotations)
 		r.reportRedirectCode(ctx, rt, a)
 		r.reportUpstreamTLS(ctx, rt, a)
+		r.dropStickyWithoutKey(rt, &a)
 		if a.sticky {
 			m.sticky = true
 		}

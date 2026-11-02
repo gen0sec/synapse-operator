@@ -199,6 +199,9 @@ type renderModel struct {
 	// against both terminate hosts in `hosts` and other passthrough entries.
 	passthroughHosts map[string]string
 	sticky           bool
+	// stickySecretFile is where the proxy mounts the signing key for sticky
+	// sessions. Empty, there is none and sticky sessions are not written.
+	stickySecretFile string
 	// solvers are the paths of cert-manager's HTTP-01 solvers, by host,
 	// each with where it is answered. They are no routes of the host as
 	// far as anything else goes: a solver does not take a host from what
@@ -1249,6 +1252,9 @@ func renderUpstreamsV2(m *renderModel) string {
 	b.WriteString("proxy:\n  fingerprints:\n    forward: false\n")
 	if m.sticky {
 		b.WriteString("  sticky_sessions:\n    enabled: true\n")
+		if m.stickySecretFile != "" {
+			fmt.Fprintf(&b, "    secret_file: %q\n", m.stickySecretFile)
+		}
 	}
 
 	// Stable iteration: terminate hosts first (sorted), then passthrough

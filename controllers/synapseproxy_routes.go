@@ -106,6 +106,7 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		CertsOutSecret:        proxyCertsName(&proxy),
 		OwnerRef:              metav1.NewControllerRef(&proxy, synapsev1alpha1.GroupVersion.WithKind("SynapseProxy")),
 		ClusterDomain:         r.ClusterDomain,
+		StickySecretFile:      proxyStickyKeyFile,
 		// The pods read the routes through a volume the kubelet refreshes
 		// on its own schedule. A Service's cluster IP is still right a
 		// minute later; a pod address may not be.
