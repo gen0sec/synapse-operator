@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"time"
 
@@ -42,6 +43,7 @@ const (
 	ReasonConfigInvalid            = "ConfigInvalid"
 	ReasonWaitingForRoutes         = "WaitingForRoutes"
 	ReasonNameCollision            = "NameCollision"
+	ReasonStickyKeyUnusable        = "StickyKeyUnusable"
 	ReasonRollingOut               = "RollingOut"
 	ReasonProgressDeadlineExceeded = "ProgressDeadlineExceeded"
 )
@@ -146,6 +148,16 @@ func (r *SynapseProxyReconciler) reconcile(ctx context.Context, proxy *synapsev1
 		Message: "spec renders to a Synapse configuration"}
 	o.configHash = cfg.Hash
 
+	// Before the routes are looked at: the routes file names the key's path,
+	// and the pods mount the key from their first start.
+	if reason, message, err := r.ensureStickyKey(ctx, proxy); err != nil {
+		return nil, err
+	} else if reason != "" {
+		o.notReady(reason, message)
+		o.requeue = collisionRetry
+		return o, nil
+	}
+
 	// The pods mount the routes and the certificates, and Synapse does not
 	// start watching a routes file that was missing when it started.
 	if missing, err := r.missingRouteOutput(ctx, proxy); err != nil {
@@ -192,6 +204,73 @@ func (r *SynapseProxyReconciler) reconcile(ctx context.Context, proxy *synapsev1
 		o.notReady(reason, message)
 	}
 	return o, nil
+}
+
+// ensureStickyKey makes sure the Secret with the signing key of sticky
+// sessions exists and holds a key Synapse takes. A non-empty reason means it
+// cannot be used as it is and says why.
+//
+//   - Absent: it is created with a fresh key.
+//   - The proxy's own, with a key that is too short: the key is replaced, as
+//     nothing else can have put it there.
+//   - Nobody's: it is adopted, so that a key can be shared between proxies or
+//     kept by whoever manages secrets. Its data is never written; if it is too
+//     short, that is reported.
+//   - Another object's: it is in the way.
+func (r *SynapseProxyReconciler) ensureStickyKey(ctx context.Context, proxy *synapsev1alpha1.SynapseProxy) (reason, message string, err error) {
+	name := client.ObjectKey{Namespace: proxy.Namespace, Name: proxyStickyKeyName(proxy)}
+	var existing corev1.Secret
+	if err := r.Get(ctx, name, &existing); apierrors.IsNotFound(err) {
+		key, err := newStickyKey()
+		if err != nil {
+			return "", "", err
+		}
+		err = r.Create(ctx, buildProxyStickyKeySecret(proxy, key))
+		if err == nil {
+			return "", "", nil
+		}
+		// Another reconcile was first: read what it wrote.
+		if !apierrors.IsAlreadyExists(err) {
+			return "", "", err
+		}
+		if err := r.Get(ctx, name, &existing); err != nil {
+			return "", "", err
+		}
+	} else if err != nil {
+		return "", "", err
+	}
+
+	switch owner := metav1.GetControllerOf(&existing); {
+	case owner != nil && !metav1.IsControlledBy(&existing, proxy):
+		return ReasonNameCollision, fmt.Sprintf("Secret %q already exists and does not belong to this SynapseProxy", name.Name), nil
+	case owner != nil && len(existing.Data[proxyStickyKey]) < proxyStickyKeyLen:
+		key, err := newStickyKey()
+		if err != nil {
+			return "", "", err
+		}
+		existing.Data = map[string][]byte{proxyStickyKey: key}
+		if err := r.Update(ctx, &existing); err != nil {
+			return "", "", err
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(proxy, corev1.EventTypeNormal, "StickyKeyReplaced",
+				"Secret %q held fewer than %d bytes under %q; it has a new key", name.Name, proxyStickyKeyLen, proxyStickyKey)
+		}
+	case owner == nil && len(existing.Data[proxyStickyKey]) < proxyStickyKeyLen:
+		return ReasonStickyKeyUnusable, fmt.Sprintf(
+			"Secret %q holds %d bytes under %q and Synapse needs at least %d; it is not ours to change, so fix it or delete it",
+			name.Name, len(existing.Data[proxyStickyKey]), proxyStickyKey, proxyStickyKeyLen), nil
+	}
+	return "", "", nil
+}
+
+// newStickyKey returns a random key of the length Synapse requires.
+func newStickyKey() ([]byte, error) {
+	key := make([]byte, proxyStickyKeyLen)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate the sticky sessions key: %w", err)
+	}
+	return key, nil
 }
 
 // apiKey resolves spec.platform.apiKeySecretRef. A non-empty reason means the
@@ -405,7 +484,7 @@ func (r *SynapseProxyReconciler) writeStatus(ctx context.Context, proxy *synapse
 	if o.ready.Reason != previousReason && r.Recorder != nil {
 		eventType := corev1.EventTypeNormal
 		switch o.ready.Reason {
-		case ReasonConfigInvalid, ReasonNameCollision, ReasonProgressDeadlineExceeded:
+		case ReasonConfigInvalid, ReasonNameCollision, ReasonStickyKeyUnusable, ReasonProgressDeadlineExceeded:
 			eventType = corev1.EventTypeWarning
 		}
 		r.Recorder.Event(proxy, eventType, o.ready.Reason, o.ready.Message)
