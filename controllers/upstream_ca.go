@@ -17,6 +17,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 const (
@@ -26,6 +28,9 @@ const (
 	// render: they share a ConfigMap with the routes, which holds 1 MiB.
 	maxCABytes      = 64 * 1024
 	maxCAFilesBytes = 512 * 1024
+	// maxCANamespaceBytes caps the distinct bundles one namespace brings in
+	// a render, so that one tenant cannot use the whole of maxCAFilesBytes.
+	maxCANamespaceBytes = 128 * 1024
 )
 
 // caFileRE is the name of a file this controller writes for a CA. Anything
@@ -85,21 +90,34 @@ func (r *IngressReconciler) caPath(file string) string {
 	return filepath.Join(filepath.Dir(r.UpstreamsOutPath), file)
 }
 
-// addCAFile records a CA file for the render and returns false when the
-// files would no longer fit the ConfigMap.
-func (m *renderModel) addCAFile(file string, pemBytes []byte) bool {
-	if _, ok := m.caFiles[file]; ok {
-		return true
+// addCAFile records a CA file that ns brings to the render. It returns why
+// it is refused, or "" when it is taken. Routes are rendered in the order of
+// their namespace and name, so which of them is refused is stable.
+func (m *renderModel) addCAFile(ns, file string, pemBytes []byte) string {
+	if _, ok := m.caNSFiles[ns][file]; ok {
+		return ""
 	}
-	if m.caBytes+len(pemBytes) > maxCAFilesBytes {
-		return false
+	if m.caNSBytes[ns]+len(pemBytes) > maxCANamespaceBytes {
+		return fmt.Sprintf("it does not fit with the other CA files of the namespace %s, which hold at most %d KiB together", ns, maxCANamespaceBytes/1024)
+	}
+	if _, ok := m.caFiles[file]; !ok && m.caBytes+len(pemBytes) > maxCAFilesBytes {
+		return "it does not fit with the other CA files in the routes ConfigMap"
 	}
 	if m.caFiles == nil {
 		m.caFiles = map[string]string{}
+		m.caNSFiles = map[string]map[string]struct{}{}
+		m.caNSBytes = map[string]int{}
 	}
-	m.caFiles[file] = string(pemBytes)
-	m.caBytes += len(pemBytes)
-	return true
+	if m.caNSFiles[ns] == nil {
+		m.caNSFiles[ns] = map[string]struct{}{}
+	}
+	m.caNSFiles[ns][file] = struct{}{}
+	m.caNSBytes[ns] += len(pemBytes)
+	if _, ok := m.caFiles[file]; !ok {
+		m.caFiles[file] = string(pemBytes)
+		m.caBytes += len(pemBytes)
+	}
+	return ""
 }
 
 // loadCA reads the CA of the Secret ns/name under key and records its file.
@@ -121,16 +139,17 @@ func (r *IngressReconciler) loadCA(ctx context.Context, m *renderModel, ns, name
 		return "", fmt.Sprintf("%s/%s key %q cannot be used: %v", ns, name, key, err), nil
 	}
 	file := caFileName(data)
-	if !m.addCAFile(file, data) {
-		return "", fmt.Sprintf("%s/%s key %q does not fit with the other CA files in the routes ConfigMap", ns, name, key), nil
+	if why := m.addCAFile(ns, file, data); why != "" {
+		return "", fmt.Sprintf("%s/%s key %q cannot be used: %s", ns, name, key, why), nil
 	}
 	return r.caPath(file), "", nil
 }
 
 // resolveUpstreamCA turns the CA that obj names into a file of the render.
 // The Secret is read from the namespace of obj only. A route whose CA cannot
-// be had keeps none, and so is checked against the system roots: it fails
-// closed and the rest are served.
+// be had gets no `ca`. Synapse then checks it against the proxy-wide
+// `upstream_tls.ca` when that is set, else the system roots: a back-end of a
+// private CA fails closed and the rest are served.
 func (r *IngressReconciler) resolveUpstreamCA(ctx context.Context, m *renderModel, obj client.Object, a *annSettings) {
 	u := &a.upstreamTLS
 	if u.caName == "" || a.ssl == nil || !*a.ssl {
@@ -150,7 +169,7 @@ func (r *IngressReconciler) resolveUpstreamCA(ctx context.Context, m *renderMode
 		return
 	}
 	if why != "" {
-		r.emit(obj, corev1.EventTypeWarning, "UpstreamCAUnusable", "%s; the route has no CA", why)
+		r.emit(obj, corev1.EventTypeWarning, "UpstreamCAUnusable", "%s; the route writes no CA, so Synapse checks it against the proxy-wide upstream_tls.ca when that is set, else the system roots", why)
 		return
 	}
 	u.caFile = file
@@ -225,4 +244,32 @@ func routeSecretWatched(o client.Object) bool {
 	}
 	_, has := s.Data[defaultCAKey]
 	return has
+}
+
+// secretWatch is the predicate for a watch of Secrets. An update counts when
+// either the old or the new object holds a CA or is referenced: a Secret that
+// loses its ca.crt has to be seen too. referenced says whether the Secret
+// ns/name is named by spec.upstreamTLS.caSecretRef, which may use any key.
+func secretWatch(referenced func(ns, name string) bool) predicate.Funcs {
+	watched := func(o client.Object) bool {
+		if o == nil {
+			return false
+		}
+		return routeSecretWatched(o) || (referenced != nil && referenced(o.GetNamespace(), o.GetName()))
+	}
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return watched(e.Object) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return watched(e.Object) },
+		GenericFunc: func(e event.GenericEvent) bool { return watched(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return watched(e.ObjectOld) || watched(e.ObjectNew) },
+	}
+}
+
+// secretPredicate watches the Secrets that hold a CA or a certificate, and
+// the one the proxy-wide upstream_tls.ca names.
+func (r *IngressReconciler) secretPredicate() predicate.Funcs {
+	return secretWatch(func(ns, name string) bool {
+		d := r.DefaultUpstreamTLS
+		return d != nil && d.CASecret.Name != "" && d.CASecret.Namespace == ns && d.CASecret.Name == name
+	})
 }

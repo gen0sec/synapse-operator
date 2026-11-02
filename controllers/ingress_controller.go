@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -982,13 +981,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// unless this mode is deliberately enabled.
 		b = b.Watches(&discoveryv1.EndpointSlice{}, enqueueAll)
 	}
-	if r.CertsOutDir != "" || r.usesCertsSecretOutput() {
-		// Re-project on TLS Secret changes (cert rotation/renewal) and on a
-		// change to a CA, without waiting for an unrelated Ingress event.
-		// Filtered to what holds one, to avoid watching every Secret.
-		b = b.Watches(&corev1.Secret{}, enqueueAll, builder.WithPredicates(
-			predicate.NewPredicateFuncs(routeSecretWatched)))
-	}
+	// Re-project on TLS Secret changes (cert rotation/renewal) and on a
+	// change to a CA, without waiting for an unrelated Ingress event. Every
+	// mode writes upstreams, and so reads CAs. Filtered to what holds one,
+	// to avoid enqueueing for every Secret.
+	b = b.Watches(&corev1.Secret{}, enqueueAll, builder.WithPredicates(r.secretPredicate()))
 	if r.GatewayAPI {
 		b = b.Watches(gwHTTPRoute(), enqueueAll).
 			Watches(gwGateway(), enqueueAll).

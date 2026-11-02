@@ -217,6 +217,10 @@ type renderModel struct {
 	// the routes file; caBytes is their size together.
 	caFiles map[string]string
 	caBytes int
+	// caNSFiles and caNSBytes are the same, by the namespace that brought
+	// them: one file two namespaces share counts for both.
+	caNSFiles map[string]map[string]struct{}
+	caNSBytes map[string]int
 	// caErr is a Secret that could not be read for a reason other than
 	// being unusable. The render fails on it, and is tried again.
 	caErr error

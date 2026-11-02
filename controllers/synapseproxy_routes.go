@@ -252,7 +252,20 @@ func (r *SynapseRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		return reqs
 	})
-	tlsSecrets := predicate.NewPredicateFuncs(routeSecretWatched)
+	// A Secret that holds a CA under another key is watched when a proxy's
+	// spec.upstreamTLS.caSecretRef names it.
+	tlsSecrets := secretWatch(func(ns, name string) bool {
+		var proxies synapsev1alpha1.SynapseProxyList
+		if err := r.List(context.Background(), &proxies, client.InNamespace(ns)); err != nil {
+			return false
+		}
+		for i := range proxies.Items {
+			if u := proxies.Items[i].Spec.UpstreamTLS; u != nil && u.CASecretRef != nil && u.CASecretRef.Name == name {
+				return true
+			}
+		}
+		return false
+	})
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		// Named explicitly: the proxy's own controller is also `For` this kind.

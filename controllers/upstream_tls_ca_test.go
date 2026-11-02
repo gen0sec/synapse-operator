@@ -21,10 +21,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -429,5 +431,152 @@ func TestRoutes_AChangedCASecretRerenders(t *testing.T) {
 		if got := routeSecretWatched(tc.obj); got != tc.want {
 			t.Errorf("%s: watched is %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestSecretWatch_ChecksTheOldObjectToo(t *testing.T) {
+	with := caSecret("default", "ca", "pem")
+	without := caSecret("default", "ca", "")
+	without.Data = map[string][]byte{"password": []byte("x")}
+	p := secretWatch(nil)
+	if !p.Update(event.UpdateEvent{ObjectOld: with, ObjectNew: without}) {
+		t.Error("a Secret that lost ca.crt is not enqueued")
+	}
+	if !p.Update(event.UpdateEvent{ObjectOld: without, ObjectNew: with}) {
+		t.Error("a Secret that gained ca.crt is not enqueued")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: without, ObjectNew: without}) {
+		t.Error("a Secret that never held a CA is enqueued")
+	}
+}
+
+func TestSecretWatch_MatchesTheSecretNamedBySpecWhateverItsKeys(t *testing.T) {
+	custom := caSecret("synapse-os", "pki", "")
+	custom.Data = map[string][]byte{"root.pem": []byte("x")}
+	other := caSecret("synapse-os", "unrelated", "")
+	other.Data = map[string][]byte{"root.pem": []byte("x")}
+	elsewhere := caSecret("tenant", "pki", "")
+	elsewhere.Data = map[string][]byte{"root.pem": []byte("x")}
+	p := secretWatch(func(ns, name string) bool { return ns == "synapse-os" && name == "pki" })
+	for _, tc := range []struct {
+		name string
+		obj  client.Object
+		want bool
+	}{
+		{"the referenced Secret", custom, true},
+		{"another Secret of the namespace", other, false},
+		{"the same name in another namespace", elsewhere, false},
+	} {
+		if got := p.Create(event.CreateEvent{Object: tc.obj}); got != tc.want {
+			t.Errorf("%s: create is %v, want %v", tc.name, got, tc.want)
+		}
+		if got := p.Delete(event.DeleteEvent{Object: tc.obj}); got != tc.want {
+			t.Errorf("%s: delete is %v, want %v", tc.name, got, tc.want)
+		}
+		if got := p.Update(event.UpdateEvent{ObjectOld: tc.obj, ObjectNew: tc.obj}); got != tc.want {
+			t.Errorf("%s: update is %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSecretWatch_TheRendererNamesTheProxyCASecret(t *testing.T) {
+	custom := caSecret("synapse-os", "pki", "")
+	custom.Data = map[string][]byte{"root.pem": []byte("x")}
+	r := &IngressReconciler{DefaultUpstreamTLS: &DefaultUpstreamTLS{
+		CASecret: types.NamespacedName{Namespace: "synapse-os", Name: "pki"}, CAKey: "root.pem"}}
+	if !r.secretPredicate().Create(event.CreateEvent{Object: custom}) {
+		t.Error("the Secret of spec.upstreamTLS.caSecretRef is not watched")
+	}
+	if (&IngressReconciler{}).secretPredicate().Create(event.CreateEvent{Object: custom}) {
+		t.Error("a Secret is watched with no reference to it")
+	}
+}
+
+func TestHashConfigMapContent_CAFilesAreIgnoredLikeTheRoutes(t *testing.T) {
+	ignored := map[string]struct{}{UpstreamsKey: {}}
+	cm := func(data map[string]string) *corev1.ConfigMap { return &corev1.ConfigMap{Data: data} }
+	base := map[string]string{"synapse.yaml": "a: 1", UpstreamsKey: "x", "ca-0123456789abcdef.pem": "one"}
+	rotated := map[string]string{"synapse.yaml": "a: 1", UpstreamsKey: "y", "ca-fedcba9876543210.pem": "two", "ca-0011223344556677.pem": "three"}
+	if a, b := hashConfigMapContent(cm(base), ignored, false), hashConfigMapContent(cm(rotated), ignored, false); a != b {
+		t.Error("a CA file changes the hash while upstreams.yaml is ignored")
+	}
+	other := map[string]string{"synapse.yaml": "a: 1", "ca-bundle.pem": "one"}
+	more := map[string]string{"synapse.yaml": "a: 1", "ca-bundle.pem": "two"}
+	if a, b := hashConfigMapContent(cm(other), ignored, false), hashConfigMapContent(cm(more), ignored, false); a == b {
+		t.Error("a key that is no CA file of ours is ignored")
+	}
+	if a, b := hashConfigMapContent(cm(base), nil, false), hashConfigMapContent(cm(rotated), nil, false); a == b {
+		t.Error("CA files are ignored when upstreams.yaml is not")
+	}
+}
+
+// paddedCA is a CA bundle of about size bytes: one real certificate, then
+// comment lines, which PEM parsing skips.
+func paddedCA(t *testing.T, name string, size int) string {
+	t.Helper()
+	ca := testCAPEM(t, name)
+	return ca + strings.Repeat("#"+strings.Repeat("-", 62)+"\n", (size-len(ca))/64)
+}
+
+func TestRoutes_UpstreamCAIsBudgetedPerNamespace(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	var objs []client.Object
+	objs = append(objs, edge, classFor("public", edge))
+	var bundles []string
+	for i, n := range []string{"a", "b", "c"} {
+		ca := paddedCA(t, "big-"+n, 60*1024)
+		bundles = append(bundles, ca)
+		objs = append(objs,
+			httpsIngress("busy", n, n+".example.com", annPrefix+"upstream-tls-ca", "ca-"+n),
+			caSecret("busy", "ca-"+n, ca))
+		_ = i
+	}
+	// The same bundle again costs the namespace nothing.
+	objs = append(objs, httpsIngress("busy", "a2", "a2.example.com", annPrefix+"upstream-tls-ca", "ca-a"))
+	// Another namespace has its own share.
+	quiet := paddedCA(t, "quiet", 60*1024)
+	objs = append(objs,
+		httpsIngress("quiet", "q", "q.example.com", annPrefix+"upstream-tls-ca", "ca-q"),
+		caSecret("quiet", "ca-q", quiet))
+
+	events := record.NewFakeRecorder(64)
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	doc := parseV2(t, routesConfigMap(t, r, edge).Data[UpstreamsKey])
+	caOf := func(host string) string {
+		if tls := doc.Hosts[host].Paths["/"].UpstreamTLS; tls != nil {
+			return tls.CA
+		}
+		return ""
+	}
+	for host, ca := range map[string]string{"a.example.com": bundles[0], "b.example.com": bundles[1], "a2.example.com": bundles[0], "q.example.com": quiet} {
+		if want := "/etc/synapse/upstreams/" + caKeyOf(ca); caOf(host) != want {
+			t.Errorf("%s has the CA %q, want %q", host, caOf(host), want)
+		}
+	}
+	if got := caOf("c.example.com"); got != "" {
+		t.Errorf("c.example.com has the CA %q over the namespace cap", got)
+	}
+	got := eventsOf(events, "UpstreamCAUnusable")
+	if len(got) != 1 || !strings.Contains(got[0], "128 KiB") {
+		t.Errorf("UpstreamCAUnusable events: %v, want one that names the 128 KiB cap", got)
+	}
+}
+
+func TestRoutes_UpstreamCAUnusableSaysWhatTheRouteFallsBackTo(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	events := record.NewFakeRecorder(64)
+	r := newRouteReconciler(t, edge, classFor("public", edge),
+		httpsIngress("default", "broken", "broken.example.com", annPrefix+"upstream-tls-ca", "missing"))
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+	got := eventsOf(events, "UpstreamCAUnusable")
+	if len(got) != 1 {
+		t.Fatalf("UpstreamCAUnusable events: %v", got)
+	}
+	if strings.Contains(got[0], "the route has no CA") || !strings.Contains(got[0], "upstream_tls.ca") || !strings.Contains(got[0], "system roots") {
+		t.Errorf("the event is %q, want it to name the proxy-wide CA and the system roots", got[0])
 	}
 }
