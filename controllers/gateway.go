@@ -154,7 +154,12 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			// upstream-tls-sni, the first Service gives it.
 			a := a
 			if a.upstreamTLS.sni == "" {
-				if names := r.ruleServiceNames(rt, rule); len(names) > 0 {
+				if names := r.ruleServiceNames(rt, rule); len(names) > 0 && !usableSNI(names[0]) {
+					if a.ssl != nil && *a.ssl {
+						r.emit(rt, corev1.EventTypeWarning, "InvalidUpstreamTLS",
+							"back-end %s is no usable TLS server name; the rule sends none. Set upstream-tls-sni", names[0])
+					}
+				} else if len(names) > 0 {
 					a.upstreamTLS.sni = names[0]
 					if len(names) > 1 && a.ssl != nil && *a.ssl {
 						r.emit(rt, corev1.EventTypeWarning, "UpstreamTLSSNIAmbiguous",
@@ -365,10 +370,7 @@ func (r *IngressReconciler) ruleServiceNames(rt *gwv1.HTTPRoute, rule gwv1.HTTPR
 		if !ok {
 			continue
 		}
-		fqdn := defaultSNI(ns, name, r.ClusterDomain)
-		if fqdn == "" {
-			continue
-		}
+		fqdn := serviceFQDN(ns, name, r.ClusterDomain)
 		if !slices.Contains(names, fqdn) {
 			names = append(names, fqdn)
 		}

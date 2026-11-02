@@ -334,6 +334,17 @@ func TestRender_TheOlderModesHTTPRouteTakesTheServiceNameAsSNI(t *testing.T) {
 			t.Errorf("events: %v, want one Warning UpstreamTLSSNIAmbiguous", w)
 		}
 	})
+	t.Run("an unusable first name gives no SNI, not the next one", func(t *testing.T) {
+		bad := []gwv1.HTTPRouteRule{{BackendRefs: []gwv1.HTTPBackendRef{backendRef("", "xn--zzzz"), backendRef("", "canary")}}}
+		rendered, events := renderOlderModeGateway(t, olderModeGateway(bad, https))
+		got := parseV2(t, rendered).Hosts["gw.example.com"].Paths["/"].UpstreamTLS
+		if got != nil && got.SNI != "" {
+			t.Errorf("upstream_tls is %+v, want no sni\n%s", got, rendered)
+		}
+		if w := eventsOf(events, "InvalidUpstreamTLS"); len(w) != 1 || !strings.Contains(w[0], "xn--zzzz") {
+			t.Errorf("events: %v, want one InvalidUpstreamTLS naming the Service", w)
+		}
+	})
 	t.Run("two Services with an sni annotation are not ambiguous", func(t *testing.T) {
 		ann := map[string]string{annPrefix + "backend-protocol": "HTTPS", annPrefix + "upstream-tls-sni": "backend.internal"}
 		rendered, events := renderOlderModeGateway(t, olderModeGateway(two, ann))
