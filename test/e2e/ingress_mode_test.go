@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -489,6 +490,133 @@ func TestIngressMode(t *testing.T) {
 				t.Errorf("%s%s is probed, want health_check type none:\n%s", noProbeHost, path, raw)
 			}
 		}
+	})
+
+	step("sticky-sessions is dropped with an event, and the file still loads", func(t *testing.T) {
+		// The sidecar has no key to sign a cookie with: Synapse refuses a
+		// file that asks for sticky sessions without one.
+		sticky := ingress("sticky", sidecarClass, "sticky.e2e.test", "api")
+		sticky.Annotations = map[string]string{"synapse.gen0sec.com/sticky-sessions": "true"}
+		c.create(t, sticky)
+		eventually(t, soon, "StickySessionsUnavailable is raised on the Ingress", func() string {
+			var events corev1.EventList
+			if err := c.k8s.List(c.ctx, &events, client.InNamespace(appsNamespace)); err != nil {
+				return err.Error()
+			}
+			for _, e := range events.Items {
+				if e.Reason == "StickySessionsUnavailable" && e.InvolvedObject.Name == "sticky" && e.Type == corev1.EventTypeWarning {
+					return ""
+				}
+			}
+			return fmt.Sprintf("%d events, none StickySessionsUnavailable on the Ingress sticky", len(events.Items))
+		})
+		raw, _, err := c.routes(cs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(raw, "sticky_sessions") || strings.Contains(raw, "secret_file") {
+			t.Errorf("the routes file asks for sticky sessions:\n%s", raw)
+		}
+		eventually(t, soon, "the sticky Ingress's host answers, without a sticky cookie", func() string {
+			if reason := c.answers("sticky.e2e.test", "/", "api"); reason != "" {
+				return reason
+			}
+			a, err := c.get("http", "sticky.e2e.test")
+			if err == nil && strings.Contains(a.header.Get("Set-Cookie"), "backend_id=") {
+				return "a sticky cookie is set"
+			}
+			return ""
+		})
+		eventually(t, soon, "the shop host still answers", func() string { return c.routed("http", shopHost, "shop") })
+	})
+
+	step("a TLS back-end with a CA of its own is served, and its CA file is written beside the routes", func(t *testing.T) {
+		authority := newAuthority(t, "sidecar-ca")
+		certPEM, keyPEM := authority.issue(t, "tlsside."+appsNamespace+".svc.cluster.local")
+		c.create(t, c.tlsBackend("tlsside", certPEM, keyPEM)...)
+		c.create(t, caSecret(appsNamespace, "tlsside-ca", authority.pem))
+		tlsIngress := httpsIngress("tlsside", "tlsside.e2e.test", "tlsside", map[string]string{"upstream-tls-ca": "tlsside-ca"})
+		class := sidecarClass
+		tlsIngress.Spec.IngressClassName = &class
+		c.create(t, tlsIngress)
+		eventually(t, soon, "the TLS back-end is served", func() string { return c.routed("http", "tlsside.e2e.test", "tlsside") })
+		raw, _, err := c.routes(cs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := regexp.MustCompile(`ca: "` + routesDir + `/(ca-[0-9a-f]{16}\.pem)"`).FindStringSubmatch(raw)
+		if m == nil {
+			t.Fatalf("the routes file names no CA file beside itself:\n%s", raw)
+		}
+		pod, err := c.sidecarPod()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readCA := func() (string, error) {
+			body, err := cs.CoreV1().Pods(proxyNamespace).ProxyGet("http", pod.Name, readerPort, "/file/"+m[1], nil).DoRaw(c.ctx)
+			return string(body), err
+		}
+		if body, err := readCA(); err != nil || body != string(authority.pem) {
+			t.Errorf("the CA file %s holds %q (error %v), want the CA of the Secret", m[1], body, err)
+		}
+		// The Secret changes under a running Ingress: a CA appended is a new
+		// file, and a Secret that loses ca.crt loses its file.
+		caName := func() string {
+			raw, _, err := c.routes(cs)
+			if err != nil {
+				return ""
+			}
+			if m := regexp.MustCompile(`ca: "` + routesDir + `/(ca-[0-9a-f]{16}\.pem)"`).FindStringSubmatch(raw); m != nil {
+				return m[1]
+			}
+			return ""
+		}
+		secretKey := client.ObjectKey{Namespace: appsNamespace, Name: "tlsside-ca"}
+		rotated := append(append([]byte{}, authority.pem...), newAuthority(t, "sidecar-ca-extra").pem...)
+		var sec corev1.Secret
+		if err := c.k8s.Get(c.ctx, secretKey, &sec); err != nil {
+			t.Fatal(err)
+		}
+		sec.Data = map[string][]byte{"ca.crt": rotated}
+		if err := c.k8s.Update(c.ctx, &sec); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, soon, "the routes name a new CA file after the Secret changed", func() string {
+			if n := caName(); n == "" || n == m[1] {
+				return "the CA file is " + n + ", want a new one"
+			}
+			return ""
+		})
+		rotatedName := caName()
+		if err := c.k8s.Get(c.ctx, secretKey, &sec); err != nil {
+			t.Fatal(err)
+		}
+		sec.Data = map[string][]byte{"other": rotated}
+		if err := c.k8s.Update(c.ctx, &sec); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, soon, "the routes name no CA file once the Secret has no ca.crt", func() string {
+			if n := caName(); n != "" {
+				return "the routes still name " + n
+			}
+			return ""
+		})
+		eventually(t, soon, "the CA file of the Secret that lost ca.crt is pruned", func() string {
+			body, err := cs.CoreV1().Pods(proxyNamespace).ProxyGet("http", pod.Name, readerPort, "/file/"+rotatedName, nil).DoRaw(c.ctx)
+			if err == nil {
+				return "the CA file " + rotatedName + " is still there: " + string(body)
+			}
+			return ""
+		})
+		if err := c.k8s.Delete(c.ctx, tlsIngress); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, soon, "the CA file of the removed Ingress is pruned", func() string {
+			if _, err := readCA(); err == nil {
+				return "the CA file " + m[1] + " is still there"
+			}
+			return ""
+		})
 	})
 
 	step("an Ingress added after start is served after the reload", func(t *testing.T) {
