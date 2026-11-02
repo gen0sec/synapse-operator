@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -139,6 +140,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		matched++
 		a := parseAnnotations(rt.Annotations)
 		r.reportRedirectCode(ctx, rt, a)
+		r.reportUpstreamTLS(ctx, rt, a)
 		if a.sticky {
 			m.sticky = true
 		}
@@ -147,6 +149,19 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			servers := r.ruleBackends(ctx, rt, rule)
 			if len(servers) == 0 {
 				continue
+			}
+			// One name is checked for the whole rule. With no
+			// upstream-tls-sni, the first Service gives it.
+			a := a
+			if a.upstreamTLS.sni == "" {
+				if names := r.ruleServiceNames(rt, rule); len(names) > 0 {
+					a.upstreamTLS.sni = names[0]
+					if len(names) > 1 && a.ssl != nil && *a.ssl {
+						r.emit(rt, corev1.EventTypeWarning, "UpstreamTLSSNIAmbiguous",
+							"rule has back-ends %s; their certificates are checked against %s. Set upstream-tls-sni to name another",
+							strings.Join(names, ", "), names[0])
+					}
+				}
 			}
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)
@@ -314,23 +329,48 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 	return paths, regexes, warnings
 }
 
-func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {
+// gwService is the namespace and name of the Service a backendRef points at.
+func gwService(routeNS string, br gwv1.HTTPBackendRef) (ns, name string, ok bool) {
 	b := br.BackendRef.BackendObjectReference
 	if b.Kind != nil && *b.Kind != "Service" {
-		return "", false
+		return "", "", false
 	}
-	ns := routeNS
+	ns = routeNS
 	if b.Namespace != nil {
 		ns = string(*b.Namespace)
 	}
 	if b.Port == nil {
+		return "", "", false
+	}
+	return ns, string(b.Name), true
+}
+
+func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {
+	ns, name, ok := gwService(routeNS, br)
+	if !ok {
 		return "", false
 	}
-	cd := r.ClusterDomain
-	if cd == "" {
-		cd = "cluster.local"
+	return fmt.Sprintf("%s:%d", serviceFQDN(ns, name, r.ClusterDomain), int32(*br.BackendRef.BackendObjectReference.Port)), true
+}
+
+// ruleServiceNames lists the distinct Service names of the backends of rule
+// that get traffic, in order.
+func (r *IngressReconciler) ruleServiceNames(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule) []string {
+	var names []string
+	for _, br := range rule.BackendRefs {
+		if br.Weight != nil && *br.Weight <= 0 {
+			continue
+		}
+		ns, name, ok := gwService(rt.Namespace, br)
+		if !ok {
+			continue
+		}
+		fqdn := serviceFQDN(ns, name, r.ClusterDomain)
+		if !slices.Contains(names, fqdn) {
+			names = append(names, fqdn)
+		}
 	}
-	return fmt.Sprintf("%s.%s.svc.%s:%d", b.Name, ns, cd, int32(*b.Port)), true
+	return names
 }
 
 // ---- status helpers (enough for cert-manager to proceed) ----------
