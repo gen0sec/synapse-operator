@@ -484,13 +484,13 @@ func hashConfigMapContent(cfg *corev1.ConfigMap, ignoredKeys map[string]struct{}
 
 	keys := make([]string, 0, len(cfg.Data)+len(cfg.BinaryData))
 	for k := range cfg.Data {
-		if shouldIgnoreKey(k, ignoredKeys) {
+		if shouldIgnoreConfigMapKey(k, ignoredKeys) {
 			continue
 		}
 		keys = append(keys, "s:"+k)
 	}
 	for k := range cfg.BinaryData {
-		if shouldIgnoreKey(k, ignoredKeys) {
+		if shouldIgnoreConfigMapKey(k, ignoredKeys) {
 			continue
 		}
 		keys = append(keys, "b:"+k)
@@ -601,6 +601,19 @@ func hashSecretContent(secret *corev1.Secret, ignoredKeys map[string]struct{}) s
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// shouldIgnoreConfigMapKey is shouldIgnoreKey, and also ignores the CA files
+// the ingress controller writes beside the routes file: they change with the
+// routes, so they are ignored when the routes file is.
+func shouldIgnoreConfigMapKey(key string, ignoredKeys map[string]struct{}) bool {
+	if shouldIgnoreKey(key, ignoredKeys) {
+		return true
+	}
+	if _, routesIgnored := ignoredKeys[UpstreamsKey]; routesIgnored {
+		return caFileRE.MatchString(key)
+	}
+	return false
 }
 
 func shouldIgnoreKey(key string, ignoredKeys map[string]struct{}) bool {

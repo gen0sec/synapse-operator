@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -29,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -117,6 +117,8 @@ type IngressReconciler struct {
 	// EventsOn is the object the ledger's events are about: the proxy. nil
 	// ⇒ the ledger ConfigMap, which may not exist yet.
 	EventsOn runtime.Object
+	// DefaultUpstreamTLS is the proxy-wide upstream_tls. nil ⇒ none.
+	DefaultUpstreamTLS *DefaultUpstreamTLS
 	// Clock is where "now" comes from. nil ⇒ time.Now.
 	Clock func() time.Time
 
@@ -337,6 +339,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
 		r.reportRedirectCode(ctx, ing, a)
 		r.reportUpstreamTLS(ctx, ing, a)
+		r.resolveUpstreamCA(ctx, m, ing, &a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
 		for _, t := range ing.Spec.TLS {
@@ -540,23 +543,41 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	}
 	hosts += len(m.passthroughHosts)
 
+	r.resolveDefaultUpstreamTLS(ctx, m)
+	if m.caErr != nil {
+		mRenderErrTotal.Inc()
+		return false, matched, hosts, fmt.Errorf("read CA: %w", m.caErr)
+	}
 	yaml := renderUpstreamsV2(m)
 	var (
 		changed bool
 		err     error
 	)
 	if r.usesConfigMapOutput() {
-		changed, err = r.writeConfigMapIfChanged(ctx, yaml)
+		changed, err = r.writeConfigMapIfChanged(ctx, yaml, m.caFiles)
 		if err != nil {
 			mRenderErrTotal.Inc()
 			return false, matched, hosts, fmt.Errorf("write configmap %s/%s: %w",
 				r.UpstreamsOutConfigMap.Namespace, r.UpstreamsOutConfigMap.Name, err)
 		}
 	} else {
+		// The CA files first: the routes file names them, and Synapse reads
+		// it as soon as it is renamed into place.
+		dir := filepath.Dir(r.UpstreamsOutPath)
+		if err = os.MkdirAll(dir, 0o755); err == nil {
+			err = writeCAFiles(dir, m.caFiles)
+		}
+		if err != nil {
+			mRenderErrTotal.Inc()
+			return false, matched, hosts, fmt.Errorf("write CA files in %s: %w", dir, err)
+		}
 		changed, err = writeIfChanged(r.UpstreamsOutPath, yaml)
 		if err != nil {
 			mRenderErrTotal.Inc()
 			return false, matched, hosts, fmt.Errorf("write %s: %w", r.UpstreamsOutPath, err)
+		}
+		if err = pruneCAFiles(dir, m.caFiles); err != nil {
+			logger.Error(err, "could not remove stale CA files", "dir", dir)
 		}
 	}
 
@@ -881,7 +902,7 @@ func writeIfChanged(path, content string) (bool, error) {
 // already matches the rendered content. The ConfigMap is created if
 // missing and labelled so callers (and humans) can identify the
 // operator-managed output at a glance.
-func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content string) (bool, error) {
+func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content string, caFiles map[string]string) (bool, error) {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      r.UpstreamsOutConfigMap.Name,
@@ -900,10 +921,22 @@ func (r *IngressReconciler) writeConfigMapIfChanged(ctx context.Context, content
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
-		if cur, ok := cm.Data[UpstreamsKey]; ok && cur == content {
+		// The CA files go with the routes in one update, so the pods never
+		// see a routes file that names one that is not there. Other keys are
+		// not this controller's, and stay.
+		want := map[string]string{UpstreamsKey: content}
+		for k, v := range caFiles {
+			want[k] = v
+		}
+		for k, v := range cm.Data {
+			if _, ok := want[k]; !ok && !caFileRE.MatchString(k) {
+				want[k] = v
+			}
+		}
+		if maps.Equal(cm.Data, want) {
 			return nil
 		}
-		cm.Data[UpstreamsKey] = content
+		cm.Data = want
 		changed = true
 		return nil
 	})
@@ -966,16 +999,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// unless this mode is deliberately enabled.
 		b = b.Watches(&discoveryv1.EndpointSlice{}, enqueueAll)
 	}
-	if r.CertsOutDir != "" || r.usesCertsSecretOutput() {
-		// Re-project on TLS Secret changes (cert rotation/renewal)
-		// without waiting for an unrelated Ingress event. Filtered
-		// to kubernetes.io/tls to avoid watching every Secret.
-		b = b.Watches(&corev1.Secret{}, enqueueAll, builder.WithPredicates(
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				s, ok := o.(*corev1.Secret)
-				return ok && s.Type == corev1.SecretTypeTLS
-			})))
-	}
+	// Re-project on TLS Secret changes (cert rotation/renewal) and on a
+	// change to a CA, without waiting for an unrelated Ingress event. Every
+	// mode writes upstreams, and so reads CAs. Filtered to what holds one,
+	// to avoid enqueueing for every Secret.
+	b = b.Watches(&corev1.Secret{}, enqueueAll, builder.WithPredicates(r.secretPredicate()))
 	if r.GatewayAPI {
 		b = b.Watches(gwHTTPRoute(), enqueueAll).
 			Watches(gwGateway(), enqueueAll).

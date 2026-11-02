@@ -120,6 +120,13 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		EventsOn:                 &proxy,
 		Clock:                    r.Clock,
 	}
+	if u := proxy.Spec.UpstreamTLS; u != nil {
+		render.DefaultUpstreamTLS = &DefaultUpstreamTLS{Verify: u.Verify}
+		if ref := u.CASecretRef; ref != nil {
+			render.DefaultUpstreamTLS.CASecret = types.NamespacedName{Namespace: proxy.Namespace, Name: ref.Name}
+			render.DefaultUpstreamTLS.CAKey = ref.Key
+		}
+	}
 	var (
 		gatewayIn     gatewayInputs
 		gatewayStatus gatewayStatuses
@@ -246,9 +253,19 @@ func (r *SynapseRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		return reqs
 	})
-	tlsSecrets := predicate.NewPredicateFuncs(func(o client.Object) bool {
-		s, ok := o.(*corev1.Secret)
-		return ok && s.Type == corev1.SecretTypeTLS
+	// A Secret that holds a CA under another key is watched when a proxy's
+	// spec.upstreamTLS.caSecretRef names it.
+	tlsSecrets := secretWatch(func(ns, name string) bool {
+		var proxies synapsev1alpha1.SynapseProxyList
+		if err := r.List(context.Background(), &proxies, client.InNamespace(ns)); err != nil {
+			return false
+		}
+		for i := range proxies.Items {
+			if u := proxies.Items[i].Spec.UpstreamTLS; u != nil && u.CASecretRef != nil && u.CASecretRef.Name == name {
+				return true
+			}
+		}
+		return false
 	})
 
 	b := ctrl.NewControllerManagedBy(mgr).
@@ -262,7 +279,7 @@ func (r *SynapseRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&networkingv1.IngressClass{}, everyProxy).
 		// Backend addresses, and the address of the proxy's own Service.
 		Watches(&corev1.Service{}, everyProxy).
-		// Certificate issuance and renewal.
+		// Certificate issuance and renewal, and a CA changing.
 		Watches(&corev1.Secret{}, everyProxy, builder.WithPredicates(tlsSecrets))
 	if r.GatewayAPI {
 		// What is written to them is their status, which is not a reason

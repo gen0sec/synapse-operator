@@ -29,7 +29,8 @@ type v2File struct {
 			SecretFile string `json:"secret_file"`
 		} `json:"sticky_sessions"`
 	} `json:"proxy"`
-	Internal []struct {
+	UpstreamTLS *v2TLSOf `json:"upstream_tls"`
+	Internal    []struct {
 		Path     string `json:"path"`
 		Upstream string `json:"upstream"`
 	} `json:"internal"`

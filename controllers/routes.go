@@ -27,6 +27,9 @@ import (
 //   backend-protocol     HTTP|HTTPS  -> ssl_enabled (TLS to upstream)
 //   upstream-tls-verify  bool        -> upstream_tls.verify (nginx: proxy-ssl-verify on|off)
 //   upstream-tls-sni     name|IP     -> upstream_tls.sni (nginx: proxy-ssl-name)
+//   upstream-tls-ca      [ns/]secret -> upstream_tls.ca (nginx: proxy-ssl-secret); the
+//                        Secret's ca.crt is written beside the routes file as
+//                        ca-<sha256[:16]>.pem. Only the object's own namespace is read.
 //   http2                bool        -> http2_enabled
 //   force-https|ssl-redirect bool    -> https_proxy_enabled (force_https)
 //   connect-timeout      uint(sec)   -> connection_timeout
@@ -152,10 +155,14 @@ type annSettings struct {
 	upstreamTLS upstreamTLSAnn
 }
 
-// upstreamTLSAnn is the parsed upstream-tls-verify and upstream-tls-sni.
+// upstreamTLSAnn is the parsed upstream-tls-verify, -sni and -ca.
 type upstreamTLSAnn struct {
 	verify *bool
 	sni    string
+	// caNS and caName are the Secret the CA is in; caNS is empty for the
+	// namespace of the object. caFile is the path of its file in the pods,
+	// set once the Secret is read and found usable.
+	caNS, caName, caFile string
 	// refused lists each annotation that was dropped, as `key: "value"`.
 	refused []string
 }
@@ -164,15 +171,17 @@ type upstreamTLSAnn struct {
 type upstreamTLSCfg struct {
 	verify *bool
 	sni    string
+	ca     string
 }
 
 // upstreamTLSCfg is the route's upstream_tls: nothing unless the route is
 // HTTPS and has a name or a verify setting to say.
 func (a annSettings) upstreamTLSCfg() *upstreamTLSCfg {
-	if a.ssl == nil || !*a.ssl || (a.upstreamTLS.sni == "" && a.upstreamTLS.verify == nil) {
+	u := a.upstreamTLS
+	if a.ssl == nil || !*a.ssl || (u.sni == "" && u.verify == nil && u.caFile == "") {
 		return nil
 	}
-	return &upstreamTLSCfg{verify: a.upstreamTLS.verify, sni: a.upstreamTLS.sni}
+	return &upstreamTLSCfg{verify: u.verify, sni: u.sni, ca: u.caFile}
 }
 
 // certProjection is one TLS Secret to materialize into the synapse
@@ -207,6 +216,19 @@ type renderModel struct {
 	// far as anything else goes: a solver does not take a host from what
 	// may route it. See solverRoutesFor.
 	solvers map[string]map[string]string
+	// caFiles are the CA bundles routes name, by file name, written beside
+	// the routes file; caBytes is their size together.
+	caFiles map[string]string
+	caBytes int
+	// caNSFiles and caNSBytes are the same, by the namespace that brought
+	// them: one file two namespaces share counts for both.
+	caNSFiles map[string]map[string]struct{}
+	caNSBytes map[string]int
+	// caErr is a Secret that could not be read for a reason other than
+	// being unusable. The render fails on it, and is tried again.
+	caErr error
+	// defaultTLS is the proxy-wide `upstream_tls`.
+	defaultTLS *upstreamTLSCfg
 	// solverSources are the Ingresses and HTTPRoutes the solvers came
 	// from, each with the name it answers for: who is told when a solver
 	// cannot be served.
@@ -991,7 +1013,32 @@ func parseUpstreamTLS(ann map[string]string) upstreamTLSAnn {
 			u.refused = append(u.refused, fmt.Sprintf("%s: %q", key, v))
 		}
 	}
+	if key, v, ok := pick("upstream-tls-ca", "proxy-ssl-secret"); ok {
+		ns, name, valid := splitSecretRef(v)
+		if valid {
+			u.caNS, u.caName = ns, name
+		} else {
+			u.refused = append(u.refused, fmt.Sprintf("%s: %q", key, v))
+		}
+	}
 	return u
+}
+
+// splitSecretRef reads `name` or `namespace/name`.
+func splitSecretRef(v string) (ns, name string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(v), "/")
+	switch len(parts) {
+	case 1:
+		ns, name = "", parts[0]
+	case 2:
+		ns, name = parts[0], parts[1]
+		if ns == "" {
+			return "", "", false
+		}
+	default:
+		return "", "", false
+	}
+	return ns, name, name != ""
 }
 
 func parseBool(s string) *bool {
@@ -1256,6 +1303,10 @@ func renderUpstreamsV2(m *renderModel) string {
 			fmt.Fprintf(&b, "    secret_file: %q\n", m.stickySecretFile)
 		}
 	}
+	if t := m.defaultTLS; t != nil {
+		b.WriteString("upstream_tls:\n")
+		writeUpstreamTLSFields(&b, "  ", t)
+	}
 
 	// Stable iteration: terminate hosts first (sorted), then passthrough
 	// hosts (sorted). Single emission per host. Deterministic output
@@ -1328,6 +1379,18 @@ const defaultReadTimeoutSeconds = 120
 // writeRouteV2 emits one v2 route block. Field ordering and indentation
 // match the v2 schema (synapse-utils RawRoute) — anything else fails
 // the deny_unknown_fields parser.
+func writeUpstreamTLSFields(b *strings.Builder, indent string, t *upstreamTLSCfg) {
+	if t.verify != nil {
+		fmt.Fprintf(b, "%sverify: %t\n", indent, *t.verify)
+	}
+	if t.sni != "" {
+		fmt.Fprintf(b, "%ssni: %s\n", indent, strconv.Quote(t.sni))
+	}
+	if t.ca != "" {
+		fmt.Fprintf(b, "%sca: %s\n", indent, strconv.Quote(t.ca))
+	}
+}
+
 func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 	// A route is probed unless it says `healthcheck: false`. Synapse does
 	// not probe a route chosen by an expression at all, and refuses a file
@@ -1360,12 +1423,7 @@ func writeRouteV2(b *strings.Builder, rc *routeCfg) {
 	}
 	if t := rc.upstreamTLS; t != nil {
 		b.WriteString("        upstream_tls:\n")
-		if t.verify != nil {
-			fmt.Fprintf(b, "          verify: %t\n", *t.verify)
-		}
-		if t.sni != "" {
-			fmt.Fprintf(b, "          sni: %s\n", strconv.Quote(t.sni))
-		}
+		writeUpstreamTLSFields(b, "          ", t)
 	}
 	if rc.http2 != nil {
 		fmt.Fprintf(b, "        http2_enabled: %t\n", *rc.http2)
