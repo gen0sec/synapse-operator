@@ -262,6 +262,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
 	m.stickySecretFile = r.StickySecretFile
+	// The proxy-wide CA goes first: it then meets only its own size cap, and
+	// the CAs of the routes count after it.
+	r.resolveDefaultUpstreamTLS(ctx, m)
 
 	// Deterministic source order: Ingresses sorted by ns/name and
 	// processed BEFORE HTTPRoutes (first-writer-wins in addRoute), so
@@ -543,7 +546,6 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	}
 	hosts += len(m.passthroughHosts)
 
-	r.resolveDefaultUpstreamTLS(ctx, m)
 	if m.caErr != nil {
 		mRenderErrTotal.Inc()
 		return false, matched, hosts, fmt.Errorf("read CA: %w", m.caErr)
