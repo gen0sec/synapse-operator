@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -512,6 +513,29 @@ func serviceAddresses(svc *corev1.Service) []string {
 	return out
 }
 
+// stickyKeyOwner maps a Secret named <proxy>-sticky-key to the SynapseProxy
+// <proxy> of its namespace, when there is one. Owning the Secret does not
+// report an adopted key, which has no owner reference. One the proxy owns is
+// left to Owns.
+func (r *SynapseProxyReconciler) stickyKeyOwner(ctx context.Context, secret client.Object) []reconcile.Request {
+	proxyName, ok := strings.CutSuffix(secret.GetName(), proxyStickyKeySuffix)
+	if !ok || proxyName == "" {
+		return nil
+	}
+	var proxy synapsev1alpha1.SynapseProxy
+	key := client.ObjectKey{Namespace: secret.GetNamespace(), Name: proxyName}
+	if err := r.Get(ctx, key, &proxy); err != nil {
+		if !apierrors.IsNotFound(err) {
+			ctrl.LoggerFrom(ctx).Error(err, "get the SynapseProxy of a sticky key Secret")
+		}
+		return nil
+	}
+	if metav1.IsControlledBy(secret, &proxy) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
+}
+
 // SetupWithManager registers the controller.
 func (r *SynapseProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	err := mgr.GetFieldIndexer().IndexField(context.Background(), &synapsev1alpha1.SynapseProxy{}, proxyAPIKeySecretIndex,
@@ -554,5 +578,6 @@ func (r *SynapseProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.Secret{}, readers).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.stickyKeyOwner)).
 		Complete(r)
 }

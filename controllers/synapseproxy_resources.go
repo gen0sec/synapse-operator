@@ -93,10 +93,12 @@ func buildProxyConfigSecret(p *synapsev1alpha1.SynapseProxy, cfg ProxyConfigOutp
 	}
 }
 
+const proxyStickyKeySuffix = "-sticky-key"
+
 // proxyStickyKeyName is the Secret that holds the key sticky sessions sign
 // their cookies with. All pods of the proxy mount it, so they agree.
 func proxyStickyKeyName(p *synapsev1alpha1.SynapseProxy) string {
-	return p.Name + "-sticky-key"
+	return p.Name + proxyStickyKeySuffix
 }
 
 func buildProxyStickyKeySecret(p *synapsev1alpha1.SynapseProxy, key []byte) *corev1.Secret {
