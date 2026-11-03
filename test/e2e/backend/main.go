@@ -4,6 +4,9 @@
 // it was sent at all. With SERVE_DIR set it also serves the files of that
 // directory under /file/, which is how the test reads a file of a pod whose
 // images have no shell. PORT, 8080 unless set, is the port it listens on.
+// With TLS_DIR set it serves TLS, with the tls.crt and tls.key of that
+// directory. X-Backend-Pod names the pod that answered, which is how the test
+// sees which of several replicas a sticky session landed on.
 package main
 
 import (
@@ -17,11 +20,13 @@ import (
 
 func main() {
 	name := os.Getenv("NAME")
+	pod, _ := os.Hostname()
 	if dir := os.Getenv("SERVE_DIR"); dir != "" {
 		http.Handle("/file/", http.StripPrefix("/file/", http.FileServer(http.Dir(dir))))
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Backend", name)
+		w.Header().Set("X-Backend-Pod", pod)
 		w.Header().Set("X-Seen-From-Gateway", r.Header.Get("X-From-Gateway"))
 		// Every value, in the order they came: a header that was added to
 		// has the client's own first.
@@ -39,6 +44,9 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+	if dir := os.Getenv("TLS_DIR"); dir != "" {
+		log.Fatal(http.ListenAndServeTLS(":"+port, dir+"/tls.crt", dir+"/tls.key", nil))
 	}
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
