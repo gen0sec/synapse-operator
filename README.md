@@ -668,10 +668,17 @@ A missing source ConfigMap is **not** an error and never prunes files: leaving t
 
 ### Migrating an existing deployment
 
-Little changes on the operator side: set `--upstreams-ca-dir=/shared` if any route names a CA. Central mode keeps rendering into the
-same ConfigMap, so the sidecar is purely additive on the proxy pod — you can
-migrate one workload at a time, and the old mounted path stays valid
-throughout, which is what makes rollback trivial.
+Nothing changes on the operator side unless a route names a CA. Central mode
+keeps rendering into the same ConfigMap, so the sidecar is purely additive on
+the proxy pod — you can migrate one workload at a time, and the old mounted
+path stays valid throughout, which is what makes rollback trivial.
+
+A route with `upstream-tls-ca` breaks that. `--upstreams-ca-dir` applies to the
+whole operator and to every proxy that reads its ConfigMap: once it is
+`/shared`, a proxy still on the mounted path finds no CA file and refuses the
+routes file. With such routes, move every proxy that reads the ConfigMap to
+config-sync before you set the flag, and unset it before you roll one back. Or
+run a second operator and ConfigMap for the proxies on config-sync.
 
 The two capabilities are independent switches. `--config-sync` changes how
 config is *delivered*; `--resolve-backend-endpoints` changes how backends are
@@ -695,7 +702,7 @@ chart; the moving parts are:
 | `proxy.extraContainers` | the long-running sidecar, `runAsUser: 0` **and** `appArmorProfile: Unconfined` |
 | `proxy.configSync.rbac.create` | `true` — `configmaps: get,list,watch` in the namespace |
 | `proxy.synapse.config` | point `proxy.upstream.conf` at `/shared/upstreams.yaml` |
-| the central operator's arguments | `--upstreams-ca-dir=/shared`, the sidecar's `--out-dir`, when an Ingress names a CA (`upstream-tls-ca`) or a `SynapseProxy` sets `spec.upstreamTLS.caSecretRef` |
+| the central operator's arguments | `--upstreams-ca-dir=/shared`, the sidecar's `--out-dir`, when an Ingress or HTTPRoute names a CA (`upstream-tls-ca`). A `SynapseProxy` is not affected: its routes always name its own mount |
 
 The routes file names each CA file by path. Without `--upstreams-ca-dir`, the
 path is under `/etc/synapse/upstreams`, the kubelet mount, which is
