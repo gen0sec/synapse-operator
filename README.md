@@ -594,6 +594,7 @@ Before this default, it was `app.kubernetes.io/name=synapse`. An install that do
 | `--ingress-class` | `synapse` | `spec.ingressClassName` this controller serves |
 | `--upstreams-out` | `/shared/upstreams.yaml` | Path of the rendered upstreams file (sidecar layout) |
 | `--upstreams-out-configmap` | _(none)_ | Central layout: write the rendered `upstreams.yaml` to this ConfigMap (`namespace/name`) instead of a file. Only the `upstreams.yaml` key is updated; other keys are preserved. Synapse reloads from its ConfigMap mount. |
+| `--upstreams-ca-dir` | _(the SynapseProxy mount, `/etc/synapse/upstreams`)_ | Used only with `--upstreams-out-configmap`. Absolute directory the proxies read the `ca-<hex>.pem` files from; the routes name each CA file there. Set it to the config-sync sidecar's `--out-dir` (`/shared`) when the proxies read the ConfigMap through config-sync. A relative value stops the operator at startup. |
 | `--resolve-backend-cluster-ips` | `false` | Emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port`, so Synapse skips backend DNS (falls back to the FQDN for headless / ExternalName / unallocated Services) |
 | `--cluster-domain` | `cluster.local` | Cluster DNS domain for backend FQDNs |
 | `--certs-out` | _(disabled)_ | Directory to project referenced TLS Secrets into |
@@ -667,7 +668,7 @@ A missing source ConfigMap is **not** an error and never prunes files: leaving t
 
 ### Migrating an existing deployment
 
-Nothing changes on the operator side. Central mode keeps rendering into the
+Little changes on the operator side: set `--upstreams-ca-dir=/shared` if any route names a CA. Central mode keeps rendering into the
 same ConfigMap, so the sidecar is purely additive on the proxy pod — you can
 migrate one workload at a time, and the old mounted path stays valid
 throughout, which is what makes rollback trivial.
@@ -694,6 +695,15 @@ chart; the moving parts are:
 | `proxy.extraContainers` | the long-running sidecar, `runAsUser: 0` **and** `appArmorProfile: Unconfined` |
 | `proxy.configSync.rbac.create` | `true` — `configmaps: get,list,watch` in the namespace |
 | `proxy.synapse.config` | point `proxy.upstream.conf` at `/shared/upstreams.yaml` |
+| the central operator's arguments | `--upstreams-ca-dir=/shared`, the sidecar's `--out-dir`, when an Ingress names a CA (`upstream-tls-ca`) or a `SynapseProxy` sets `spec.upstreamTLS.caSecretRef` |
+
+The routes file names each CA file by path. Without `--upstreams-ca-dir`, the
+path is under `/etc/synapse/upstreams`, the kubelet mount, which is
+re-projected about a minute after the sidecar has written the file. Synapse
+then refuses the routes file and keeps its old routes. With the flag, the
+routes name `/shared/ca-<hex>.pem`, which the sidecar writes before
+`upstreams.yaml`. `--sync-keys` MUST include the `ca-<hex>.pem` files, or stay
+empty (all keys); a list that leaves them out never delivers the CA files.
 
 Leave the ConfigMap projection in place. Once `conf` points at `/shared` the
 mounted `upstreams.yaml` is inert, but keeping it means reverting is a values

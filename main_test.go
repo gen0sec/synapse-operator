@@ -384,3 +384,26 @@ func TestDefaultLabelSelector(t *testing.T) {
 	}
 	assert.False(t, selector.Matches(labels.Set{"app": "synapse"}), "missing label")
 }
+
+func TestUpstreamsCADirError(t *testing.T) {
+	tests := []struct {
+		name, dir, want string
+	}{
+		{name: "unset", dir: ""},
+		{name: "absolute", dir: "/shared"},
+		{name: "relative", dir: "shared", want: "absolute"},
+		{name: "dot", dir: ".", want: "absolute"},
+		{name: "parent", dir: "../shared", want: "absolute"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := upstreamsCADirError(tt.dir)
+			if tt.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, "--upstreams-ca-dir")
+			assert.Contains(t, got, tt.want)
+		})
+	}
+}

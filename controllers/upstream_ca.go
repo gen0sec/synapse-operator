@@ -82,10 +82,15 @@ func checkCAPEM(pemBytes []byte) error {
 	return nil
 }
 
-// caDir is where the pods read the CA files: beside the routes file.
+// caPath is where the pods read the CA files: beside the routes file, unless
+// UpstreamsCADir names another directory for the ConfigMap output.
 func (r *IngressReconciler) caPath(file string) string {
 	if r.usesConfigMapOutput() {
-		return path.Join(path.Dir(proxyUpstreamsFile), file)
+		dir := r.UpstreamsCADir
+		if dir == "" {
+			dir = path.Dir(proxyUpstreamsFile)
+		}
+		return path.Join(dir, file)
 	}
 	return filepath.Join(filepath.Dir(r.UpstreamsOutPath), file)
 }

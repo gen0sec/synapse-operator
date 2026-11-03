@@ -580,3 +580,26 @@ func TestRoutes_UpstreamCAUnusableSaysWhatTheRouteFallsBackTo(t *testing.T) {
 		t.Errorf("the event is %q, want it to name the proxy-wide CA and the system roots", got[0])
 	}
 }
+
+func TestCAPath(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "upstreams.yaml")
+	cm := types.NamespacedName{Namespace: "ns", Name: "routes"}
+	tests := []struct {
+		name string
+		r    *IngressReconciler
+		want string
+	}{
+		{"configmap, no dir: the SynapseProxy mount", &IngressReconciler{UpstreamsOutConfigMap: cm}, "/etc/synapse/upstreams/ca-1.pem"},
+		{"configmap, dir set", &IngressReconciler{UpstreamsOutConfigMap: cm, UpstreamsCADir: "/shared"}, "/shared/ca-1.pem"},
+		{"configmap, dir with a trailing slash", &IngressReconciler{UpstreamsOutConfigMap: cm, UpstreamsCADir: "/shared/"}, "/shared/ca-1.pem"},
+		{"file output beside the routes file", &IngressReconciler{UpstreamsOutPath: out}, filepath.Join(filepath.Dir(out), "ca-1.pem")},
+		{"file output ignores the dir", &IngressReconciler{UpstreamsOutPath: out, UpstreamsCADir: "/shared"}, filepath.Join(filepath.Dir(out), "ca-1.pem")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.r.caPath("ca-1.pem"); got != tt.want {
+				t.Fatalf("caPath = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

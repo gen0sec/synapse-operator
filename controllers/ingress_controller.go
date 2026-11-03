@@ -157,6 +157,10 @@ type IngressReconciler struct {
 	// synapse reads through a ConfigMap mount and reloads via its own
 	// inotify/poll machinery. Cannot be combined with `UpstreamsOutPath`.
 	UpstreamsOutConfigMap types.NamespacedName
+	// UpstreamsCADir: with UpstreamsOutConfigMap, the absolute directory
+	// the proxies read the ca-*.pem files from. Empty means the directory
+	// of the SynapseProxy mount.
+	UpstreamsCADir string
 	// ResolveBackendClusterIPs swaps the `<svc>.<ns>.svc.<ClusterDomain>`
 	// FQDN that `backendAddr` would normally emit for an Ingress
 	// backend with the Service's `spec.clusterIP`. Cuts the DNS round-
