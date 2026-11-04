@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -73,6 +74,7 @@ func main() {
 	var ingressClass string
 	var upstreamsOut string
 	var upstreamsOutConfigMap string
+	var upstreamsCADir string
 	var resolveBackendClusterIPs bool
 	var resolveBackendEndpoints bool
 	var clusterDomain string
@@ -116,6 +118,7 @@ func main() {
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode, sidecar layout: a shared volume synapse inotify-reloads). Ignored when --upstreams-out-configmap is set.")
 	flag.StringVar(&upstreamsOutConfigMap, "upstreams-out-configmap", "", "Ingress-mode central layout: write the rendered upstreams.yaml to this ConfigMap (format namespace/name) instead of a file path. Disables SIGHUP signalling — synapse-proxy reloads via its own machinery on the ConfigMap mount.")
+	flag.StringVar(&upstreamsCADir, "upstreams-ca-dir", "", "Absolute directory the proxies read the ca-*.pem files from, written into the routes as the CA path. Used only with --upstreams-out-configmap. Default: the SynapseProxy mount, /etc/synapse/upstreams. Set it to the config-sync sidecar's --out-dir when the proxies read the ConfigMap through config-sync.")
 	flag.BoolVar(&resolveBackendEndpoints, "resolve-backend-endpoints", false, "Ingress-mode: render the READY pod IPs from EndpointSlices as the server list, instead of a single Service address. Pod IPs are literals, so synapse never resolves DNS for them and a replaced pod is picked up on the next render instead of after its DNS-cache TTL. Falls back to ClusterIP/FQDN when the endpoint set is missing or empty.")
 	flag.BoolVar(&resolveBackendClusterIPs, "resolve-backend-cluster-ips", false, "Ingress-mode: emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port` for each backend, so synapse-proxy's HttpPeer skips DNS. Falls back to the FQDN for headless / ExternalName / not-yet-allocated Services.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
@@ -159,6 +162,11 @@ func main() {
 	outCM, err := parseNamespacedName(upstreamsOutConfigMap)
 	if err != nil {
 		setupLog.Error(err, "--upstreams-out-configmap")
+		os.Exit(1)
+	}
+
+	if why := upstreamsCADirError(upstreamsCADir); why != "" {
+		setupLog.Error(nil, why)
 		os.Exit(1)
 	}
 
@@ -246,6 +254,7 @@ func main() {
 			IngressClassName:         ingressClass,
 			UpstreamsOutPath:         upstreamsOut,
 			UpstreamsOutConfigMap:    outCM,
+			UpstreamsCADir:           upstreamsCADir,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
 			ResolveBackendEndpoints:  resolveBackendEndpoints,
 			CertsOutDir:              certsOut,
@@ -378,6 +387,7 @@ func main() {
 			IngressClassName:         ingressClass,
 			UpstreamsOutPath:         upstreamsOut,
 			UpstreamsOutConfigMap:    outCM,
+			UpstreamsCADir:           upstreamsCADir,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
 			ResolveBackendEndpoints:  resolveBackendEndpoints,
 			CertsOutDir:              certsOut,
@@ -669,4 +679,12 @@ func parseKeySet(value string) map[string]struct{} {
 		return nil
 	}
 	return entries
+}
+
+// upstreamsCADirError reports why --upstreams-ca-dir cannot be used, or "".
+func upstreamsCADirError(dir string) string {
+	if dir != "" && !path.IsAbs(dir) {
+		return fmt.Sprintf("--upstreams-ca-dir %q must be an absolute path", dir)
+	}
+	return ""
 }
