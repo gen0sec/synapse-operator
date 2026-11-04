@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -20,7 +21,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -652,3 +655,161 @@ func TestRoutes_TheProxyWideCAIsLoadedBeforeTheRoutes(t *testing.T) {
 		t.Errorf("UpstreamCAUnusable events: %v, want one for the tenant CA that names the 128 KiB cap", got)
 	}
 }
+
+// objEvents records the events with the namespace/name of their object, which
+// FakeRecorder does not say for an object with no type information.
+type objEvents struct{ got []string }
+
+func (o *objEvents) Event(obj runtime.Object, etype, reason, msg string) {
+	name := ""
+	if co, ok := obj.(client.Object); ok {
+		name = co.GetNamespace() + "/" + co.GetName()
+	}
+	o.got = append(o.got, name+" "+reason+" "+msg)
+}
+
+func (o *objEvents) Eventf(obj runtime.Object, etype, reason, msgFmt string, args ...any) {
+	o.Event(obj, etype, reason, fmt.Sprintf(msgFmt, args...))
+}
+
+func (o *objEvents) AnnotatedEventf(obj runtime.Object, _ map[string]string, etype, reason, msgFmt string, args ...any) {
+	o.Eventf(obj, etype, reason, msgFmt, args...)
+}
+
+func (o *objEvents) reason(reason string) []string {
+	var out []string
+	for _, e := range o.got {
+		if strings.Contains(e, " "+reason+" ") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// padRoutes are ingresses of the namespace pad that carry no CA. Their long
+// paths make the routes file big without many objects.
+func padRoutes(n int) []client.Object {
+	var objs []client.Object
+	long := "/" + strings.Repeat("x", 900)
+	for i := 0; i < n; i++ {
+		ing := routedIngress(fmt.Sprintf("p%04d", i), ptr("public"), fmt.Sprintf("p%04d.example.com", i))
+		ing.Namespace = "pad"
+		ing.Spec.Rules[0].HTTP.Paths[0].Path = long
+		objs = append(objs, ing)
+	}
+	return objs
+}
+
+func TestRoutes_TheConfigMapStaysUnderItsLimitByDroppingTheLastCA(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	objs := append([]client.Object{edge, classFor("public", edge)}, padRoutes(padCount)...)
+	bundles := map[string]string{}
+	for _, n := range []string{"a", "b", "c"} {
+		ca := paddedCA(t, "big-"+n, 60*1024)
+		bundles[n] = ca
+		objs = append(objs,
+			httpsIngress(n, "web", n+".example.com", annPrefix+"upstream-tls-ca", "ca-"+n),
+			caSecret(n, "ca-"+n, ca))
+	}
+	events := &objEvents{}
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	cm := routesConfigMap(t, r, edge)
+	size := 0
+	for k, v := range cm.Data {
+		size += len(k) + len(v)
+	}
+	if size > maxRoutesConfigMapBytes {
+		t.Errorf("the ConfigMap holds %d bytes, over the %d budget", size, maxRoutesConfigMapBytes)
+	}
+	want := []string{caKeyOf(bundles["a"]), caKeyOf(bundles["b"])}
+	sort.Strings(want)
+	if got := caKeys(cm); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("CA keys are %v, want the first two bundles %v", got, want)
+	}
+	doc := parseV2(t, cm.Data[UpstreamsKey])
+	for host, ca := range map[string]string{"a.example.com": bundles["a"], "b.example.com": bundles["b"]} {
+		if tls := doc.Hosts[host].Paths["/"].UpstreamTLS; tls == nil || tls.CA != "/etc/synapse/upstreams/"+caKeyOf(ca) {
+			t.Errorf("%s: upstream_tls is %+v, want its CA kept", host, tls)
+		}
+	}
+	if tls := doc.Hosts["c.example.com"].Paths["/"].UpstreamTLS; tls == nil || tls.CA != "" {
+		t.Errorf("c.example.com: upstream_tls is %+v, want it kept without a CA", tls)
+	}
+	got := events.reason("UpstreamCAUnusable")
+	if len(got) != 1 || !strings.HasPrefix(got[0], "c/web ") || !strings.Contains(got[0], "the routes ConfigMap is full") {
+		t.Errorf("UpstreamCAUnusable events: %v, want one on c/web that says the routes ConfigMap is full", got)
+	}
+}
+
+func TestRoutes_AFullConfigMapTellsEveryNamespaceThatSharesTheDroppedCA(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	objs := append([]client.Object{edge, classFor("public", edge)}, padRoutes(padCount+40)...)
+	first := paddedCA(t, "first", 60*1024)
+	shared := paddedCA(t, "shared", 60*1024)
+	objs = append(objs,
+		httpsIngress("a", "web", "a.example.com", annPrefix+"upstream-tls-ca", "ca"), caSecret("a", "ca", first),
+		httpsIngress("b", "web", "b.example.com", annPrefix+"upstream-tls-ca", "ca"), caSecret("b", "ca", shared),
+		httpsIngress("c", "web", "c.example.com", annPrefix+"upstream-tls-ca", "ca"), caSecret("c", "ca", shared))
+	events := &objEvents{}
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	if keys := caKeys(routesConfigMap(t, r, edge)); len(keys) != 1 || keys[0] != caKeyOf(first) {
+		t.Errorf("CA keys are %v, want only the first bundle", keys)
+	}
+	got := strings.Join(events.reason("UpstreamCAUnusable"), "\n")
+	for _, owner := range []string{"b/web", "c/web"} {
+		if !strings.Contains(got, owner) || strings.Count(got, owner+" UpstreamCAUnusable") != 1 {
+			t.Errorf("want one UpstreamCAUnusable on %s, got:\n%s", owner, got)
+		}
+	}
+	if strings.Contains(got, "a/web") {
+		t.Errorf("the kept CA's route was told it is unusable:\n%s", got)
+	}
+}
+
+func TestRoutes_TheProxyWideCAIsDroppedWithoutRoutesToDropFirst(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	edge.Spec.UpstreamTLS = &synapsev1alpha1.UpstreamTLSSpec{
+		CASecretRef: &synapsev1alpha1.CASecretReference{Name: "internal-ca", Key: "ca.crt"},
+	}
+	proxyCA := paddedCA(t, "proxy-wide", 60*1024)
+	objs := append([]client.Object{edge, classFor("public", edge), caSecret("synapse-os", "internal-ca", proxyCA)}, padRoutes(padCount+100)...)
+	events := &objEvents{}
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	cm := routesConfigMap(t, r, edge)
+	if keys := caKeys(cm); len(keys) != 0 {
+		t.Errorf("CA keys %v remain", keys)
+	}
+	if doc := parseV2(t, cm.Data[UpstreamsKey]); doc.UpstreamTLS != nil {
+		t.Errorf("the proxy-wide upstream_tls is %+v, want none", doc.UpstreamTLS)
+	}
+	got := events.reason("UpstreamCAUnusable")
+	if len(got) != 1 || !strings.HasPrefix(got[0], "synapse-os/edge ") || !strings.Contains(got[0], "the routes ConfigMap is full") {
+		t.Errorf("UpstreamCAUnusable events: %v, want one on the proxy", got)
+	}
+}
+
+func TestRoutes_RoutesAloneOverTheLimitFailTheRender(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	objs := append([]client.Object{edge, classFor("public", edge)}, padRoutes(1200)...)
+	r := newRouteReconciler(t, objs...)
+	err := reconcileRoutes(t, r, edge)
+	if err == nil || !strings.Contains(err.Error(), "RoutesTooLarge") {
+		t.Fatalf("reconcile error is %v, want RoutesTooLarge", err)
+	}
+	var cm corev1.ConfigMap
+	key := client.ObjectKey{Namespace: edge.Namespace, Name: edge.Name + "-upstreams"}
+	if err := r.Get(context.Background(), key, &cm); !apierrors.IsNotFound(err) {
+		t.Errorf("the ConfigMap was written (get: %v)", err)
+	}
+}
+
+const padCount = 840

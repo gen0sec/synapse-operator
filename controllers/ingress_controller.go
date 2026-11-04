@@ -250,6 +250,23 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 // the same time cannot hide each other's failures.
 func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int, claimsNotRecorded *bool) (bool, int, int, error) {
 	mRenderTotal.Inc()
+	// A render that does not fit the routes ConfigMap is done again without
+	// the CA file added last, until it fits or no CA file is left.
+	blocked := map[string]struct{}{}
+	for {
+		changed, matched, hosts, err := r.renderPass(ctx, certsFailed, claimsNotRecorded, blocked)
+		if !errors.Is(err, errCADropped) {
+			return changed, matched, hosts, err
+		}
+	}
+}
+
+// errCADropped says renderPass dropped a CA file and wants another pass.
+var errCADropped = errors.New("a CA file was dropped to fit the routes ConfigMap")
+
+// renderPass is one render. It skips the CA files in blocked, and adds the one
+// it drops to it.
+func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, claimsNotRecorded *bool, blocked map[string]struct{}) (bool, int, int, error) {
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
 		mRenderErrTotal.Inc()
@@ -266,6 +283,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
 	m.stickySecretFile = r.StickySecretFile
+	m.caBlocked = blocked
 	// The proxy-wide CA goes first: it then meets only its own size cap, and
 	// the CAs of the routes count after it.
 	r.resolveDefaultUpstreamTLS(ctx, m)
@@ -555,6 +573,13 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		return false, matched, hosts, fmt.Errorf("read CA: %w", m.caErr)
 	}
 	yaml := renderUpstreamsV2(m)
+	if r.usesConfigMapOutput() && len(yaml)+m.caBytes > maxRoutesConfigMapBytes {
+		if r.dropLastCA(m, blocked) {
+			return false, 0, 0, errCADropped
+		}
+		mRenderErrTotal.Inc()
+		return false, matched, hosts, fmt.Errorf("RoutesTooLarge: the routes file is %d bytes, over the %d the routes ConfigMap may hold", len(yaml), maxRoutesConfigMapBytes)
+	}
 	var (
 		changed bool
 		err     error
