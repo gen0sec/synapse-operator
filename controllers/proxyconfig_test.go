@@ -378,6 +378,7 @@ func TestRenderProxyConfig_RefusesKeysItOwns(t *testing.T) {
 		"proxy.address_tls":               `"0.0.0.0:443"`,
 		"proxy.certificates":              `"/certs"`,
 		"proxy.upstream.conf":             `"/x/upstreams.yaml"`,
+		"proxy.enabled":                   `false`,
 		"proxy.acme":                      `{"enabled": true}`,
 		"firewall.ids":                    `{"enforce_block": false}`,
 		"proxy.internal_services.enabled": `false`,
