@@ -189,6 +189,11 @@ type IngressReconciler struct {
 	ready      atomic.Bool
 	reloadOnce sync.Once
 	signaler   *ReloadSignaler
+
+	// renderMu lets one render at a time own events. A pass keeps its Events
+	// there until it is known to be the last.
+	renderMu sync.Mutex
+	events   atomic.Pointer[eventBuffer]
 }
 
 // usesConfigMapOutput reports whether the reconciler is in central
@@ -249,7 +254,54 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 // ledger could not be written. The caller owns both, so renders that run at
 // the same time cannot hide each other's failures.
 func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int, claimsNotRecorded *bool) (bool, int, int, error) {
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
 	mRenderTotal.Inc()
+	// A render that does not fit the routes ConfigMap is done again without
+	// the CA file added last, until it fits or no CA file is left. Only the
+	// last pass speaks: its Events are sent, and the drops are told only when
+	// the render succeeds, since a failed render leaves the old CA in place.
+	ps := &renderState{blocked: map[string]struct{}{}, drops: &eventBuffer{}}
+	for {
+		pass := &eventBuffer{}
+		changed, matched, hosts, err := func() (bool, int, int, error) {
+			r.events.Store(pass)
+			defer r.events.Store(nil)
+			return r.renderPass(ctx, certsFailed, claimsNotRecorded, ps)
+		}()
+		if errors.Is(err, errCADropped) {
+			continue
+		}
+		pass.send(r.Recorder)
+		if err == nil {
+			ps.drops.send(r.Recorder)
+		}
+		return changed, matched, hosts, err
+	}
+}
+
+// errCADropped says renderPass dropped a CA file and wants another pass.
+var errCADropped = errors.New("a CA file was dropped to fit the routes ConfigMap")
+
+// renderState is what the passes of one render share.
+type renderState struct {
+	// blocked holds the CA files the passes have dropped.
+	blocked map[string]struct{}
+	// drops holds the Events of the dropped CA files.
+	drops *eventBuffer
+	// claims is the outcome of ageClaims, once it has run. It changes the
+	// ledger and tells of what it dropped, so it runs in the first pass only.
+	claims     []hostClaim
+	claimsAged bool
+	// certsDone says the certificates were projected, which also tells of
+	// the ones that failed, so it is done in the first pass only.
+	certsDone bool
+}
+
+// renderPass is one render. It skips the CA files in ps.blocked, and adds the
+// one it drops to it.
+func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, claimsNotRecorded *bool, ps *renderState) (bool, int, int, error) {
+	blocked := ps.blocked
 	var list networkingv1.IngressList
 	if err := r.List(ctx, &list); err != nil {
 		mRenderErrTotal.Inc()
@@ -266,6 +318,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	logger := ctrl.LoggerFrom(ctx).WithName("ingress")
 	m := newRenderModel()
 	m.stickySecretFile = r.StickySecretFile
+	m.caBlocked = blocked
 	// The proxy-wide CA goes first: it then meets only its own size cap, and
 	// the CAs of the routes count after it.
 	r.resolveDefaultUpstreamTLS(ctx, m)
@@ -310,11 +363,16 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		if r.ExtraClaims != nil {
 			claims = append(claims, r.ExtraClaims()...)
 		}
-		var err error
-		if claims, err = r.ageClaims(ctx, claims, claimsNotRecorded); err != nil {
-			mRenderErrTotal.Inc()
-			return false, 0, 0, err
+		if !ps.claimsAged {
+			var err error
+			r.unbuffered(func() { claims, err = r.ageClaims(ctx, claims, claimsNotRecorded) })
+			if err != nil {
+				mRenderErrTotal.Inc()
+				return false, 0, 0, err
+			}
+			ps.claims, ps.claimsAged = claims, true
 		}
+		claims = ps.claims
 		m.owners = resolveHostOwners(claims)
 	}
 	var served, refusedIngs []*networkingv1.Ingress
@@ -531,16 +589,27 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	// mode writes <stem>.crt/<stem>.key into the shared CertsOutDir. Both
 	// are per-pod, never leader-gated (mirrors the upstreams file-vs-CM
 	// split); synapse inotify-hot-reloads certs independently of SIGHUP.
-	if r.usesCertsSecretOutput() {
-		if _, _, cerr := r.projectCertsToSecret(ctx, m); cerr != nil {
+	if !ps.certsDone {
+		var cerr error
+		r.unbuffered(func() {
+			if r.usesCertsSecretOutput() {
+				if _, _, cerr = r.projectCertsToSecret(ctx, m); cerr != nil {
+					cerr = fmt.Errorf("project certs to secret: %w", cerr)
+				}
+				return
+			}
+			var failed int
+			if _, _, failed, cerr = r.writeCerts(ctx, m); cerr != nil {
+				cerr = fmt.Errorf("project certs: %w", cerr)
+				return
+			}
+			*certsFailed = failed
+		})
+		if cerr != nil {
 			mRenderErrTotal.Inc()
-			return false, matched, len(m.hosts), fmt.Errorf("project certs to secret: %w", cerr)
+			return false, matched, len(m.hosts), cerr
 		}
-	} else if _, _, failed, cerr := r.writeCerts(ctx, m); cerr != nil {
-		mRenderErrTotal.Inc()
-		return false, matched, len(m.hosts), fmt.Errorf("project certs: %w", cerr)
-	} else {
-		*certsFailed = failed
+		ps.certsDone = true
 	}
 
 	hosts, routes := 0, 0
@@ -555,6 +624,15 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		return false, matched, hosts, fmt.Errorf("read CA: %w", m.caErr)
 	}
 	yaml := renderUpstreamsV2(m)
+	if r.usesConfigMapOutput() && len(yaml)+m.caBytes > maxRoutesConfigMapBytes {
+		var dropped bool
+		r.eventsInto(ps.drops, func() { dropped = r.dropLastCA(m, blocked) })
+		if dropped {
+			return false, 0, 0, errCADropped
+		}
+		mRenderErrTotal.Inc()
+		return false, matched, hosts, fmt.Errorf("RoutesTooLarge: the routes file is %d bytes, over the %d the routes ConfigMap may hold", len(yaml), maxRoutesConfigMapBytes)
+	}
 	var (
 		changed bool
 		err     error
@@ -776,8 +854,43 @@ func (r *IngressReconciler) emit(obj runtime.Object, etype, reason, msgFmt strin
 	if r.Recorder == nil || obj == nil {
 		return
 	}
+	if b := r.events.Load(); b != nil {
+		b.add(obj, etype, reason, fmt.Sprintf(msgFmt, args...))
+		return
+	}
 	r.Recorder.Eventf(obj, etype, reason, msgFmt, args...)
 }
+
+// eventBuffer holds Events until they are sent, or dropped.
+type eventBuffer struct{ evs []bufferedEvent }
+
+type bufferedEvent struct {
+	obj                 runtime.Object
+	etype, reason, text string
+}
+
+func (b *eventBuffer) add(obj runtime.Object, etype, reason, text string) {
+	b.evs = append(b.evs, bufferedEvent{obj, etype, reason, text})
+}
+
+func (b *eventBuffer) send(rec record.EventRecorder) {
+	if rec == nil {
+		return
+	}
+	for _, e := range b.evs {
+		rec.Event(e.obj, e.etype, e.reason, e.text)
+	}
+}
+
+// eventsInto runs f with the Events it emits going to b.
+func (r *IngressReconciler) eventsInto(b *eventBuffer, f func()) {
+	prev := r.events.Swap(b)
+	defer r.events.Store(prev)
+	f()
+}
+
+// unbuffered runs f with the Events it emits sent at once.
+func (r *IngressReconciler) unbuffered(f func()) { r.eventsInto(nil, f) }
 
 // publishStatus writes StatusAddresses onto each served Ingress's
 // .status.loadBalancer.ingress (idempotent: only patches on change). An

@@ -15,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -31,7 +32,15 @@ const (
 	// maxCANamespaceBytes caps the distinct bundles one namespace brings in
 	// a render, so that one tenant cannot use the whole of maxCAFilesBytes.
 	maxCANamespaceBytes = 128 * 1024
+	// maxRoutesConfigMapBytes is what the routes file and the CA files may
+	// hold together in the ConfigMap: 1 MiB, less 16 KiB for the metadata and
+	// the key names.
+	maxRoutesConfigMapBytes = 1024*1024 - 16*1024
 )
+
+// caBlockedWhy is what loadCA says of a file that was dropped for want of room
+// in the routes ConfigMap. Its owners were told when it was dropped.
+const caBlockedWhy = "the routes ConfigMap is full"
 
 // caFileRE is the name of a file this controller writes for a CA. Anything
 // else in the directory or the ConfigMap is not its to remove.
@@ -121,6 +130,7 @@ func (m *renderModel) addCAFile(ns, file string, pemBytes []byte) string {
 	if _, ok := m.caFiles[file]; !ok {
 		m.caFiles[file] = string(pemBytes)
 		m.caBytes += len(pemBytes)
+		m.caOrder = append(m.caOrder, file)
 	}
 	return ""
 }
@@ -144,6 +154,9 @@ func (r *IngressReconciler) loadCA(ctx context.Context, m *renderModel, ns, name
 		return "", fmt.Sprintf("%s/%s key %q cannot be used: %v", ns, name, key, err), nil
 	}
 	file := caFileName(data)
+	if _, blocked := m.caBlocked[file]; blocked {
+		return "", caBlockedWhy, nil
+	}
 	if why := m.addCAFile(ns, file, data); why != "" {
 		return "", fmt.Sprintf("%s/%s key %q cannot be used: %s", ns, name, key, why), nil
 	}
@@ -173,10 +186,14 @@ func (r *IngressReconciler) resolveUpstreamCA(ctx context.Context, m *renderMode
 		m.caErr = errors.Join(m.caErr, err)
 		return
 	}
+	if why == caBlockedWhy {
+		return
+	}
 	if why != "" {
 		r.emit(obj, corev1.EventTypeWarning, "UpstreamCAUnusable", "%s; the route writes no CA, so Synapse checks it against the proxy-wide upstream_tls.ca when that is set, else the system roots", why)
 		return
 	}
+	m.addCAOwner(path.Base(file), obj)
 	u.caFile = file
 }
 
@@ -196,15 +213,59 @@ func (r *IngressReconciler) resolveDefaultUpstreamTLS(ctx context.Context, m *re
 		switch {
 		case err != nil:
 			m.caErr = errors.Join(m.caErr, err)
+		case why == caBlockedWhy:
 		case why != "":
 			r.emit(r.EventsOn, corev1.EventTypeWarning, "UpstreamCAUnusable", "spec.upstreamTLS.caSecretRef: %s; routes with no CA of their own are checked against the system roots", why)
 		default:
+			m.addCAOwner(path.Base(file), r.EventsOn)
 			cfg.ca = file
 		}
 	}
 	if cfg.verify != nil || cfg.ca != "" {
 		m.defaultTLS = cfg
 	}
+}
+
+// addCAOwner records that obj names the CA file, once.
+func (m *renderModel) addCAOwner(file string, obj runtime.Object) {
+	if obj == nil {
+		return
+	}
+	key := ownerKey(obj)
+	for _, o := range m.caOwners[file] {
+		if ownerKey(o) == key {
+			return
+		}
+	}
+	if m.caOwners == nil {
+		m.caOwners = map[string][]runtime.Object{}
+	}
+	m.caOwners[file] = append(m.caOwners[file], obj)
+}
+
+func ownerKey(o runtime.Object) string {
+	if co, ok := o.(client.Object); ok {
+		return fmt.Sprintf("%T/%s/%s", o, co.GetNamespace(), co.GetName())
+	}
+	return fmt.Sprintf("%T/%p", o, o)
+}
+
+// dropLastCA blocks the CA file that was added last, tells its owners, and
+// returns false when there is none left. The caller renders again.
+func (r *IngressReconciler) dropLastCA(m *renderModel, blocked map[string]struct{}) bool {
+	if len(m.caOrder) == 0 {
+		return false
+	}
+	file := m.caOrder[len(m.caOrder)-1]
+	blocked[file] = struct{}{}
+	for _, o := range m.caOwners[file] {
+		if o == r.EventsOn {
+			r.emit(o, corev1.EventTypeWarning, "UpstreamCAUnusable", "spec.upstreamTLS.caSecretRef: %s; routes with no CA of their own are checked against the system roots", caBlockedWhy)
+			continue
+		}
+		r.emit(o, corev1.EventTypeWarning, "UpstreamCAUnusable", "%s; the route writes no CA, so Synapse checks it against the proxy-wide upstream_tls.ca when that is set, else the system roots", caBlockedWhy)
+	}
+	return true
 }
 
 // pruneCAFiles removes the CA files in dir that the render does not name.
