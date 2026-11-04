@@ -141,8 +141,11 @@ func TestConfigSync_EnsureFilesCreatesAValidFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if want := renderUpstreams(newRenderModel()); string(got) != want {
+	if want := proxyFloor(); string(got) != want {
 		t.Errorf("floor = %q, want %q", got, want)
+	}
+	if hosts := parseV2(t, string(got)).Hosts; len(hosts) != 0 {
+		t.Errorf("floor routes hosts: %v", hosts)
 	}
 }
 

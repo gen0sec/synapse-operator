@@ -2,10 +2,13 @@ package controllers
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -62,8 +65,8 @@ func TestRegexRouteRender(t *testing.T) {
 		[]backend{{addr: "other:1"}}, annSettings{}, nil, nil) {
 		t.Fatal("duplicate regex route must be rejected (first-writer-wins)")
 	}
-	wantExpr := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
-	for _, out := range []string{renderUpstreams(m), renderUpstreamsV2(m)} {
+	wantExpr := `match_expr: "http.request.path matches \"^(?:^/api/runs/[^/]+/stream$)\""`
+	for _, out := range []string{renderUpstreamsV2(m)} {
 		if !strings.Contains(out, wantExpr) {
 			t.Fatalf("rendered config missing match_expr:\nwant substring: %s\ngot:\n%s", wantExpr, out)
 		}
@@ -73,13 +76,55 @@ func TestRegexRouteRender(t *testing.T) {
 	}
 }
 
+// A regex reaches Synapse as it was written. Quoted like a string, its
+// backslashes were doubled, and `\d` was a backslash and a d.
+func TestRegexRouteKeepsItsBackslashes(t *testing.T) {
+	m := newRenderModel()
+	m.addRegexRoute("h", `/api/v\d+/x\.json$`, []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+	var got string
+	for _, rc := range m.hosts["h"] {
+		got = rc.matchExpr
+	}
+	if want := `http.request.path matches "^(?:/api/v\d+/x\.json$)"`; got != want {
+		t.Fatalf("match_expr = %s\nwant         %s", got, want)
+	}
+}
+
+// Every alternative of a path regex is anchored at the start of the path:
+// `/a|/b` is "/a, or /b", not "/a at the start, or /b anywhere".
+func TestRegexAlternativesAreAllAnchored(t *testing.T) {
+	cases := []struct {
+		regex string
+		path  string
+		want  bool
+	}{
+		{"/a|/b", "/a", true},
+		{"/a|/b", "/a/x", true},
+		{"/a|/b", "/b/x", true},
+		{"/a|/b", "/x/b", false},
+		{"^/x", "/x/y", true},
+		{"^/x", "/a/x", false},
+	}
+	for _, c := range cases {
+		m := newRenderModel()
+		m.addRegexRoute("h", c.regex, []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
+		rc := m.hosts["h"][regexRouteKey(c.regex)]
+		if rc == nil {
+			t.Fatalf("%s: no route under regexRouteKey; keys: %v", c.regex, m.hosts["h"])
+		}
+		if got := evalRouteExpr(t, rc.matchExpr, gwRequest{method: "GET", path: c.path}); got != c.want {
+			t.Errorf("%s on %s = %v, want %v (%s)", c.regex, c.path, got, c.want, rc.matchExpr)
+		}
+	}
+}
+
 // A path regex stored without a leading `^` (k8s requires the Ingress path to
 // begin with `/`) is anchored at the start by the renderer.
 func TestRegexAnchoring(t *testing.T) {
 	m := newRenderModel()
 	m.addRegexRoute("h", "/api/runs/[^/]+/stream$", []backend{{addr: "x:1"}}, annSettings{}, nil, nil)
-	want := `match_expr: "http.request.path matches \"^/api/runs/[^/]+/stream$\""`
-	if out := renderUpstreams(m); !strings.Contains(out, want) {
+	want := `match_expr: "http.request.path matches \"^(?:/api/runs/[^/]+/stream$)\""`
+	if out := renderUpstreamsV2(m); !strings.Contains(out, want) {
 		t.Fatalf("unanchored path regex must be ^-anchored:\nwant %s\ngot:\n%s", want, out)
 	}
 }
@@ -179,7 +224,7 @@ func TestEnsureCond(t *testing.T) {
 	}
 }
 
-// HTTPRoute attached to our GatewayClass: ACME path → model.acme;
+// HTTPRoute attached to our GatewayClass: ACME path → a solver of its host;
 // app path → weighted servers + header-filter injection.
 func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	gc := &gwv1.GatewayClass{}
@@ -223,8 +268,12 @@ func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	if n := r.renderGateways(context.Background(), m); n < 2 {
 		t.Fatalf("expected ≥2 programmed HTTPRoutes, got %d", n)
 	}
-	if m.acme != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
-		t.Fatalf("acme backend not set from Gateway solver HTTPRoute: %q", m.acme)
+	const token = "/.well-known/acme-challenge/tok"
+	if got := m.solvers["app.example.com"][token]; got != "cm-acme-http-solver-svc.default.svc.cluster.local:8089" {
+		t.Fatalf("solver not recorded from Gateway solver HTTPRoute: %v", m.solvers)
+	}
+	if _, routed := m.hosts["app.example.com"][token]; routed {
+		t.Fatal("the solver was added as an ordinary route")
 	}
 	rc := m.hosts["app.example.com"]["/"]
 	if rc == nil || len(rc.servers) != 2 ||
@@ -234,6 +283,53 @@ func TestRenderGateways_SolverWeightsAndFilters(t *testing.T) {
 	}
 	if len(rc.reqHeaders) != 1 || rc.reqHeaders[0] != "X-Canary: on" {
 		t.Fatalf("header filter not applied: %+v", rc)
+	}
+}
+
+// The older modes read an HTTPRoute's redirect annotations too: a code
+// Synapse does not serve keeps the default and the HTTPRoute is told.
+func TestRenderGateways_ARefusedRedirectCodeIsReported(t *testing.T) {
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "synapse-gw", "default"
+	gw.Spec.GatewayClassName = gwv1.ObjectName("synapse")
+	rt := &gwv1.HTTPRoute{}
+	rt.Name, rt.Namespace = "moved", "default"
+	rt.Annotations = map[string]string{
+		"synapse.gen0sec.com/permanent-redirect":      "https://example.com/new",
+		"synapse.gen0sec.com/permanent-redirect-code": "70000",
+	}
+	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	rt.Spec.Hostnames = []gwv1.Hostname{"moved.example.com"}
+	rt.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Value: ptr("/")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{
+			Name: "app", Port: ptr(gwv1.PortNumber(80))}}}},
+	}}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(gc, gw, rt).
+		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true, Recorder: events}
+
+	m := newRenderModel()
+	if n := r.renderGateways(context.Background(), m); n != 1 {
+		t.Fatalf("programmed %d HTTPRoutes, want 1", n)
+	}
+	rc := m.hosts["moved.example.com"]["/"]
+	if rc == nil || rc.redirectStatus == nil || *rc.redirectStatus != 301 {
+		t.Fatalf("the route is %+v, want a redirect with status 301", rc)
+	}
+	var told bool
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.Contains(event, " InvalidRedirectCode ") && strings.Contains(event, "70000") {
+			told = true
+		}
+	}
+	if !told {
+		t.Error("the HTTPRoute was not told with an InvalidRedirectCode event")
 	}
 }
 
@@ -254,7 +350,67 @@ func TestRenderGateways_IgnoresForeignGatewayClass(t *testing.T) {
 		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
 	r := &IngressReconciler{Client: c, ClusterDomain: "cluster.local", GatewayAPI: true}
 	m := newRenderModel()
-	if n := r.renderGateways(context.Background(), m); n != 0 || m.acme != "" || len(m.hosts) != 0 {
-		t.Fatalf("foreign GatewayClass leaked: n=%d acme=%q hosts=%v", n, m.acme, m.hosts)
+	if n := r.renderGateways(context.Background(), m); n != 0 || len(m.solvers) != 0 || len(m.hosts) != 0 {
+		t.Fatalf("foreign GatewayClass leaked: n=%d solvers=%v hosts=%v", n, m.solvers, m.hosts)
+	}
+}
+
+// A solver that an HTTPRoute brings is told as an Ingress's is when the
+// name it answers for is passed through and nothing can serve its path.
+func TestRender_AnHTTPRouteSolverOnAPassthroughHostIsSaid(t *testing.T) {
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "synapse-gw", "default"
+	gw.Spec.GatewayClassName = gwv1.ObjectName("synapse")
+	solver := &gwv1.HTTPRoute{}
+	solver.Name, solver.Namespace = "cm-acme-http-solver-xyz", "default"
+	solver.Spec.ParentRefs = []gwv1.ParentReference{{Name: "synapse-gw", Namespace: ptr(gwv1.Namespace("default"))}}
+	solver.Spec.Hostnames = []gwv1.Hostname{"raw.example.com"}
+	solver.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{
+			Type: ptr(gwv1.PathMatchExact), Value: ptr("/.well-known/acme-challenge/tok")}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{
+			Name: "cm-acme-http-solver-svc", Port: ptr(gwv1.PortNumber(8089))}}}},
+	}}
+	raw := routedIngress("raw", ptr("synapse"), "raw.example.com")
+	raw.Annotations = map[string]string{"synapse.gen0sec.com/ssl-passthrough": "true"}
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(gc, gw, solver, raw).
+		WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build()
+	events := record.NewFakeRecorder(16)
+	r := &IngressReconciler{Client: c, IngressClassName: "synapse", ClusterDomain: "cluster.local", GatewayAPI: true,
+		UpstreamsOutPath: filepath.Join(t.TempDir(), "u.yaml"), CertsOutDir: t.TempDir(), Recorder: events}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	told := 0
+	for len(events.Events) > 0 {
+		if event := <-events.Events; strings.HasPrefix(event, corev1.EventTypeWarning+" SolverUnreachable ") {
+			told++
+		}
+	}
+	if told != 1 {
+		t.Errorf("%d solvers were told they cannot be reached, want 1", told)
+	}
+}
+
+// The path the end-to-end test asks for keeps its alternatives at the top
+// when it is read as Synapse's engine will read it, which is what makes that
+// test one of the anchoring: anchored in front alone, it takes /x/bar.
+func TestRegexAlternativesSurviveTheCanonicalForm(t *testing.T) {
+	written, err := canonicalRegex("/foo|(/bar)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evalRouteExpr(t, "http.request.path matches "+wfRegex("^"+written), gwRequest{method: "GET", path: "/x/bar"}) {
+		t.Fatalf("%q anchored in front alone does not take /x/bar: the end-to-end test proves nothing", written)
+	}
+	for path, want := range map[string]bool{"/bar": true, "/foo/x": true, "/x/bar": false} {
+		if got := evalRouteExpr(t, pathRegexExpr(written), gwRequest{method: "GET", path: path}); got != want {
+			t.Errorf("%s on %s = %v, want %v", written, path, got, want)
+		}
 	}
 }
