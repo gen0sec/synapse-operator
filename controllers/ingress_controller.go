@@ -414,12 +414,6 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 				}
 				continue
 			}
-			r.claimHSTS(m, ing, host, a)
-			for _, alias := range a.serverAliases {
-				if alias != "" && alias != host {
-					r.claimHSTS(m, ing, alias, a)
-				}
-			}
 			for _, p := range rule.HTTP.Paths {
 				servers, ok := r.backendServers(ctx, ing.Namespace, p.Backend)
 				if !ok {
@@ -450,7 +444,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 						continue
 					}
 					path = written
-					if !m.addRegexRoute(host, path, servers, a, nil, nil) {
+					if m.addRegexRoute(host, path, servers, a, nil, nil) {
+						r.routeProgrammed(m, ing, host, a)
+					} else {
 						logger.Info("regex route conflict ignored (first-writer-wins)",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
 						mRouteConflicts.Inc()
@@ -461,7 +457,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 						if alias == "" || alias == host {
 							continue
 						}
-						if !m.addRegexRoute(alias, path, servers, a, nil, nil) {
+						if m.addRegexRoute(alias, path, servers, a, nil, nil) {
+							r.routeProgrammed(m, ing, alias, a)
+						} else {
 							logger.Info("regex route conflict ignored on server-alias (first-writer-wins)",
 								"host", alias, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 							mRouteConflicts.Inc()
@@ -487,7 +485,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					}
 					continue
 				}
-				if !m.addRoute(host, path, servers, a, nil, nil) {
+				if m.addRoute(host, path, servers, a, nil, nil) {
+					r.routeProgrammed(m, ing, host, a)
+				} else {
 					logger.Info("route conflict ignored (first-writer-wins)",
 						"host", host, "path", path, "ingress", ing.Namespace+"/"+ing.Name)
 					mRouteConflicts.Inc()
@@ -501,7 +501,9 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 					if alias == "" || alias == host {
 						continue
 					}
-					if !m.addRoute(alias, path, servers, a, nil, nil) {
+					if m.addRoute(alias, path, servers, a, nil, nil) {
+						r.routeProgrammed(m, ing, alias, a)
+					} else {
 						logger.Info("route conflict ignored on server-alias (first-writer-wins)",
 							"host", alias, "path", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 						mRouteConflicts.Inc()

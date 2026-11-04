@@ -174,10 +174,69 @@ func (r *IngressReconciler) reportHSTS(obj client.Object, a annSettings) {
 	}
 }
 
-// claimHSTS gives host the hsts policy of obj. The first object to ask,
-// in render order, keeps the host; a later one with another policy is told.
+// noteHostOwner records ns as the owner of host if no namespace has
+// programmed a route on it yet. Call it when a route on host was added.
+func (m *renderModel) noteHostOwner(host, ns string) {
+	key := hostKey(host)
+	if _, ok := m.hostOwner[key]; ok {
+		return
+	}
+	if m.hostOwner == nil {
+		m.hostOwner = map[string]string{}
+	}
+	m.hostOwner[key] = ns
+}
+
+// hostSettingOwner is the namespace that may set host-level settings on
+// host: the owner that hostAllowed enforces under HostOwnership, else the
+// namespace of the first object that programmed a route on it.
+func (m *renderModel) hostSettingOwner(host string) (string, bool) {
+	if owner, ok := m.owners.owner(host); ok {
+		return owner, true
+	}
+	owner, ok := m.hostOwner[hostKey(host)]
+	return owner, ok
+}
+
+// hostSettingAllowed says whether obj may set `what` on host. Only the
+// owner namespace may; a refusal is told to obj once per host. Call it only
+// after a route of obj on host was programmed.
+func (r *IngressReconciler) hostSettingAllowed(m *renderModel, obj client.Object, host, what string) bool {
+	owner, ok := m.hostSettingOwner(host)
+	if !ok || owner == obj.GetNamespace() {
+		return true
+	}
+	r.hostSettingConflict(m, obj, host, what, "belongs to namespace "+owner+", which had it first")
+	return false
+}
+
+// hostSettingConflict tells obj, once per host and setting, that its `what`
+// for host is not applied.
+func (r *IngressReconciler) hostSettingConflict(m *renderModel, obj client.Object, host, what, why string) {
+	key := obj.GetNamespace() + "/" + obj.GetName() + "\x00" + hostKey(host) + "\x00" + what
+	if m.settingSaid[key] {
+		return
+	}
+	if m.settingSaid == nil {
+		m.settingSaid = map[string]bool{}
+	}
+	m.settingSaid[key] = true
+	r.emit(obj, corev1.EventTypeWarning, "HostSettingConflict",
+		"host %s %s; the %s of this object do not apply to it", host, why, what)
+}
+
+// routeProgrammed is called when a route of obj on host was added. The first
+// to do so owns the host's settings; obj's own are then claimed.
+func (r *IngressReconciler) routeProgrammed(m *renderModel, obj client.Object, host string, a annSettings) {
+	m.noteHostOwner(host, obj.GetNamespace())
+	r.claimHSTS(m, obj, host, a)
+}
+
+// claimHSTS gives host the hsts policy of obj, if obj's namespace owns the
+// host. Within the owner namespace the first object to ask, in render order,
+// keeps the host; a later one with another policy is told.
 func (r *IngressReconciler) claimHSTS(m *renderModel, obj client.Object, host string, a annSettings) {
-	if a.hsts.policy == nil {
+	if a.hsts.policy == nil || !r.hostSettingAllowed(m, obj, host, "hsts annotations") {
 		return
 	}
 	from := obj.GetNamespace() + "/" + obj.GetName()
@@ -192,8 +251,8 @@ func (r *IngressReconciler) claimHSTS(m *renderModel, obj client.Object, host st
 	if have.from == from || have.policy == *a.hsts.policy {
 		return
 	}
-	r.emit(obj, corev1.EventTypeWarning, "HostSettingConflict",
-		"host %s already has an HSTS setting from %s (first-writer-wins); the hsts annotations of this object do not apply to it", host, have.from)
+	r.hostSettingConflict(m, obj, host, "hsts annotations",
+		"already has an HSTS setting from "+have.from+" (first-writer-wins)")
 }
 
 func writeHSTS(b *strings.Builder, indent string, p hstsPolicy) {

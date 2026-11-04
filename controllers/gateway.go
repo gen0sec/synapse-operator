@@ -171,9 +171,6 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					}
 				}
 			}
-			for _, h := range hostnames {
-				r.claimHSTS(m, rt, string(h), a)
-			}
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)
 			for _, w := range warns {
@@ -190,7 +187,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 						m.solverFrom(rt, host)
 						continue
 					}
-					if !m.addRoute(host, path, servers, a, req, resp) {
+					if m.addRoute(host, path, servers, a, req, resp) {
+						r.routeProgrammed(m, rt, host, a)
+					} else {
 						logger.Info("route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
 							"host", host, "path", path, "httproute", rt.Namespace+"/"+rt.Name)
 						mRouteConflicts.Inc()
@@ -206,7 +205,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				}
 				for _, h := range hostnames {
 					host := string(h)
-					if !m.addRegexRoute(host, rx, servers, a, req, resp) {
+					if m.addRegexRoute(host, rx, servers, a, req, resp) {
+						r.routeProgrammed(m, rt, host, a)
+					} else {
 						logger.Info("regex route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
 							"host", host, "regex", rx, "httproute", rt.Namespace+"/"+rt.Name)
 						mRouteConflicts.Inc()

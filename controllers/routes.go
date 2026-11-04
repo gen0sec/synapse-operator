@@ -235,6 +235,10 @@ type renderModel struct {
 	// from the first object to ask for one (see claimHSTS).
 	hsts     *hstsPolicy
 	hostHSTS map[string]hstsClaim
+	// hostOwner is, by hostKey, the namespace of the first object to program
+	// a route on each host; settingSaid the refusals already told.
+	hostOwner   map[string]string
+	settingSaid map[string]bool
 	// solverSources are the Ingresses and HTTPRoutes the solvers came
 	// from, each with the name it answers for: who is told when a solver
 	// cannot be served.

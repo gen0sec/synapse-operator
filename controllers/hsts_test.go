@@ -2,12 +2,15 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -138,8 +141,9 @@ func TestRender_HSTSSkipsAPassthroughHost(t *testing.T) {
 func TestRender_HSTSHostConflictFirstWriterWins(t *testing.T) {
 	out, events := renderSchema(t, false,
 		hstsIngress("aaa", "first", "shop.example.com", "hsts-max-age", "600"),
-		hstsIngress("bbb", "second", "shop.example.com", "hsts-max-age", "1200"),
-		hstsIngress("ccc", "same", "shop.example.com", "hsts-max-age", "600"),
+		// Each has a path of its own: a dropped route claims nothing.
+		annotated(ingressIn("aaa", "second", "shop.example.com", "/b"), "hsts-max-age", "1200"),
+		annotated(ingressIn("aaa", "same", "shop.example.com", "/c"), "hsts-max-age", "600"),
 	)
 	if strings.Count(out, "hsts:") != 1 || !strings.Contains(out, "max_age: 600\n") || strings.Contains(out, "1200") {
 		t.Errorf("want the first writer's policy only:\n%s", out)
@@ -234,6 +238,9 @@ func TestRenderGateways_HSTSAnnotations(t *testing.T) {
 	}
 	a := route("a", map[string]string{hstsKey + "hsts-max-age": "600", hstsKey + "hsts-preload": "true"})
 	b := route("b", map[string]string{hstsKey + "hsts-max-age": "1200"})
+	// A route of its own on the host, or b would be dropped and claim nothing.
+	pt, p := gwv1.PathMatchPathPrefix, "/b"
+	b.Spec.Rules[0].Matches = []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Type: &pt, Value: &p}}}
 	events := record.NewFakeRecorder(16)
 	r := &IngressReconciler{
 		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(gc, gw, a, b).
@@ -258,5 +265,140 @@ func TestRenderGateways_HSTSAnnotations(t *testing.T) {
 	slices.Sort(reasons)
 	if !slices.Equal(reasons, []string{"HostSettingConflict", "InvalidHSTS"}) {
 		t.Errorf("events %q, want InvalidHSTS and HostSettingConflict", reasons)
+	}
+}
+
+// hstsMixed renders Ingresses and HTTPRoutes together, as one Gateway of the
+// class serves the routes.
+func hstsMixed(t *testing.T, ownership bool, objs ...client.Object) (string, *record.FakeRecorder) {
+	t.Helper()
+	gc := &gwv1.GatewayClass{}
+	gc.Name = "synapse"
+	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "gw", "default"
+	gw.Spec.GatewayClassName = "synapse"
+	events := record.NewFakeRecorder(64)
+	out := filepath.Join(t.TempDir(), "u.yaml")
+	r := &IngressReconciler{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(append([]client.Object{gc, gw}, objs...)...).
+			WithStatusSubresource(&gwv1.GatewayClass{}, &gwv1.Gateway{}, &gwv1.HTTPRoute{}).Build(),
+		IngressClassName: "synapse", UpstreamsOutPath: out, CertsOutDir: t.TempDir(),
+		ClusterDomain: "cluster.local", GatewayAPI: true, Recorder: events,
+		DefaultHSTS: &DefaultHSTS{MaxAgeSeconds: 300},
+		EventsOn:    routedIngress("proxy", nil, ""),
+	}
+	if ownership {
+		r.HostOwnership = true
+		r.HostClaims = types.NamespacedName{Namespace: "default", Name: "claims"}
+	}
+	if _, _, _, err := r.render(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), events
+}
+
+func hstsRoute(ns, name, host, path string, kv ...string) *gwv1.HTTPRoute {
+	rt := &gwv1.HTTPRoute{}
+	rt.Name, rt.Namespace = name, ns
+	rt.Annotations = map[string]string{}
+	for i := 0; i < len(kv); i += 2 {
+		rt.Annotations[hstsKey+kv[i]] = kv[i+1]
+	}
+	gwNS := gwv1.Namespace("default")
+	rt.Spec.ParentRefs = []gwv1.ParentReference{{Name: "gw", Namespace: &gwNS}}
+	rt.Spec.Hostnames = []gwv1.Hostname{gwv1.Hostname(host)}
+	pt := gwv1.PathMatchPathPrefix
+	rt.Spec.Rules = []gwv1.HTTPRouteRule{{
+		Matches: []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Type: &pt, Value: &path}}},
+		BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
+			BackendObjectReference: gwv1.BackendObjectReference{Name: "app", Port: ptr(gwv1.PortNumber(80))}}}}}}
+	return rt
+}
+
+// hostBlock is the part of the routes file that is host's.
+func hostBlock(t *testing.T, out, host string) string {
+	t.Helper()
+	i := strings.Index(out, "\n  \""+host+"\":\n")
+	if i < 0 {
+		t.Fatalf("no host %s in\n%s", host, out)
+	}
+	rest := out[i+1:]
+	if j := strings.Index(rest[1:], "\n  \""); j >= 0 {
+		rest = rest[:j+1]
+	}
+	return rest
+}
+
+func TestRender_HSTSOnlyTheHostsOwnerSetsIt(t *testing.T) {
+	for _, ownership := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ownership=%v", ownership), func(t *testing.T) {
+			out, events := hstsMixed(t, ownership,
+				ingressIn("a", "shop", "shop.example.com", "/"),
+				hstsRoute("b", "intruder", "shop.example.com", "/other", "hsts", "off"))
+			if strings.Contains(hostBlock(t, out, "shop.example.com"), "hsts") {
+				t.Errorf("a host of namespace a took the hsts of namespace b:\n%s", out)
+			}
+			if !strings.Contains(out, "\nhsts:\n  max_age: 300\n") {
+				t.Errorf("the proxy-wide hsts is gone:\n%s", out)
+			}
+			got := eventsOf(events, "HostSettingConflict")
+			if len(got) != 1 || !strings.Contains(got[0], "Warning") || !strings.Contains(got[0], "namespace a,") {
+				t.Errorf("events = %q, want one Warning HostSettingConflict naming namespace a", got)
+			}
+		})
+	}
+}
+
+func TestRender_HSTSDroppedRouteClaimsNothing(t *testing.T) {
+	// b's path is a's: the route is dropped, and with it the claim.
+	out, events := hstsMixed(t, false,
+		ingressIn("a", "shop", "shop.example.com", "/"),
+		hstsRoute("b", "intruder", "shop.example.com", "/", "hsts", "off"))
+	if strings.Contains(hostBlock(t, out, "shop.example.com"), "hsts") {
+		t.Errorf("a dropped route set the hsts of the host:\n%s", out)
+	}
+	if got := eventsOf(events, "RouteConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want the route dropped", got)
+	}
+}
+
+func TestRender_HSTSDroppedRouteDoesNotTakeTheHostEither(t *testing.T) {
+	// The first object in order has no route on the host that is programmed,
+	// so the owner is the first that has one.
+	missing := ingressIn("a", "broken", "shop.example.com", "/")
+	missing.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "web"}
+	out, _ := hstsMixed(t, false, missing,
+		annotated(ingressIn("b", "works", "shop.example.com", "/"), "hsts-max-age", "600"))
+	if !strings.Contains(hostBlock(t, out, "shop.example.com"), "max_age: 600") {
+		t.Errorf("the working Ingress's policy is not rendered:\n%s", out)
+	}
+}
+
+func TestRender_HSTSUnresolvedBackendClaimsNothing(t *testing.T) {
+	broken := annotated(ingressIn("a", "broken", "shop.example.com", "/"), "hsts-max-age", "100")
+	broken.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "web"}
+	out, _ := hstsMixed(t, false, broken,
+		annotated(ingressIn("a", "works", "shop.example.com", "/api"), "hsts-max-age", "600"))
+	block := hostBlock(t, out, "shop.example.com")
+	if !strings.Contains(block, "max_age: 600") || strings.Contains(block, "100") {
+		t.Errorf("want the working Ingress's policy only:\n%s", out)
+	}
+}
+
+func TestRender_HSTSSameNamespaceFirstWriterWinsAcrossKinds(t *testing.T) {
+	out, events := hstsMixed(t, false,
+		annotated(ingressIn("a", "shop", "shop.example.com", "/"), "hsts-max-age", "600"),
+		hstsRoute("a", "later", "shop.example.com", "/other", "hsts-max-age", "1200"))
+	block := hostBlock(t, out, "shop.example.com")
+	if !strings.Contains(block, "max_age: 600") || strings.Contains(block, "1200") {
+		t.Errorf("want the first writer's policy:\n%s", out)
+	}
+	if got := eventsOf(events, "HostSettingConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want one HostSettingConflict", got)
 	}
 }
