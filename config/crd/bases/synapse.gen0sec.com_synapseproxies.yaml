@@ -1023,6 +1023,36 @@ spec:
                 - Namespace
                 - None
                 type: string
+              hsts:
+                description: |-
+                  HSTS makes the proxy send Strict-Transport-Security on responses to
+                  TLS clients, for every host that does not say otherwise. The
+                  synapse.gen0sec.com/hsts annotations of an Ingress or HTTPRoute
+                  replace it for their hosts.
+                properties:
+                  includeSubdomains:
+                    description: IncludeSubdomains applies the policy to every subdomain
+                      too.
+                    type: boolean
+                  maxAgeSeconds:
+                    description: MaxAgeSeconds is how long a browser remembers the
+                      host is HTTPS-only.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  preload:
+                    description: |-
+                      Preload asks for the host to be added to the browsers' preload lists.
+                      That is hard to undo.
+                    type: boolean
+                required:
+                - maxAgeSeconds
+                type: object
+                x-kubernetes-validations:
+                - message: 'preload needs maxAgeSeconds of at least 31536000 (one
+                    year) and includeSubdomains: true'
+                  rule: '!has(self.preload) || !self.preload || (self.maxAgeSeconds
+                    >= 31536000 && has(self.includeSubdomains) && self.includeSubdomains)'
               image:
                 description: |-
                   Image is the Synapse container image, tag or digest included. It has

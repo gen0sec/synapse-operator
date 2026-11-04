@@ -164,6 +164,14 @@ type SynapseProxySpec struct {
 	// +optional
 	UpstreamTLS *UpstreamTLSSpec `json:"upstreamTLS,omitempty"`
 
+	// HSTS makes the proxy send Strict-Transport-Security on responses to
+	// TLS clients, for every host that does not say otherwise. The
+	// synapse.gen0sec.com/hsts annotations of an Ingress or HTTPRoute
+	// replace it for their hosts.
+	//
+	// +optional
+	HSTS *HSTSSpec `json:"hsts,omitempty"`
+
 	// HostOwnership decides who owns a host name among the namespaces whose
 	// Ingresses this proxy serves. With Namespace, a host goes to the
 	// namespace whose Ingress named it first, and another namespace's use of
@@ -298,6 +306,27 @@ type UpstreamTLSSpec struct {
 	//
 	// +optional
 	CASecretRef *CASecretReference `json:"caSecretRef,omitempty"`
+}
+
+// HSTSSpec is the proxy-wide Strict-Transport-Security policy.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.preload) || !self.preload || (self.maxAgeSeconds >= 31536000 && has(self.includeSubdomains) && self.includeSubdomains)",message="preload needs maxAgeSeconds of at least 31536000 (one year) and includeSubdomains: true"
+type HSTSSpec struct {
+	// MaxAgeSeconds is how long a browser remembers the host is HTTPS-only.
+	//
+	// +kubebuilder:validation:Minimum=1
+	MaxAgeSeconds int64 `json:"maxAgeSeconds"`
+
+	// IncludeSubdomains applies the policy to every subdomain too.
+	//
+	// +optional
+	IncludeSubdomains bool `json:"includeSubdomains,omitempty"`
+
+	// Preload asks for the host to be added to the browsers' preload lists.
+	// That is hard to undo.
+	//
+	// +optional
+	Preload bool `json:"preload,omitempty"`
 }
 
 // CASecretReference names one key of a Secret in the same namespace that
