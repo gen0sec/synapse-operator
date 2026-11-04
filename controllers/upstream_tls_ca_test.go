@@ -603,3 +603,52 @@ func TestCAPath(t *testing.T) {
 		})
 	}
 }
+
+func TestRoutes_TheProxyWideCAIsLoadedBeforeTheRoutes(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	proxyCA := paddedCA(t, "proxy-wide", 16*1024)
+	edge.Spec.UpstreamTLS = &synapsev1alpha1.UpstreamTLSSpec{
+		CASecretRef: &synapsev1alpha1.CASecretReference{Name: "internal-ca", Key: "ca.crt"},
+	}
+	objs := []client.Object{edge, classFor("public", edge), caSecret("synapse-os", "internal-ca", proxyCA)}
+	// Together the tenant CAs of the proxy's namespace fill its 128 KiB share
+	// on their own, so the proxy-wide CA fits only if it is taken first.
+	var bundles []string
+	for _, n := range []string{"a", "b"} {
+		ca := paddedCA(t, "tenant-"+n, 60*1024)
+		bundles = append(bundles, ca)
+		objs = append(objs,
+			httpsIngress("synapse-os", n, n+".example.com", annPrefix+"upstream-tls-ca", "ca-"+n),
+			caSecret("synapse-os", "ca-"+n, ca))
+	}
+
+	events := record.NewFakeRecorder(64)
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	cm := routesConfigMap(t, r, edge)
+	doc := parseV2(t, cm.Data[UpstreamsKey])
+	if want := "/etc/synapse/upstreams/" + caKeyOf(proxyCA); doc.UpstreamTLS == nil || doc.UpstreamTLS.CA != want {
+		t.Errorf("the proxy-wide upstream_tls is %+v, want the CA %q", doc.UpstreamTLS, want)
+	}
+	if cm.Data[caKeyOf(proxyCA)] != proxyCA {
+		t.Error("the proxy-wide CA file is not in the ConfigMap")
+	}
+	caOf := func(host string) string {
+		if tls := doc.Hosts[host].Paths["/"].UpstreamTLS; tls != nil {
+			return tls.CA
+		}
+		return ""
+	}
+	if want := "/etc/synapse/upstreams/" + caKeyOf(bundles[0]); caOf("a.example.com") != want {
+		t.Errorf("a.example.com has the CA %q, want %q", caOf("a.example.com"), want)
+	}
+	if got := caOf("b.example.com"); got != "" {
+		t.Errorf("b.example.com has the CA %q, want the last tenant CA refused", got)
+	}
+	got := eventsOf(events, "UpstreamCAUnusable")
+	if len(got) != 1 || !strings.Contains(got[0], "128 KiB") || strings.Contains(got[0], "spec.upstreamTLS.caSecretRef") {
+		t.Errorf("UpstreamCAUnusable events: %v, want one for the tenant CA that names the 128 KiB cap", got)
+	}
+}
