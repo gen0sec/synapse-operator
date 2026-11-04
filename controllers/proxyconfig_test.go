@@ -125,6 +125,13 @@ func TestRenderProxyConfig_Golden(t *testing.T) {
 			"telemetry": {"enabled": true, "otlp": {"endpoint": "http://collector:4317"}},
 			"daemon": {"working_directory": null}
 		}`))},
+		"listener-tcp-mss": {Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
+			mss := int32(1360)
+			s.Listeners = []synapsev1alpha1.Listener{
+				{Name: "http", Port: 80, Protocol: "HTTP"},
+				{Name: "https", Port: 443, Protocol: "TLS", TCPMSS: &mss},
+			}
+		})},
 		// Values that a careless YAML round trip would change.
 		"scalars-survive": {Proxy: proxyForConfig(rawConfig(`{
 			"proxy": {"tunnel_max_bytes": 18446744073709551615, "tunnel_max_lifetime_secs": 9007199254740993},
@@ -253,6 +260,29 @@ func TestRenderProxyConfig_TypedFields(t *testing.T) {
 		got, _ := at(tree, "proxy.trusted_proxies")
 		if list, ok := got.([]any); !ok || len(list) != 2 || list[0] != "10.0.0.0/8" || list[1] != "192.0.2.7" {
 			t.Errorf("proxy.trusted_proxies = %v", got)
+		}
+	})
+
+	t.Run("listener tcpMSS is rendered only where set", func(t *testing.T) {
+		mss := int32(1360)
+		tree := renderedTree(t, ProxyConfigInput{Proxy: proxyForConfig(func(s *synapsev1alpha1.SynapseProxySpec) {
+			s.Listeners = []synapsev1alpha1.Listener{
+				{Name: "http", Port: 80, Protocol: "HTTP"},
+				{Name: "https", Port: 443, Protocol: "TLS", TCPMSS: &mss},
+			}
+		})})
+		got, _ := at(tree, "proxy.listeners")
+		list, ok := got.([]any)
+		if !ok || len(list) != 2 {
+			t.Fatalf("proxy.listeners = %v", got)
+		}
+		plain, _ := list[0].(map[string]any)
+		if _, has := plain["tcp_mss"]; has {
+			t.Errorf("listener without tcpMSS renders tcp_mss = %v", plain["tcp_mss"])
+		}
+		clamped, _ := list[1].(map[string]any)
+		if fmt.Sprint(clamped["tcp_mss"]) != "1360" {
+			t.Errorf("tcp_mss = %v (%T), want 1360", clamped["tcp_mss"], clamped["tcp_mss"])
 		}
 	})
 
