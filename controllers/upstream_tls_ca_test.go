@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -813,3 +814,66 @@ func TestRoutes_RoutesAloneOverTheLimitFailTheRender(t *testing.T) {
 }
 
 const padCount = 840
+
+// Routes that are over the limit on their own fail the render. The CA files
+// that were dropped on the way are still in the ConfigMap, so nobody is told
+// that their CA is unusable.
+func TestRoutes_NoCADropIsReportedWhenTheRoutesAloneAreOverTheLimit(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	objs := append([]client.Object{edge, classFor("public", edge)}, padRoutes(1200)...)
+	for _, n := range []string{"a", "b"} {
+		objs = append(objs,
+			httpsIngress(n, "web", n+".example.com", annPrefix+"upstream-tls-ca", "ca-"+n),
+			caSecret(n, "ca-"+n, paddedCA(t, "big-"+n, 60*1024)))
+	}
+	old := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: edge.Namespace, Name: edge.Name + "-upstreams"},
+		Data:       map[string]string{UpstreamsKey: "old routes", "ca-old.pem": "old ca"},
+	}
+	objs = append(objs, old)
+	events := &objEvents{}
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+
+	err := reconcileRoutes(t, r, edge)
+	if err == nil || !strings.Contains(err.Error(), "RoutesTooLarge") {
+		t.Fatalf("reconcile error is %v, want RoutesTooLarge", err)
+	}
+	if got := events.reason("UpstreamCAUnusable"); len(got) != 0 {
+		t.Errorf("UpstreamCAUnusable events on a render that failed: %v", got)
+	}
+	cm := routesConfigMap(t, r, edge)
+	if !reflect.DeepEqual(cm.Data, old.Data) {
+		t.Errorf("the ConfigMap changed: %d keys, want the old data", len(cm.Data))
+	}
+}
+
+// A render that drops a CA runs the pass again. The events of the routes are
+// sent once, not once per pass.
+func TestRoutes_RouteEventsAreSentOnceWhenACAIsDropped(t *testing.T) {
+	edge := testProxy("synapse-os", "edge")
+	objs := append([]client.Object{edge, classFor("public", edge)}, padRoutes(padCount)...)
+	for _, n := range []string{"a", "b", "c"} {
+		objs = append(objs,
+			httpsIngress(n, "web", n+".example.com", annPrefix+"upstream-tls-ca", "ca-"+n),
+			caSecret(n, "ca-"+n, paddedCA(t, "big-"+n, 60*1024)))
+	}
+	pt := routedIngress("web", ptr("public"), "pt.example.com")
+	pt.Namespace = "pt"
+	pt.Annotations = map[string]string{annPrefix + "ssl-passthrough": "true"}
+	// A port by name needs the Service, and there is none.
+	pt.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port = networkingv1.ServiceBackendPort{Name: "http"}
+	objs = append(objs, pt)
+	events := &objEvents{}
+	r := newRouteReconciler(t, objs...)
+	r.Recorder = events
+	mustReconcileRoutes(t, r, edge)
+
+	if got := events.reason("UpstreamCAUnusable"); len(got) == 0 {
+		t.Fatal("no CA was dropped, so the test proves nothing")
+	}
+	got := events.reason("BackendUnresolved")
+	if len(got) != 1 || !strings.HasPrefix(got[0], "pt/web ") {
+		t.Errorf("BackendUnresolved events: %v, want exactly one, on pt/web", got)
+	}
+}
