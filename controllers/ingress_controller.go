@@ -119,6 +119,8 @@ type IngressReconciler struct {
 	EventsOn runtime.Object
 	// DefaultUpstreamTLS is the proxy-wide upstream_tls. nil ⇒ none.
 	DefaultUpstreamTLS *DefaultUpstreamTLS
+	// DefaultHSTS is the proxy-wide hsts. nil ⇒ none.
+	DefaultHSTS *DefaultHSTS
 	// Clock is where "now" comes from. nil ⇒ time.Now.
 	Clock func() time.Time
 
@@ -269,6 +271,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 	// The proxy-wide CA goes first: it then meets only its own size cap, and
 	// the CAs of the routes count after it.
 	r.resolveDefaultUpstreamTLS(ctx, m)
+	r.resolveDefaultHSTS(m)
 
 	// Deterministic source order: Ingresses sorted by ns/name and
 	// processed BEFORE HTTPRoutes (first-writer-wins in addRoute), so
@@ -346,6 +349,7 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
 		r.reportRedirectCode(ctx, ing, a)
 		r.reportUpstreamTLS(ctx, ing, a)
+		r.reportHSTS(ing, a)
 		r.resolveUpstreamCA(ctx, m, ing, &a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
@@ -409,6 +413,12 @@ func (r *IngressReconciler) renderCounting(ctx context.Context, certsFailed *int
 						"passthrough host %s already claimed (first-writer-wins, terminate route or earlier passthrough); this rule is ignored", host)
 				}
 				continue
+			}
+			r.claimHSTS(m, ing, host, a)
+			for _, alias := range a.serverAliases {
+				if alias != "" && alias != host {
+					r.claimHSTS(m, ing, alias, a)
+				}
 			}
 			for _, p := range rule.HTTP.Paths {
 				servers, ok := r.backendServers(ctx, ing.Namespace, p.Backend)

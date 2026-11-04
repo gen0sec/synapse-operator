@@ -554,3 +554,43 @@ func TestSynapseProxy_UpstreamTLS(t *testing.T) {
 		}
 	})
 }
+
+func TestSynapseProxy_HSTS(t *testing.T) {
+	create := func(h *v1alpha1.HSTSSpec) error {
+		p := validProxy()
+		p.Spec.HSTS = h
+		err := k8s.Create(context.Background(), p)
+		if err == nil {
+			_ = k8s.Delete(context.Background(), p)
+		}
+		return err
+	}
+	accepted := map[string]*v1alpha1.HSTSSpec{
+		"a max age alone":               {MaxAgeSeconds: 1},
+		"preload at exactly one year":   {MaxAgeSeconds: 31536000, IncludeSubdomains: true, Preload: true},
+		"a short age without preload":   {MaxAgeSeconds: 600, IncludeSubdomains: true},
+		"preload with a longer max age": {MaxAgeSeconds: 63072000, IncludeSubdomains: true, Preload: true},
+		"subdomains without preload":    {MaxAgeSeconds: 600, IncludeSubdomains: true},
+		"a long age without subdomains": {MaxAgeSeconds: 63072000},
+	}
+	for name, h := range accepted {
+		t.Run("accepts "+name, func(t *testing.T) {
+			if err := create(h); err != nil {
+				t.Errorf("rejected: %v", err)
+			}
+		})
+	}
+	rejected := map[string]*v1alpha1.HSTSSpec{
+		"preload under a year":       {MaxAgeSeconds: 31535999, IncludeSubdomains: true, Preload: true},
+		"preload without subdomains": {MaxAgeSeconds: 31536000, Preload: true},
+		"a max age of zero":          {MaxAgeSeconds: 0},
+	}
+	for name, h := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			err := create(h)
+			if err == nil || !apierrors.IsInvalid(err) {
+				t.Errorf("got %v, want an Invalid error", err)
+			}
+		})
+	}
+}

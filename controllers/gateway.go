@@ -141,6 +141,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		a := parseAnnotations(rt.Annotations)
 		r.reportRedirectCode(ctx, rt, a)
 		r.reportUpstreamTLS(ctx, rt, a)
+		r.reportHSTS(rt, a)
 		r.resolveUpstreamCA(ctx, m, rt, &a)
 		r.dropStickyWithoutKey(rt, &a)
 		if a.sticky {
@@ -169,6 +170,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 							strings.Join(names, ", "), names[0])
 					}
 				}
+			}
+			for _, h := range hostnames {
+				r.claimHSTS(m, rt, string(h), a)
 			}
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)

@@ -146,6 +146,8 @@ type annSettings struct {
 	// written; the route keeps the default status.
 	redirectCodeRefused string
 	sticky              bool
+	// hsts is what the object's hsts annotations say about its hosts.
+	hsts hstsAnn
 	// useRegex mirrors nginx `nginx.ingress.kubernetes.io/use-regex: "true"`:
 	// the Ingress's paths are POSIX regexes, rendered as synapse `match_expr`
 	// regex routes rather than longest-prefix paths.
@@ -229,6 +231,10 @@ type renderModel struct {
 	caErr error
 	// defaultTLS is the proxy-wide `upstream_tls`.
 	defaultTLS *upstreamTLSCfg
+	// hsts is the proxy-wide `hsts`; hostHSTS is the policy of each host,
+	// from the first object to ask for one (see claimHSTS).
+	hsts     *hstsPolicy
+	hostHSTS map[string]hstsClaim
 	// solverSources are the Ingresses and HTTPRoutes the solvers came
 	// from, each with the name it answers for: who is told when a solver
 	// cannot be served.
@@ -1127,6 +1133,7 @@ func parseAnnotations(ann map[string]string) annSettings {
 	}
 	var s annSettings
 	s.upstreamTLS = parseUpstreamTLS(ann)
+	s.hsts = parseHSTS(ann)
 
 	// backend-protocol: HTTPS ⇒ TLS to upstream. synapse-compat key
 	// first, then nginx-compat.
@@ -1303,6 +1310,9 @@ func renderUpstreamsV2(m *renderModel) string {
 			fmt.Fprintf(&b, "    secret_file: %q\n", m.stickySecretFile)
 		}
 	}
+	if m.hsts != nil {
+		writeHSTS(&b, "", *m.hsts)
+	}
 	if t := m.defaultTLS; t != nil {
 		b.WriteString("upstream_tls:\n")
 		writeUpstreamTLSFields(&b, "  ", t)
@@ -1344,6 +1354,9 @@ func renderUpstreamsV2(m *renderModel) string {
 			fmt.Fprintf(&b, "    tls:\n      terminate:\n        cert: %q\n", stem)
 		} else {
 			b.WriteString("    tls:\n      terminate: {}\n")
+		}
+		if c, ok := m.hostHSTS[h]; ok {
+			writeHSTS(&b, "    ", c.policy)
 		}
 		paths := m.hosts[h]
 		pathKeys := make([]string, 0, len(paths))
