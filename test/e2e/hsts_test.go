@@ -130,6 +130,8 @@ func TestHSTS(t *testing.T) {
 			if h.name == "hconf-b" {
 				// The certificate of the first Ingress is the host's.
 				ing.Spec.TLS = nil
+				// Its own path, so that its route is programmed and it claims.
+				ing.Spec.Rules[0].HTTP.Paths[0].Path = "/b"
 			}
 			if h.name != "hconf-b" {
 				c.create(t, secret)
