@@ -133,6 +133,17 @@ func TestSynapseProxy_HostOwnershipNoneIsAccepted(t *testing.T) {
 	}
 }
 
+func TestSynapseProxy_ListenerTCPMSSBoundsAreAccepted(t *testing.T) {
+	for _, mss := range []int32{88, 1360, 32767} {
+		p := validProxy()
+		p.Spec.Listeners[0].TCPMSS = &mss
+		mustCreate(t, p)
+		if p.Spec.Listeners[0].TCPMSS == nil || *p.Spec.Listeners[0].TCPMSS != mss {
+			t.Errorf("tcpMSS = %v, want %d kept", p.Spec.Listeners[0].TCPMSS, mss)
+		}
+	}
+}
+
 func TestSynapseProxy_Rejects(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -189,6 +200,12 @@ func TestSynapseProxy_Rejects(t *testing.T) {
 		{"a listener port above 65535",
 			func(p *v1alpha1.SynapseProxy) { p.Spec.Listeners[0].Port = 65536 },
 			"spec.listeners[0].port"},
+		{"a tcpMSS below 88",
+			func(p *v1alpha1.SynapseProxy) { n := int32(87); p.Spec.Listeners[0].TCPMSS = &n },
+			"spec.listeners[0].tcpMSS"},
+		{"a tcpMSS above 32767",
+			func(p *v1alpha1.SynapseProxy) { n := int32(32768); p.Spec.Listeners[0].TCPMSS = &n },
+			"spec.listeners[0].tcpMSS"},
 		{"hostNetwork with a NodePort Service",
 			func(p *v1alpha1.SynapseProxy) {
 				p.Spec.HostNetwork = true
