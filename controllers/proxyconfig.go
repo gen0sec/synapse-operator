@@ -82,6 +82,7 @@ type ownedConfigKey struct {
 var ownedConfigKeys = []ownedConfigKey{
 	{"mode", "the operator always runs a SynapseProxy in proxy mode"},
 	{"daemon.enabled", "the operator runs Synapse in the foreground"},
+	{"proxy.enabled", "the operator always runs a SynapseProxy as a proxy"},
 	{"proxy.listeners", "use spec.listeners"},
 	{"proxy.address_http", "use spec.listeners"},
 	{"proxy.address_tls", "use spec.listeners"},
