@@ -120,6 +120,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 	for i := range rtList.Items {
 		rt := &rtList.Items[i]
 		var boundParent *gwv1.ParentReference
+		var boundNS string
 		for j := range rt.Spec.ParentRefs {
 			p := &rt.Spec.ParentRefs[j]
 			if p.Kind != nil && *p.Kind != "Gateway" {
@@ -130,7 +131,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				ns = string(*p.Namespace)
 			}
 			if ourGW[types.NamespacedName{Namespace: ns, Name: string(p.Name)}] {
-				boundParent = p
+				boundParent, boundNS = p, ns
 				break
 			}
 		}
@@ -188,7 +189,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 						continue
 					}
 					if m.addRoute(host, path, servers, a, req, resp) {
-						r.routeProgrammed(m, rt, host, a)
+						r.routeProgrammedUnder(m, rt, boundNS, host, a)
 					} else {
 						logger.Info("route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
 							"host", host, "path", path, "httproute", rt.Namespace+"/"+rt.Name)
@@ -206,7 +207,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				for _, h := range hostnames {
 					host := string(h)
 					if m.addRegexRoute(host, rx, servers, a, req, resp) {
-						r.routeProgrammed(m, rt, host, a)
+						r.routeProgrammedUnder(m, rt, boundNS, host, a)
 					} else {
 						logger.Info("regex route conflict ignored (first-writer-wins; Ingress/earlier source kept)",
 							"host", host, "regex", rx, "httproute", rt.Namespace+"/"+rt.Name)

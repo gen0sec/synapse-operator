@@ -199,11 +199,13 @@ func (m *renderModel) hostSettingOwner(host string) (string, bool) {
 }
 
 // hostSettingAllowed says whether obj may set `what` on host. Only the
-// owner namespace may; a refusal is told to obj once per host. Call it only
-// after a route of obj on host was programmed.
-func (r *IngressReconciler) hostSettingAllowed(m *renderModel, obj client.Object, host, what string) bool {
+// owner namespace may; a refusal is told to obj once per host. claimNS is
+// the namespace that obj's claim on host was made under when that is not its
+// own: the Gateway's, for an HTTPRoute. Call it only after a route of obj on
+// host was programmed.
+func (r *IngressReconciler) hostSettingAllowed(m *renderModel, obj client.Object, claimNS, host, what string) bool {
 	owner, ok := m.hostSettingOwner(host)
-	if !ok || owner == obj.GetNamespace() {
+	if !ok || owner == obj.GetNamespace() || owner == claimNS {
 		return true
 	}
 	r.hostSettingConflict(m, obj, host, what, "belongs to namespace "+owner+", which had it first")
@@ -228,15 +230,22 @@ func (r *IngressReconciler) hostSettingConflict(m *renderModel, obj client.Objec
 // routeProgrammed is called when a route of obj on host was added. The first
 // to do so owns the host's settings; obj's own are then claimed.
 func (r *IngressReconciler) routeProgrammed(m *renderModel, obj client.Object, host string, a annSettings) {
+	r.routeProgrammedUnder(m, obj, "", host, a)
+}
+
+// routeProgrammedUnder is routeProgrammed for an object whose claim on host
+// is made under another namespace than its own, as an HTTPRoute's is under
+// its Gateway's. claimNS is that namespace.
+func (r *IngressReconciler) routeProgrammedUnder(m *renderModel, obj client.Object, claimNS, host string, a annSettings) {
 	m.noteHostOwner(host, obj.GetNamespace())
-	r.claimHSTS(m, obj, host, a)
+	r.claimHSTS(m, obj, claimNS, host, a)
 }
 
 // claimHSTS gives host the hsts policy of obj, if obj's namespace owns the
 // host. Within the owner namespace the first object to ask, in render order,
 // keeps the host; a later one with another policy is told.
-func (r *IngressReconciler) claimHSTS(m *renderModel, obj client.Object, host string, a annSettings) {
-	if a.hsts.policy == nil || !r.hostSettingAllowed(m, obj, host, "hsts annotations") {
+func (r *IngressReconciler) claimHSTS(m *renderModel, obj client.Object, claimNS, host string, a annSettings) {
+	if a.hsts.policy == nil || !r.hostSettingAllowed(m, obj, claimNS, host, "hsts annotations") {
 		return
 	}
 	from := obj.GetNamespace() + "/" + obj.GetName()

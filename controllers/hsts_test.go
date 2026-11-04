@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -272,6 +273,12 @@ func TestRenderGateways_HSTSAnnotations(t *testing.T) {
 // class serves the routes.
 func hstsMixed(t *testing.T, ownership bool, objs ...client.Object) (string, *record.FakeRecorder) {
 	t.Helper()
+	return hstsMixedClaims(t, ownership, nil, objs...)
+}
+
+// hstsMixedClaims is hstsMixed with the claims that Gateways make on hosts.
+func hstsMixedClaims(t *testing.T, ownership bool, claims []hostClaim, objs ...client.Object) (string, *record.FakeRecorder) {
+	t.Helper()
 	gc := &gwv1.GatewayClass{}
 	gc.Name = "synapse"
 	gc.Spec.ControllerName = gwv1.GatewayController(ControllerName)
@@ -291,6 +298,7 @@ func hstsMixed(t *testing.T, ownership bool, objs ...client.Object) (string, *re
 	if ownership {
 		r.HostOwnership = true
 		r.HostClaims = types.NamespacedName{Namespace: "default", Name: "claims"}
+		r.ExtraClaims = func() []hostClaim { return claims }
 	}
 	if _, _, _, err := r.render(context.Background()); err != nil {
 		t.Fatal(err)
@@ -364,6 +372,49 @@ func TestRender_HSTSDroppedRouteClaimsNothing(t *testing.T) {
 	}
 	if got := eventsOf(events, "RouteConflict"); len(got) != 1 {
 		t.Errorf("events = %q, want the route dropped", got)
+	}
+}
+
+func TestRender_HSTSDroppedRouteOfTheOwnersNamespaceClaimsNothing(t *testing.T) {
+	// The route is a's own, so only the dropped-route check keeps its
+	// "off" from the host.
+	out, events := hstsMixed(t, false,
+		ingressIn("a", "shop", "shop.example.com", "/"),
+		hstsRoute("a", "dropped", "shop.example.com", "/", "hsts", "off"))
+	if strings.Contains(hostBlock(t, out, "shop.example.com"), "hsts") {
+		t.Errorf("a dropped route of the owner namespace set the hsts of the host:\n%s", out)
+	}
+	if !strings.Contains(out, "\nhsts:\n  max_age: 300\n") {
+		t.Errorf("the proxy-wide hsts is gone:\n%s", out)
+	}
+	if got := eventsOf(events, "RouteConflict"); len(got) != 1 {
+		t.Errorf("events = %q, want the route dropped", got)
+	}
+}
+
+func TestRender_HSTSOfARouteOnASharedGatewayIsJudgedByTheGatewaysNamespace(t *testing.T) {
+	// The Gateway is in "default" and holds the host for that namespace; the
+	// route that it carries is in "app".
+	gw := &gwv1.Gateway{}
+	gw.Name, gw.Namespace = "gw", "default"
+	claims := []hostClaim{{host: "shop.example.com", ns: "default", created: time.Unix(1, 0), who: gw}}
+	out, events := hstsMixedClaims(t, true, claims,
+		hstsRoute("app", "shop", "shop.example.com", "/", "hsts-max-age", "600"))
+	if !strings.Contains(hostBlock(t, out, "shop.example.com"), "max_age: 600") {
+		t.Errorf("the route's hsts is not rendered:\n%s", out)
+	}
+	if got := eventsOf(events, "HostSettingConflict"); len(got) != 0 {
+		t.Errorf("events = %q, want none", got)
+	}
+
+	// Another route on the same Gateway is judged the same way: the first
+	// writer keeps the host.
+	out, events = hstsMixedClaims(t, true, claims,
+		hstsRoute("app", "shop", "shop.example.com", "/", "hsts-max-age", "600"),
+		hstsRoute("zzz", "other", "shop.example.com", "/other", "hsts-max-age", "900"))
+	block := hostBlock(t, out, "shop.example.com")
+	if !strings.Contains(block, "max_age: 600") || strings.Contains(block, "900") {
+		t.Errorf("want the first writer's policy:\n%s", out)
 	}
 }
 
