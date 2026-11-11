@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ import (
 const ControllerName = "gen0sec.com/synapse"
 
 // renderGateways merges HTTPRoutes (attached to Gateways of a
-// GatewayClass we control) into the same host/path map + acmeBackend
+// GatewayClass we control) into the same host/path map + solvers
 // the Ingress path uses, and sets the GatewayClass/Gateway/HTTPRoute
 // status conditions cert-manager's gatewayHTTPRoute solver waits on.
 // Tolerant of the Gateway API CRDs being absent (returns silently).
@@ -85,9 +86,9 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					ns = string(*cr.Namespace)
 				}
 				if stem, bound := certStem(host, ns, string(cr.Name)); bound {
-					m.addCert(host, stem, ns, string(cr.Name))
+					m.addCert(host, stem, ns, string(cr.Name), gw)
 				} else {
-					m.addCert("", stem, ns, string(cr.Name))
+					m.addCert("", stem, ns, string(cr.Name), gw)
 				}
 			}
 		}
@@ -138,6 +139,10 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 		}
 		matched++
 		a := parseAnnotations(rt.Annotations)
+		r.reportRedirectCode(ctx, rt, a)
+		r.reportUpstreamTLS(ctx, rt, a)
+		r.resolveUpstreamCA(ctx, m, rt, &a)
+		r.dropStickyWithoutKey(rt, &a)
 		if a.sticky {
 			m.sticky = true
 		}
@@ -147,10 +152,28 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 			if len(servers) == 0 {
 				continue
 			}
+			// One name is checked for the whole rule. With no
+			// upstream-tls-sni, the first Service gives it.
+			a := a
+			if a.upstreamTLS.sni == "" {
+				if names := r.ruleServiceNames(rt, rule); len(names) > 0 && !usableSNI(names[0]) {
+					if a.ssl != nil && *a.ssl {
+						r.emit(rt, corev1.EventTypeWarning, "InvalidUpstreamTLS",
+							"back-end %s is no usable TLS server name; the rule sends none. Set upstream-tls-sni", names[0])
+					}
+				} else if len(names) > 0 {
+					a.upstreamTLS.sni = names[0]
+					if len(names) > 1 && a.ssl != nil && *a.ssl {
+						r.emit(rt, corev1.EventTypeWarning, "UpstreamTLSSNIAmbiguous",
+							"rule has back-ends %s; their certificates are checked against %s. Set upstream-tls-sni to name another",
+							strings.Join(names, ", "), names[0])
+					}
+				}
+			}
 			req, resp := headerFilters(rule.Filters)
 			paths, regexes, warns := rulePaths(rule)
 			for _, w := range warns {
-				logger.Info("HTTPRoute match feature not representable in synapse v1 (best-effort)",
+				logger.Info("HTTPRoute match feature not representable in synapse (best-effort)",
 					"httproute", rt.Namespace+"/"+rt.Name, "detail", w)
 				mUnsupportedMatch.Inc()
 				r.emit(rt, corev1.EventTypeWarning, "UnsupportedMatch", "%s", w)
@@ -159,9 +182,8 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 				for _, h := range hostnames {
 					host := string(h)
 					if strings.HasPrefix(path, acmeChallengePrefix) {
-						if m.acme == "" {
-							m.acme = servers[0].addr
-						}
+						m.addSolver(host, path, servers[0].addr)
+						m.solverFrom(rt, host)
 						continue
 					}
 					if !m.addRoute(host, path, servers, a, req, resp) {
@@ -173,7 +195,11 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 					}
 				}
 			}
-			for _, rx := range regexes {
+			for _, raw := range regexes {
+				rx, ok := r.canonicalRegexPath(logger, rt, raw, "")
+				if !ok {
+					continue
+				}
 				for _, h := range hostnames {
 					host := string(h)
 					if !m.addRegexRoute(host, rx, servers, a, req, resp) {
@@ -197,7 +223,7 @@ func (r *IngressReconciler) renderGateways(ctx context.Context, m *renderModel) 
 // headerFilters maps HTTPRoute Request/ResponseHeaderModifier filters
 // to synapse request_headers/response_headers injection lines
 // ("Name: value"). Header `remove` and `URLRewrite`/`RequestMirror`
-// have no equivalent in synapse's v1 per-path schema and are left
+// have no equivalent in synapse's per-path schema and are left
 // unmodified (not silently faked).
 func headerFilters(filters []gwv1.HTTPRouteFilter) (req, resp []string) {
 	conv := func(f *gwv1.HTTPHeaderFilter) []string {
@@ -284,7 +310,7 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 	for _, mt := range rule.Matches {
 		if len(mt.Headers) > 0 || mt.Method != nil || len(mt.QueryParams) > 0 {
 			warnings = append(warnings,
-				"header/method/queryParam match conditions are ignored (synapse v1 routes on host+path only)")
+				"header/method/queryParam match conditions are ignored (synapse routes on host+path only)")
 		}
 		pv := "/"
 		pt := gwv1.PathMatchPathPrefix
@@ -303,30 +329,55 @@ func rulePaths(rule gwv1.HTTPRouteRule) (paths []string, regexes []string, warni
 			continue
 		case gwv1.PathMatchExact:
 			warnings = append(warnings,
-				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse v1 matches longest-prefix)", pv))
+				fmt.Sprintf("Exact path match %q is approximated as a prefix (synapse matches longest-prefix)", pv))
 		}
 		paths = append(paths, pv)
 	}
 	return paths, regexes, warnings
 }
 
-func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {
+// gwService is the namespace and name of the Service a backendRef points at.
+func gwService(routeNS string, br gwv1.HTTPBackendRef) (ns, name string, ok bool) {
 	b := br.BackendRef.BackendObjectReference
 	if b.Kind != nil && *b.Kind != "Service" {
-		return "", false
+		return "", "", false
 	}
-	ns := routeNS
+	ns = routeNS
 	if b.Namespace != nil {
 		ns = string(*b.Namespace)
 	}
 	if b.Port == nil {
+		return "", "", false
+	}
+	return ns, string(b.Name), true
+}
+
+func (r *IngressReconciler) gwBackend(routeNS string, br gwv1.HTTPBackendRef) (string, bool) {
+	ns, name, ok := gwService(routeNS, br)
+	if !ok {
 		return "", false
 	}
-	cd := r.ClusterDomain
-	if cd == "" {
-		cd = "cluster.local"
+	return fmt.Sprintf("%s:%d", serviceFQDN(ns, name, r.ClusterDomain), int32(*br.BackendRef.BackendObjectReference.Port)), true
+}
+
+// ruleServiceNames lists the distinct Service names of the backends of rule
+// that get traffic, in order.
+func (r *IngressReconciler) ruleServiceNames(rt *gwv1.HTTPRoute, rule gwv1.HTTPRouteRule) []string {
+	var names []string
+	for _, br := range rule.BackendRefs {
+		if br.Weight != nil && *br.Weight <= 0 {
+			continue
+		}
+		ns, name, ok := gwService(rt.Namespace, br)
+		if !ok {
+			continue
+		}
+		fqdn := serviceFQDN(ns, name, r.ClusterDomain)
+		if !slices.Contains(names, fqdn) {
+			names = append(names, fqdn)
+		}
 	}
-	return fmt.Sprintf("%s.%s.svc.%s:%d", b.Name, ns, cd, int32(*b.Port)), true
+	return names
 }
 
 // ---- status helpers (enough for cert-manager to proceed) ----------

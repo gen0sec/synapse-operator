@@ -1,0 +1,17 @@
+# The operator as the end-to-end test installs it: the one in config/, built
+# from this tree as synapse-operator:local, running SynapseProxy resources.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../config
+  - ../../../config/proxy-controller
+
+patches:
+  - target:
+      kind: Deployment
+      name: synapse-operator
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --proxy-controller

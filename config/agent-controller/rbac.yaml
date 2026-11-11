@@ -1,0 +1,109 @@
+# What the operator needs, on top of ../rbac.yaml, to run SynapseAgent
+# resources (--agent-controller). It is a role of its own so that an operator
+# that does not run them is not handed it.
+#
+# Three grants are wide because RBAC cannot narrow them:
+#   - Secrets, in every namespace: read, because an agent's API key and its
+#     rule files (spec.ids.rules) are in Secrets of the user's choosing;
+#     write, for the configuration Secret it keeps for each agent.
+#   - ConfigMaps, in every namespace: read, because spec.ids.rules may take
+#     rule files from a ConfigMap of the user's choosing.
+#   - DaemonSets, in every namespace: create and patch. Whoever may do that
+#     can run a pod under any ServiceAccount of that namespace.
+#
+# Every grant here is one the controller has been seen to use, and none is
+# missing: the tests in controllers/synapseagent_rbac_test.go run it as this
+# ServiceAccount, holding this role, and fail on either. Nothing is deleted:
+# what an agent owns goes with it through its owner references.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: synapse-operator-agent-controller
+rules:
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseagents
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseagents/status
+    verbs:
+      - patch
+  # Everything written for an agent is owned by it. A cluster that enforces
+  # owner-reference permissions, as OpenShift does, asks for this before it
+  # lets an object depend on its owner.
+  - apiGroups:
+      - synapse.gen0sec.com
+    resources:
+      - synapseagents/finalizers
+    verbs:
+      - update
+  # The agent itself. Applied server-side, which is a patch, and a create as
+  # well the first time.
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+  # Read: the Secret an API key is in. Written: each agent's configuration.
+  # The ServiceAccount is applied like the DaemonSet.
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+  # The rule files of spec.ids.rules. Secrets are read above.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+  # What HOME_NET is made of when an agent does not type it.
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: synapse-operator-agent-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: synapse-operator-agent-controller
+subjects:
+  - kind: ServiceAccount
+    name: synapse-operator
+    namespace: synapse-os
