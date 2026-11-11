@@ -119,6 +119,8 @@ type IngressReconciler struct {
 	EventsOn runtime.Object
 	// DefaultUpstreamTLS is the proxy-wide upstream_tls. nil ⇒ none.
 	DefaultUpstreamTLS *DefaultUpstreamTLS
+	// DefaultHSTS is the proxy-wide hsts. nil ⇒ none.
+	DefaultHSTS *DefaultHSTS
 	// Clock is where "now" comes from. nil ⇒ time.Now.
 	Clock func() time.Time
 
@@ -322,6 +324,7 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 	// The proxy-wide CA goes first: it then meets only its own size cap, and
 	// the CAs of the routes count after it.
 	r.resolveDefaultUpstreamTLS(ctx, m)
+	r.resolveDefaultHSTS(m)
 
 	// Deterministic source order: Ingresses sorted by ns/name and
 	// processed BEFORE HTTPRoutes (first-writer-wins in addRoute), so
@@ -404,6 +407,7 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 		a.serverAliases = slices.DeleteFunc(a.serverAliases, func(alias string) bool { return !allowed(alias) })
 		r.reportRedirectCode(ctx, ing, a)
 		r.reportUpstreamTLS(ctx, ing, a)
+		r.reportHSTS(ing, a)
 		r.resolveUpstreamCA(ctx, m, ing, &a)
 		// spec.tls → project each Secret. Empty Hosts ⇒ the cert
 		// applies to this Ingress's rule hosts (Kubernetes semantics).
@@ -498,7 +502,9 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 						continue
 					}
 					path = written
-					if !m.addRegexRoute(host, path, servers, a, nil, nil) {
+					if m.addRegexRoute(host, path, servers, a, nil, nil) {
+						r.routeProgrammed(m, ing, host, a)
+					} else {
 						logger.Info("regex route conflict ignored (first-writer-wins)",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
 						mRouteConflicts.Inc()
@@ -509,7 +515,9 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 						if alias == "" || alias == host {
 							continue
 						}
-						if !m.addRegexRoute(alias, path, servers, a, nil, nil) {
+						if m.addRegexRoute(alias, path, servers, a, nil, nil) {
+							r.routeProgrammed(m, ing, alias, a)
+						} else {
 							logger.Info("regex route conflict ignored on server-alias (first-writer-wins)",
 								"host", alias, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 							mRouteConflicts.Inc()
@@ -535,7 +543,9 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 					}
 					continue
 				}
-				if !m.addRoute(host, path, servers, a, nil, nil) {
+				if m.addRoute(host, path, servers, a, nil, nil) {
+					r.routeProgrammed(m, ing, host, a)
+				} else {
 					logger.Info("route conflict ignored (first-writer-wins)",
 						"host", host, "path", path, "ingress", ing.Namespace+"/"+ing.Name)
 					mRouteConflicts.Inc()
@@ -549,7 +559,9 @@ func (r *IngressReconciler) renderPass(ctx context.Context, certsFailed *int, cl
 					if alias == "" || alias == host {
 						continue
 					}
-					if !m.addRoute(alias, path, servers, a, nil, nil) {
+					if m.addRoute(alias, path, servers, a, nil, nil) {
+						r.routeProgrammed(m, ing, alias, a)
+					} else {
 						logger.Info("route conflict ignored on server-alias (first-writer-wins)",
 							"host", alias, "path", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 						mRouteConflicts.Inc()
