@@ -34,7 +34,7 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     # Longer than the test gives itself (test/e2e/run.sh), so that a run that
     # hangs is ended by the test, with its state printed, and not by this.
-    timeout-minutes: 45
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

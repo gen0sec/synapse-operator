@@ -1020,11 +1020,13 @@ func TestSynapseProxy(t *testing.T) {
 				return fmt.Sprintf("the Gateway is %+v", gw.Status.Conditions)
 			case len(gw.Status.Addresses) == 0:
 				return "the Gateway has no address"
-			// All seven routes attach to the listener for every host, the
-			// one that cannot be programmed too: attaching is about who
-			// may, not about what the route then asks for. Only the first
-			// is for the host the other listener serves.
-			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 7 || gw.Status.Listeners[1].AttachedRoutes != 1:
+			// Six routes attach to the listener for every host, the one
+			// that cannot be programmed too: attaching is about who may,
+			// not about what the route then asks for. The first is not
+			// among them: its host is one the other listener names, in the
+			// Gateway's namespace, so it is held there and the route, from
+			// another namespace, attaches to that listener only.
+			case len(gw.Status.Listeners) != 2 || gw.Status.Listeners[0].AttachedRoutes != 6 || gw.Status.Listeners[1].AttachedRoutes != 1:
 				return fmt.Sprintf("the listeners are %+v", gw.Status.Listeners)
 			}
 			return ""
