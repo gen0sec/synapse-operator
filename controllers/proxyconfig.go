@@ -171,11 +171,15 @@ func RenderProxyConfig(in ProxyConfigInput) (ProxyConfigOutput, field.ErrorList)
 			errs = append(errs, field.Invalid(at.Child("port"), l.Port,
 				"is the port of Synapse's internal services (proxy.internal_services.port)"))
 		}
-		listeners = append(listeners, map[string]any{
+		entry := map[string]any{
 			"name":    l.Name,
 			"address": fmt.Sprintf("0.0.0.0:%d", l.Port),
 			"mode":    strings.ToLower(l.Protocol),
-		})
+		}
+		if l.TCPMSS != nil {
+			entry["tcp_mss"] = int64(*l.TCPMSS)
+		}
+		listeners = append(listeners, entry)
 	}
 	if len(errs) > 0 {
 		// A stable order: the errors are written to the resource's status,

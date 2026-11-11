@@ -127,6 +127,9 @@ func (r *SynapseRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			render.DefaultUpstreamTLS.CAKey = ref.Key
 		}
 	}
+	if h := proxy.Spec.HSTS; h != nil {
+		render.DefaultHSTS = &DefaultHSTS{MaxAgeSeconds: h.MaxAgeSeconds, IncludeSubdomains: h.IncludeSubdomains, Preload: h.Preload}
+	}
 	var (
 		gatewayIn     gatewayInputs
 		gatewayStatus gatewayStatuses

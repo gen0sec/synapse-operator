@@ -133,6 +133,17 @@ func TestSynapseProxy_HostOwnershipNoneIsAccepted(t *testing.T) {
 	}
 }
 
+func TestSynapseProxy_ListenerTCPMSSBoundsAreAccepted(t *testing.T) {
+	for _, mss := range []int32{88, 1360, 32767} {
+		p := validProxy()
+		p.Spec.Listeners[0].TCPMSS = &mss
+		mustCreate(t, p)
+		if p.Spec.Listeners[0].TCPMSS == nil || *p.Spec.Listeners[0].TCPMSS != mss {
+			t.Errorf("tcpMSS = %v, want %d kept", p.Spec.Listeners[0].TCPMSS, mss)
+		}
+	}
+}
+
 func TestSynapseProxy_Rejects(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -189,6 +200,12 @@ func TestSynapseProxy_Rejects(t *testing.T) {
 		{"a listener port above 65535",
 			func(p *v1alpha1.SynapseProxy) { p.Spec.Listeners[0].Port = 65536 },
 			"spec.listeners[0].port"},
+		{"a tcpMSS below 88",
+			func(p *v1alpha1.SynapseProxy) { n := int32(87); p.Spec.Listeners[0].TCPMSS = &n },
+			"spec.listeners[0].tcpMSS"},
+		{"a tcpMSS above 32767",
+			func(p *v1alpha1.SynapseProxy) { n := int32(32768); p.Spec.Listeners[0].TCPMSS = &n },
+			"spec.listeners[0].tcpMSS"},
 		{"hostNetwork with a NodePort Service",
 			func(p *v1alpha1.SynapseProxy) {
 				p.Spec.HostNetwork = true
@@ -553,4 +570,44 @@ func TestSynapseProxy_UpstreamTLS(t *testing.T) {
 			t.Errorf("got %v, want an Invalid error naming spec.upstreamTLS.caSecretRef.name", err)
 		}
 	})
+}
+
+func TestSynapseProxy_HSTS(t *testing.T) {
+	create := func(h *v1alpha1.HSTSSpec) error {
+		p := validProxy()
+		p.Spec.HSTS = h
+		err := k8s.Create(context.Background(), p)
+		if err == nil {
+			_ = k8s.Delete(context.Background(), p)
+		}
+		return err
+	}
+	accepted := map[string]*v1alpha1.HSTSSpec{
+		"a max age alone":               {MaxAgeSeconds: 1},
+		"preload at exactly one year":   {MaxAgeSeconds: 31536000, IncludeSubdomains: true, Preload: true},
+		"a short age without preload":   {MaxAgeSeconds: 600, IncludeSubdomains: true},
+		"preload with a longer max age": {MaxAgeSeconds: 63072000, IncludeSubdomains: true, Preload: true},
+		"subdomains without preload":    {MaxAgeSeconds: 600, IncludeSubdomains: true},
+		"a long age without subdomains": {MaxAgeSeconds: 63072000},
+	}
+	for name, h := range accepted {
+		t.Run("accepts "+name, func(t *testing.T) {
+			if err := create(h); err != nil {
+				t.Errorf("rejected: %v", err)
+			}
+		})
+	}
+	rejected := map[string]*v1alpha1.HSTSSpec{
+		"preload under a year":       {MaxAgeSeconds: 31535999, IncludeSubdomains: true, Preload: true},
+		"preload without subdomains": {MaxAgeSeconds: 31536000, Preload: true},
+		"a max age of zero":          {MaxAgeSeconds: 0},
+	}
+	for name, h := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			err := create(h)
+			if err == nil || !apierrors.IsInvalid(err) {
+				t.Errorf("got %v, want an Invalid error", err)
+			}
+		})
+	}
 }
