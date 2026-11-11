@@ -226,6 +226,20 @@ type Listener struct {
 	//
 	// +kubebuilder:validation:Enum=HTTP;TLS
 	Protocol string `json:"protocol"`
+
+	// TCPMSS caps the TCP MSS of the connections this listener accepts, in
+	// both directions. It only lowers: a client that offers less keeps it.
+	// Synapse enforces it in a TC stage of its BPF firewall, so it needs
+	// Synapse 0.8.9 or newer with firewall.mode auto or xdp, on Linux. Where
+	// no stage is attached (none, nftables, iptables) it has no effect, and
+	// Synapse logs an error and serves anyway. The listener's address selects
+	// the packets, so every host served on the listener is clamped. Empty
+	// leaves the MSS alone.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=88
+	// +kubebuilder:validation:Maximum=32767
+	TCPMSS *int32 `json:"tcpMSS,omitempty"`
 }
 
 // TLSSpec configures TLS termination.
