@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/net/idna"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -224,6 +225,14 @@ type renderModel struct {
 	// them: one file two namespaces share counts for both.
 	caNSFiles map[string]map[string]struct{}
 	caNSBytes map[string]int
+	// caOrder is the file names of caFiles in the order they were added, and
+	// caOwners the objects that name each: the routes, and for the proxy-wide
+	// CA the object the proxy's events are about.
+	caOrder  []string
+	caOwners map[string][]runtime.Object
+	// caBlocked are the files that no longer fit the routes ConfigMap. A
+	// block is treated as an unusable CA when it is resolved.
+	caBlocked map[string]struct{}
 	// caErr is a Secret that could not be read for a reason other than
 	// being unusable. The render fails on it, and is tried again.
 	caErr error
