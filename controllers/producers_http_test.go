@@ -3,14 +3,17 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -484,5 +487,49 @@ func TestEdgeProducer_DeltaLines(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("upserts = %v, want the frontend->api edge", d.Upserts)
+	}
+}
+
+// With no API key the download-api would refuse every request, so the
+// producers make none and say why once.
+func TestProducers_IdleWithoutAPIKey(t *testing.T) {
+	for _, key := range []string{"", " ", " \t\n"} {
+		for _, kind := range []string{"identity", "edge"} {
+			t.Run(fmt.Sprintf("%s/%q", kind, key), func(t *testing.T) {
+				api := newDownloadAPI(t)
+				var lines int
+				var mu sync.Mutex
+				log := funcr.New(func(_, _ string) { mu.Lock(); lines++; mu.Unlock() }, funcr.Options{})
+				kube := producerKube(t, servingPod("web-1", "10.0.0.1", map[string]string{"app": "web"}))
+
+				var start func(context.Context) error
+				if kind == "identity" {
+					p := newIdentityProducer(kube, api, "")
+					p.APIKey, p.Log = key, log
+					start = p.Start
+				} else {
+					p := newEdgeProducer(kube, api, "")
+					p.APIKey, p.Log = key, log
+					start = p.Start
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() { done <- start(ctx) }()
+				time.Sleep(500 * time.Millisecond)
+				cancel()
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+
+				if n := api.count(); n != 0 {
+					t.Errorf("%d requests without an API key, want 0 (first: %s %s)", n, api.requests()[0].Method, api.requests()[0].Path)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if lines != 1 {
+					t.Errorf("%d log lines, want exactly 1", lines)
+				}
+			})
+		}
 	}
 }

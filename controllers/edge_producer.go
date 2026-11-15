@@ -76,6 +76,9 @@ func (r *EdgeProducerReconciler) Start(ctx context.Context) error {
 	if r.DeltaDebounce <= 0 {
 		r.DeltaDebounce = 200 * time.Millisecond
 	}
+	if idleWithoutAPIKey(ctx, r.Log, "edge-producer", r.APIKey) {
+		return nil
+	}
 	r.epoch = uint64(time.Now().UnixNano())
 	r.index = map[string]struct{}{}
 
