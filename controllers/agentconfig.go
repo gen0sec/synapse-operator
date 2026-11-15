@@ -231,10 +231,11 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 			setConfig(cfg, "platform.identity.cluster", in.ClusterID)
 		}
 	}
-	// Only an explicit true is rendered: the agent enables a policy_edges
-	// block by default, so a block without a typed enable must never appear.
-	if p := spec.Platform; p != nil && p.PolicyEdges != nil && p.PolicyEdges.Enabled != nil && *p.PolicyEdges.Enabled {
-		setConfig(cfg, "platform.policy_edges.enabled", true)
+	// Rendered only for an explicit typed value, false included: the agent
+	// enables a policy_edges block by default, so a raw block beside a typed
+	// false would otherwise turn the feed on.
+	if p := spec.Platform; p != nil && p.PolicyEdges != nil && p.PolicyEdges.Enabled != nil {
+		setConfig(cfg, "platform.policy_edges.enabled", *p.PolicyEdges.Enabled)
 	}
 	if c := spec.Capture; c != nil {
 		if len(c.Interfaces) > 0 {
