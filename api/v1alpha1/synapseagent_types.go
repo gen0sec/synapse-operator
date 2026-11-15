@@ -168,6 +168,8 @@ type SynapseAgentSpec struct {
 }
 
 // AgentPlatformSpec connects the agent to the Gen0Sec platform.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.policyEdges) || !has(self.policyEdges.enabled) || !self.policyEdges.enabled || (has(self.identity) && has(self.identity.enabled) && self.identity.enabled)",message="policyEdges.enabled needs identity.enabled: true"
 type AgentPlatformSpec struct {
 	// APIKeySecretRef names the Secret key holding the platform API key.
 	//
@@ -178,6 +180,21 @@ type AgentPlatformSpec struct {
 	//
 	// +optional
 	Identity *AgentIdentitySpec `json:"identity,omitempty"`
+
+	// PolicyEdges configures the declared-edge allow-list the agent downloads
+	// for east-west detection.
+	//
+	// +optional
+	PolicyEdges *AgentPolicyEdgesSpec `json:"policyEdges,omitempty"`
+}
+
+// AgentPolicyEdgesSpec configures the declared-edge allow-list.
+type AgentPolicyEdgesSpec struct {
+	// Enabled turns the allow-list on. It needs spec.platform.identity.enabled
+	// to be true. Empty leaves Synapse's default.
+	//
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // AgentIdentitySpec configures the identity the agent reports.

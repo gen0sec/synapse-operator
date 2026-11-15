@@ -148,6 +148,19 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{APIKeySecretRef: &v1alpha1.SecretKeyReference{Name: "creds"}}
 			},
 			"spec.platform.apiKeySecretRef.key"},
+		{"policyEdges enabled without identity",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(true)}}
+			},
+			"policyEdges.enabled needs identity.enabled: true"},
+		{"policyEdges enabled with identity off",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{
+					Identity:    &v1alpha1.AgentIdentitySpec{Enabled: ptr.To(false)},
+					PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(true)},
+				}
+			},
+			"policyEdges.enabled needs identity.enabled: true"},
 		{"a rule source with both references",
 			func(a *v1alpha1.SynapseAgent) {
 				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{
@@ -203,6 +216,24 @@ func eveLogging(e v1alpha1.EveLogSpec) *v1alpha1.AgentLoggingSpec {
 }
 
 // The Go type always sends enabled, so a missing one needs raw JSON.
+func TestSynapseAgent_AcceptsPolicyEdges(t *testing.T) {
+	cases := map[string]*v1alpha1.AgentPlatformSpec{
+		"enabled with identity enabled": {
+			Identity:    &v1alpha1.AgentIdentitySpec{Enabled: ptr.To(true)},
+			PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(true)},
+		},
+		"disabled without identity": {PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(false)}},
+		"empty without identity":    {PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{}},
+	}
+	for name, platform := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := validAgent()
+			a.Spec.Platform = platform
+			mustCreateAgent(t, a)
+		})
+	}
+}
+
 func TestSynapseAgent_RejectsEveWithoutEnabled(t *testing.T) {
 	u := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": v1alpha1.GroupVersion.String(),
