@@ -779,14 +779,44 @@ func TestRenderAgentConfig_EastWestDownloadDefaults(t *testing.T) {
 			t.Errorf("platform.identity = %v", b)
 		}
 	})
-	t.Run("an empty url opts out", func(t *testing.T) {
+	t.Run("an empty url is unset and not defaulted", func(t *testing.T) {
 		a := agentForConfig(identityOn(true), agentRawConfig(`{"platform": {"identity": {"url": ""}}}`))
 		b, _ := block(t, a, "identity")
-		if url, ok := b["url"]; !ok || url != "" {
-			t.Errorf("platform.identity.url = %v (present %v), want an empty string", url, ok)
+		if url, ok := b["url"]; ok {
+			t.Errorf("platform.identity.url = %v, want the key absent", url)
 		}
 		if b["path"] != "/var/lib/synapse/identity.mmdb" {
 			t.Errorf("platform.identity.path = %v, want the default", b["path"])
+		}
+	})
+	t.Run("an empty path is unset and not defaulted", func(t *testing.T) {
+		a := agentForConfig(identityOn(true), agentRawConfig(`{"platform": {"identity": {"path": ""}}}`))
+		b, _ := block(t, a, "identity")
+		if path, ok := b["path"]; ok {
+			t.Errorf("platform.identity.path = %v, want the key absent", path)
+		}
+		if b["url"] != apiURL {
+			t.Errorf("platform.identity.url = %v, want the default", b["url"])
+		}
+	})
+	t.Run("policyEdges: an empty url is unset and not defaulted", func(t *testing.T) {
+		a := agentForConfig(edgesOn(true), agentRawConfig(`{"platform": {"policy_edges": {"url": ""}}}`))
+		b, _ := block(t, a, "policy_edges")
+		if url, ok := b["url"]; ok {
+			t.Errorf("platform.policy_edges.url = %v, want the key absent", url)
+		}
+		if b["path"] != "/var/lib/synapse/policy-edges.txt" {
+			t.Errorf("platform.policy_edges.path = %v, want the default", b["path"])
+		}
+	})
+	t.Run("policyEdges: an empty path is unset and not defaulted", func(t *testing.T) {
+		a := agentForConfig(edgesOn(true), agentRawConfig(`{"platform": {"policy_edges": {"path": ""}}}`))
+		b, _ := block(t, a, "policy_edges")
+		if path, ok := b["path"]; ok {
+			t.Errorf("platform.policy_edges.path = %v, want the key absent", path)
+		}
+		if b["url"] != apiURL {
+			t.Errorf("platform.policy_edges.url = %v, want the default", b["url"])
 		}
 	})
 	t.Run("a null url gets the default", func(t *testing.T) {
