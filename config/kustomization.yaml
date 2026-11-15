@@ -9,3 +9,13 @@ resources:
   - manager.yaml
   - manager-producers.yaml
 
+
+# The cluster id both Deployments read as SYNAPSE_CLUSTER_ID. It scopes the
+# producers' uploads, and is the default platform.identity.cluster of an agent
+# with identity enabled. Empty keeps the shared global path. Set it to a stable
+# value unique per cluster. A change renames the ConfigMap, which rolls both
+# Deployments.
+configMapGenerator:
+  - name: synapse-operator-cluster
+    literals:
+      - cluster-id=

@@ -425,3 +425,25 @@ func TestUpstreamsCADirError(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveClusterID(t *testing.T) {
+	tests := []struct {
+		name    string
+		flagVal string
+		flagSet bool
+		env     string
+		want    string
+	}{
+		{"nothing set", "", false, "", ""},
+		{"env only", "", false, "prod-eu", "prod-eu"},
+		{"flag only", "from-flag", true, "", "from-flag"},
+		{"flag beats env", "from-flag", true, "from-env", "from-flag"},
+		{"an explicit empty flag beats env", "", true, "from-env", ""},
+		{"env is trimmed", "", false, " prod-eu\n", "prod-eu"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, resolveClusterID(tt.flagVal, tt.flagSet, tt.env))
+		})
+	}
+}

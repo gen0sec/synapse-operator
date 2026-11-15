@@ -2,7 +2,10 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -39,11 +42,17 @@ const (
 const agentAPIKeySecretIndex = "spec.platform.apiKeySecretRef.name"
 
 // SetupAgentControllers registers the controller that runs SynapseAgent
-// resources.
-func SetupAgentControllers(mgr ctrl.Manager) error {
+// resources. clusterID is the operator's cluster id, which an agent with
+// identity enabled takes unless its spec names one; it may be empty, and it
+// is refused when it holds a control character.
+func SetupAgentControllers(mgr ctrl.Manager, clusterID string) error {
+	if strings.ContainsFunc(clusterID, unicode.IsControl) {
+		return errors.New("the cluster id holds control characters")
+	}
 	agents := &SynapseAgentReconciler{
-		Client:   mgr.GetClient(),
-		Recorder: mgr.GetEventRecorderFor("synapse-agent"),
+		Client:    mgr.GetClient(),
+		Recorder:  mgr.GetEventRecorderFor("synapse-agent"),
+		ClusterID: clusterID,
 	}
 	if err := agents.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("agent controller: %w", err)

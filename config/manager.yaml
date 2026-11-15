@@ -32,6 +32,13 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "--leader-elect"
+          env:
+            - name: SYNAPSE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: synapse-operator-cluster
+                  key: cluster-id
+                  optional: true
           ports:
             - containerPort: 8080
               name: metrics

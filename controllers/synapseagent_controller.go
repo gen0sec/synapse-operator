@@ -21,6 +21,14 @@ import (
 // selects no node.
 const ReasonNoMatchingNodes = "NoMatchingNodes"
 
+// The ClusterIDMatches condition and its reasons.
+const (
+	ConditionClusterIDMatches = "ClusterIDMatches"
+	ReasonClusterMatches      = "Matches"
+	ReasonClusterFromOperator = "FromOperator"
+	ReasonClusterMismatch     = "Mismatch"
+)
+
 // agentFieldOwner is the field manager the agent's objects are applied as. It
 // is not the proxy's: an apply forced as the same manager could take over an
 // object of a SynapseProxy of the same name, if the collision check missed it.
@@ -46,6 +54,8 @@ type SynapseAgentReconciler struct {
 	// not the agent's, so they are read live and not cached whole. Nil means
 	// Client.
 	RuleReader client.Reader
+	// ClusterID is the operator's cluster id.
+	ClusterID string
 }
 
 func (r *SynapseAgentReconciler) ruleReader() client.Reader {
@@ -59,8 +69,13 @@ func (r *SynapseAgentReconciler) ruleReader() client.Reader {
 type agentOutcome struct {
 	configValid metav1.Condition
 	ready       metav1.Condition
-	configHash  string
-	requeue     time.Duration
+	// clusterID is the advisory ClusterIDMatches condition, nil when there
+	// is none. It is written only when clusterKnown: an invalid spec leaves
+	// what is there.
+	clusterID    *metav1.Condition
+	clusterKnown bool
+	configHash   string
+	requeue      time.Duration
 }
 
 func (o *agentOutcome) invalid(reason, message string) {
@@ -143,7 +158,7 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 		return o, nil
 	}
 
-	cfg, err := RenderAgentConfig(AgentConfigInput{Agent: agent, APIKey: apiKey, HomeNet: homeNet, RuleFiles: agentRuleFileNames(rules)})
+	cfg, err := RenderAgentConfig(AgentConfigInput{Agent: agent, APIKey: apiKey, HomeNet: homeNet, ClusterID: r.ClusterID, RuleFiles: agentRuleFileNames(rules)})
 	if err != nil {
 		o.invalid(ReasonInvalidConfig, err.Error())
 		return o, nil
@@ -154,6 +169,8 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 	}
 	o.configValid = metav1.Condition{Type: ConditionConfigValid, Status: metav1.ConditionTrue, Reason: ReasonRendered,
 		Message: "spec renders to a Synapse configuration"}
+
+	o.clusterID, o.clusterKnown = clusterIDCondition(agent, r.ClusterID), true
 
 	objects := []client.Object{
 		buildAgentConfigSecret(agent, cfg.YAML, rules...),
@@ -201,6 +218,36 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 		o.notReady(reason, message)
 	}
 	return o, nil
+}
+
+// clusterIDCondition compares the cluster id the agent reports with the
+// operator's, which the producers upload under. It is advice and nothing
+// more: it never touches Ready. It is nil when there is nothing to compare,
+// that is when neither id is in play or the agent has no identity to scope.
+func clusterIDCondition(agent *synapsev1alpha1.SynapseAgent, operator string) *metav1.Condition {
+	spec := ""
+	if p := agent.Spec.Platform; p != nil && p.Identity != nil {
+		spec = p.Identity.Cluster
+	}
+	c := metav1.Condition{Type: ConditionClusterIDMatches}
+	switch {
+	case spec != "" && spec == operator:
+		c.Status, c.Reason = metav1.ConditionTrue, ReasonClusterMatches
+		c.Message = "spec.platform.identity.cluster is the operator's cluster id"
+	case spec != "":
+		c.Status, c.Reason = metav1.ConditionFalse, ReasonClusterMismatch
+		if operator == "" {
+			c.Message = "spec.platform.identity.cluster is set, and the operator has no cluster id: the operator's producers upload to the shared path, which this agent does not read"
+		} else {
+			c.Message = "spec.platform.identity.cluster differs from the operator's cluster id: the operator's producers upload to another path than this agent reads"
+		}
+	case agentIdentityEnabled(&agent.Spec) && operator != "":
+		c.Status, c.Reason = metav1.ConditionTrue, ReasonClusterFromOperator
+		c.Message = "the agent takes the operator's cluster id"
+	default:
+		return nil
+	}
+	return &c
 }
 
 // clusterHomeNet is HOME_NET as the cluster's nodes and services make it.
@@ -260,6 +307,16 @@ func (r *SynapseAgentReconciler) writeStatus(ctx context.Context, agent *synapse
 	for _, c := range []metav1.Condition{o.configValid, o.ready} {
 		c.ObservedGeneration = agent.Generation
 		meta.SetStatusCondition(&status.Conditions, c)
+	}
+
+	if o.clusterKnown {
+		if o.clusterID != nil {
+			c := *o.clusterID
+			c.ObservedGeneration = agent.Generation
+			meta.SetStatusCondition(&status.Conditions, c)
+		} else {
+			meta.RemoveStatusCondition(&status.Conditions, ConditionClusterIDMatches)
+		}
 	}
 
 	// The running pods are reported whatever the outcome: an invalid spec
