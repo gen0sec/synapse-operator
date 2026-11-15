@@ -168,9 +168,7 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 					PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(true)},
 				}
 			},
-			// The leading text rules out a CEL evaluation error, which carries
-			// the same message after "evaluating rule:".
-			`Invalid value: policyEdges.enabled needs identity.enabled: true`},
+			"policyEdges.enabled needs identity.enabled: true"},
 		{"a rule source with both references",
 			func(a *v1alpha1.SynapseAgent) {
 				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{
@@ -216,6 +214,11 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("message does not mention %q:\n%v", tc.want, err)
+			}
+			// A CEL evaluation error also ends with the rule's message, so a
+			// broken rule would otherwise pass as a rejection.
+			if strings.Contains(err.Error(), "evaluating rule") {
+				t.Errorf("rejected by a CEL evaluation error, not by the rule:\n%v", err)
 			}
 		})
 	}
