@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 
 	synapsev1alpha1 "synapse-operator/api/v1alpha1"
 )
@@ -27,6 +29,13 @@ const (
 	ReasonClusterMatches      = "Matches"
 	ReasonClusterFromOperator = "FromOperator"
 	ReasonClusterMismatch     = "Mismatch"
+)
+
+// The EastWestObserved condition and its reasons.
+const (
+	ConditionEastWestObserved = "EastWestObserved"
+	ReasonObserving           = "Observing"
+	ReasonNothingObserved     = "NothingObserved"
 )
 
 // agentFieldOwner is the field manager the agent's objects are applied as. It
@@ -74,8 +83,12 @@ type agentOutcome struct {
 	// what is there.
 	clusterID    *metav1.Condition
 	clusterKnown bool
-	configHash   string
-	requeue      time.Duration
+	// eastWest is the advisory EastWestObserved condition, with the same
+	// rules as clusterID.
+	eastWest      *metav1.Condition
+	eastWestKnown bool
+	configHash    string
+	requeue       time.Duration
 }
 
 func (o *agentOutcome) invalid(reason, message string) {
@@ -171,6 +184,7 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 		Message: "spec renders to a Synapse configuration"}
 
 	o.clusterID, o.clusterKnown = clusterIDCondition(agent, r.ClusterID), true
+	o.eastWest, o.eastWestKnown = eastWestCondition(agent, cfg.YAML), true
 
 	objects := []client.Object{
 		buildAgentConfigSecret(agent, cfg.YAML, rules...),
@@ -321,6 +335,15 @@ func (r *SynapseAgentReconciler) writeStatus(ctx context.Context, agent *synapse
 			meta.RemoveStatusCondition(&status.Conditions, ConditionClusterIDMatches)
 		}
 	}
+	if o.eastWestKnown {
+		if o.eastWest != nil {
+			c := *o.eastWest
+			c.ObservedGeneration = agent.Generation
+			meta.SetStatusCondition(&status.Conditions, c)
+		} else {
+			meta.RemoveStatusCondition(&status.Conditions, ConditionEastWestObserved)
+		}
+	}
 
 	// The running pods are reported whatever the outcome: an invalid spec
 	// does not stop what is already there.
@@ -353,4 +376,43 @@ func (r *SynapseAgentReconciler) writeStatus(ctx context.Context, agent *synapse
 
 	// A patch with nothing in it changes nothing on the server.
 	return r.Status().Patch(ctx, agent, client.MergeFrom(before))
+}
+
+// eastWestObservation says whether the rendered config tree observes
+// anything, and if not, why and what to change. It follows Synapse: both
+// observer backends (tcx, af_packet) need an observe_interfaces entry that is
+// not blank, and only an agent on the host network sees the node's
+// interfaces.
+func eastWestObservation(tree map[string]any, hostNetwork bool) (bool, string) {
+	if !hostNetwork {
+		return false, "spec.hostNetwork is false: the agent sees only its own pod's network namespace, so nothing is observed; enable hostNetwork"
+	}
+	capture, _ := tree["capture"].(map[string]any)
+	names, _ := capture["observe_interfaces"].([]any)
+	for _, n := range names {
+		if name, _ := n.(string); strings.TrimSpace(name) != "" {
+			return true, "the agent observes pod traffic on " + strings.TrimSpace(name)
+		}
+	}
+	return false, "capture.observe_interfaces is empty, so the observer attaches nowhere (observe_pod_veths needs it too); set spec.capture.cni or spec.capture.observeInterfaces"
+}
+
+// eastWestCondition is the advisory EastWestObserved condition, computed from
+// the rendered config. It never touches Ready. It is nil unless identity is
+// typed-enabled: the observer feeds the identity graph.
+func eastWestCondition(agent *synapsev1alpha1.SynapseAgent, renderedYAML []byte) *metav1.Condition {
+	if !agentIdentityEnabled(&agent.Spec) {
+		return nil
+	}
+	var tree map[string]any
+	if err := yaml.Unmarshal(renderedYAML, &tree); err != nil {
+		return nil
+	}
+	c := metav1.Condition{Type: ConditionEastWestObserved}
+	if ok, message := eastWestObservation(tree, agentHostNetwork(&agent.Spec)); ok {
+		c.Status, c.Reason, c.Message = metav1.ConditionTrue, ReasonObserving, message
+	} else {
+		c.Status, c.Reason, c.Message = metav1.ConditionFalse, ReasonNothingObserved, message
+	}
+	return &c
 }

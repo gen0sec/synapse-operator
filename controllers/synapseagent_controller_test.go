@@ -765,3 +765,123 @@ func TestAgent_ClusterIDCondition(t *testing.T) {
 		}
 	})
 }
+
+func TestEastWestObservation(t *testing.T) {
+	tree := func(capture map[string]any) map[string]any { return map[string]any{"capture": capture} }
+	ifaces := func(names ...any) map[string]any { return tree(map[string]any{"observe_interfaces": names}) }
+	cases := []struct {
+		name    string
+		tree    map[string]any
+		host    bool
+		want    bool
+		message string // a part of the message of a False
+	}{
+		{"tcx on an interface", ifaces("eth0"), true, true, ""},
+		{"tcx, mode named", tree(map[string]any{"observe_interfaces": []any{"eth0"}, "observe_mode": "tcx"}), true, true, ""},
+		{"tcx, first entry blank, second set", ifaces(" ", "eth0"), true, true, ""},
+		{"af_packet on its first interface", tree(map[string]any{"observe_interfaces": []any{"cni0"}, "observe_mode": "af_packet"}), true, true, ""},
+		{"af_packet, first entry blank", tree(map[string]any{"observe_interfaces": []any{"", "cni0"}, "observe_mode": "af_packet"}), true, true, ""},
+		{"no capture block", map[string]any{}, true, false, "observe_interfaces"},
+		{"no interfaces", tree(map[string]any{}), true, false, "observe_interfaces"},
+		{"empty interfaces", ifaces(), true, false, "observe_interfaces"},
+		{"blank interfaces", ifaces("", "  "), true, false, "observe_interfaces"},
+		{"pod veths alone", tree(map[string]any{"observe_pod_veths": true}), true, false, "observe_interfaces"},
+		{"pod veths and empty interfaces", tree(map[string]any{"observe_pod_veths": true, "observe_interfaces": []any{}}), true, false, "observe_interfaces"},
+		{"host network off", ifaces("eth0"), false, false, "hostNetwork"},
+		{"af_packet with no interface", tree(map[string]any{"observe_mode": "af_packet"}), true, false, "observe_interfaces"},
+		{"af_packet with blanks", tree(map[string]any{"observe_interfaces": []any{"", " "}, "observe_mode": "af_packet"}), true, false, "observe_interfaces"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, message := eastWestObservation(tc.tree, tc.host)
+			if got != tc.want {
+				t.Fatalf("observing = %v (%s), want %v", got, message, tc.want)
+			}
+			if !tc.want && !strings.Contains(message, tc.message) {
+				t.Errorf("message %q lacks %q", message, tc.message)
+			}
+		})
+	}
+}
+
+func TestAgent_EastWestObservedCondition(t *testing.T) {
+	identity := func(s *synapsev1alpha1.SynapseAgentSpec) {
+		s.Platform = &synapsev1alpha1.AgentPlatformSpec{Identity: &synapsev1alpha1.AgentIdentitySpec{Enabled: boolPtr(true)}}
+	}
+	with := func(mutate ...func(*synapsev1alpha1.SynapseAgentSpec)) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			identity(s)
+			for _, m := range mutate {
+				m(s)
+			}
+		}
+	}
+	capture := func(c synapsev1alpha1.AgentCaptureSpec) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) { s.Capture = &c }
+	}
+	noHost := func(s *synapsev1alpha1.SynapseAgentSpec) { s.HostNetwork = kptr.To(false) }
+	cases := []struct {
+		name    string
+		spec    func(*synapsev1alpha1.SynapseAgentSpec)
+		status  metav1.ConditionStatus // empty: the condition is absent
+		reason  string
+		message string
+	}{
+		{"preset", with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})), metav1.ConditionTrue, ReasonObserving, ""},
+		{"typed interfaces", with(capture(synapsev1alpha1.AgentCaptureSpec{ObserveInterfaces: []string{"eth0"}})), metav1.ConditionTrue, ReasonObserving, ""},
+		{"raw passthrough interfaces", with(agentRawConfig(`{"capture": {"observe_interfaces": ["eth0"]}}`)), metav1.ConditionTrue, ReasonObserving, ""},
+		{"af_packet on a raw interface", with(agentRawConfig(`{"capture": {"observe_interfaces": ["cni0"], "observe_mode": "af_packet"}}`)), metav1.ConditionTrue, ReasonObserving, ""},
+		{"nothing set", with(), metav1.ConditionFalse, ReasonNothingObserved, "spec.capture.cni"},
+		{"empty raw interfaces", with(agentRawConfig(`{"capture": {"observe_interfaces": []}}`)), metav1.ConditionFalse, ReasonNothingObserved, "observe_interfaces"},
+		{"pod veths only", with(capture(synapsev1alpha1.AgentCaptureSpec{ObservePodVeths: boolPtr(true)})), metav1.ConditionFalse, ReasonNothingObserved, "observe_interfaces"},
+		{"host network off", with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"}), noHost), metav1.ConditionFalse, ReasonNothingObserved, "hostNetwork"},
+		{"af_packet with no interface", with(capture(synapsev1alpha1.AgentCaptureSpec{ObserveMode: "af_packet"})), metav1.ConditionFalse, ReasonNothingObserved, "observe_interfaces"},
+		{"identity off", func(s *synapsev1alpha1.SynapseAgentSpec) {
+			capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})(s)
+		}, "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newAgentEnv(t)
+			a := e.running(tc.spec)
+			if tc.status == "" {
+				if c := meta.FindStatusCondition(a.Status.Conditions, ConditionEastWestObserved); c != nil {
+					t.Fatalf("unexpected %s condition: %+v", ConditionEastWestObserved, c)
+				}
+			} else {
+				c := wantAgentCondition(t, a, ConditionEastWestObserved, tc.status, tc.reason)
+				if !strings.Contains(c.Message, tc.message) {
+					t.Errorf("message %q lacks %q", c.Message, tc.message)
+				}
+			}
+			// Advisory: Ready and ConfigValid are what they were without it.
+			wantAgentCondition(t, a, ConditionReady, metav1.ConditionFalse, ReasonRollingOut)
+			wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
+		})
+	}
+
+	t.Run("follows the spec, is kept on an invalid one and removed with identity", func(t *testing.T) {
+		e := newAgentEnv(t)
+		a := e.running(with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})))
+		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionTrue, ReasonObserving)
+
+		e.edit(a, with(noHost))
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved)
+
+		e.edit(a, with(noHost, agentRawConfig(`{"mode":"proxy"}`)))
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonInvalidConfig)
+		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved)
+
+		e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Config = nil
+			s.Platform = nil
+			capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})(s)
+		})
+		e.reconcile(a)
+		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionEastWestObserved); c != nil {
+			t.Errorf("the condition stays after identity is turned off: %+v", c)
+		}
+	})
+}
