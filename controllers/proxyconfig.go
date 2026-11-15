@@ -394,8 +394,9 @@ func setConfig(cfg map[string]any, path string, value any) {
 	cfg[parts[len(parts)-1]] = value
 }
 
-// setConfigDefault sets path only when the key is absent or null. An empty
-// string is a value, so it opts out of the default.
+// setConfigDefault sets path when the key is absent or null. An empty string
+// means unset: the key is removed and not defaulted, so the setting is left
+// out of the rendered config.
 func setConfigDefault(cfg map[string]any, path string, value any) {
 	parts := strings.Split(path, ".")
 	cur := cfg
@@ -408,8 +409,11 @@ func setConfigDefault(cfg map[string]any, path string, value any) {
 		cur = next
 	}
 	last := parts[len(parts)-1]
-	if cur[last] == nil {
+	switch cur[last] {
+	case nil:
 		cur[last] = value
+	case "":
+		delete(cur, last)
 	}
 }
 
