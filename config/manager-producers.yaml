@@ -1,19 +1,17 @@
 # Operator deployment running the east-west PRODUCERS (identity + declared-edge).
 #
-# This is a standalone variant of config/manager.yaml with the two producer
-# modes enabled. It reuses the synapse-operator ServiceAccount/ClusterRole from
-# config/rbac.yaml (which now grants the pods/networkpolicies/namespaces reads
-# the producers need). It can run alongside, or instead of, the config-hash
-# manager — the modes are composable, so you may instead just add the three
-# producer args to config/manager.yaml's existing container.
+# Part of the default install. It is a second Deployment of the operator image
+# with the two producer modes on and the config-hash controller off, so each
+# Deployment holds its own leader lease. It reuses the synapse-operator
+# ServiceAccount and ClusterRole from config/rbac.yaml.
 #
-# Wiring:
-#   - SYNAPSE_API_KEY: an API key holding `identity:write` (download-api upload).
-#   - --download-api-url: the download-api base (default https://api.gen0sec.com/v1).
-#
-# Create the API-key secret first:
+# Without the Secret below the producers start, log once and stay idle. To
+# enable them, create it and restart the Deployment:
 #   kubectl -n synapse-os create secret generic synapse-operator-api \
 #     --from-literal=api-key='<key-with-identity:write>'
+#   kubectl -n synapse-os rollout restart deployment/synapse-operator-producers
+#
+# --download-api-url is the download-api base (default https://api.gen0sec.com/v1).
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -38,10 +36,12 @@ spec:
       serviceAccountName: synapse-operator
       containers:
         - name: manager
-          image: ghcr.io/gen0sec/synapse-operator:latest
+          image: synapse-operator:local
           imagePullPolicy: IfNotPresent
           args:
             - "--leader-elect"
+            - "--leader-election-id=producers.synapse.gen0sec.com"
+            - "--config-hash-controller=false"
             - "--identity-producer"
             - "--edge-producer"
             - "--download-api-url=https://api.gen0sec.com/v1"
@@ -53,6 +53,7 @@ spec:
                 secretKeyRef:
                   name: synapse-operator-api
                   key: api-key
+                  optional: true
           ports:
             - containerPort: 8080
               name: metrics
