@@ -109,3 +109,11 @@ func TestCheckAgentAccess_AnythingElseIsPassedOnAsItIs(t *testing.T) {
 		t.Errorf("an unreachable API server is blamed on the install: %v", err)
 	}
 }
+
+func TestSetupAgentControllers_RefusesControlCharacters(t *testing.T) {
+	for _, id := range []string{"a\nb", "a\x00b", "a\tb", "a\x7fb"} {
+		if err := SetupAgentControllers(nil, id); err == nil {
+			t.Errorf("cluster id %q was accepted", id)
+		}
+	}
+}

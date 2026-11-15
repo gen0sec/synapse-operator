@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
@@ -198,5 +199,87 @@ func TestDefaultInstall_ShipsProducers(t *testing.T) {
 	}
 	if !found {
 		t.Error("the producers Deployment has no SYNAPSE_API_KEY")
+	}
+}
+
+// One cluster id feeds both Deployments, through one ConfigMap, so the
+// controller's agents and the producers' uploads cannot name different clusters.
+func TestDefaultInstall_OneClusterID(t *testing.T) {
+	kubectl, err := exec.LookPath("kubectl")
+	if err != nil {
+		t.Skip("no kubectl to build a kustomization with")
+	}
+	cmd := exec.Command(kubectl, "kustomize", "../config")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("kubectl kustomize: %v\n%s", err, stderr.String())
+	}
+
+	var deployments []*appsv1.Deployment
+	var clusterMaps []*corev1.ConfigMap
+	dec := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(out), 4096)
+	for {
+		var obj map[string]any
+		if err := dec.Decode(&obj); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := yaml.Marshal(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch obj["kind"] {
+		case "Deployment":
+			d := &appsv1.Deployment{}
+			if err := yaml.Unmarshal(raw, d); err != nil {
+				t.Fatal(err)
+			}
+			deployments = append(deployments, d)
+		case "ConfigMap":
+			c := &corev1.ConfigMap{}
+			if err := yaml.Unmarshal(raw, c); err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(c.Name, "synapse-operator-cluster") {
+				clusterMaps = append(clusterMaps, c)
+			}
+		}
+	}
+	if len(clusterMaps) != 1 {
+		t.Fatalf("the default install has %d cluster ConfigMaps, want 1", len(clusterMaps))
+	}
+	cm := clusterMaps[0]
+	if _, ok := cm.Data["cluster-id"]; !ok {
+		t.Errorf("the cluster ConfigMap has no cluster-id key: %v", cm.Data)
+	}
+	if len(deployments) != 2 {
+		t.Fatalf("the default install has %d Deployments, want 2", len(deployments))
+	}
+	for _, d := range deployments {
+		var found *corev1.EnvVar
+		for i, e := range d.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "SYNAPSE_CLUSTER_ID" {
+				found = &d.Spec.Template.Spec.Containers[0].Env[i]
+			}
+		}
+		if found == nil || found.ValueFrom == nil || found.ValueFrom.ConfigMapKeyRef == nil {
+			t.Errorf("%s does not read SYNAPSE_CLUSTER_ID from a ConfigMap", d.Name)
+			continue
+		}
+		ref := found.ValueFrom.ConfigMapKeyRef
+		if ref.Name != cm.Name || ref.Key != "cluster-id" {
+			t.Errorf("%s reads SYNAPSE_CLUSTER_ID from %s/%s, want %s/cluster-id (the name is hashed, so the reference has to be rewritten)", d.Name, ref.Name, ref.Key, cm.Name)
+		}
+		if ref.Optional != nil && !*ref.Optional {
+			t.Errorf("%s: the reference is mandatory, so the pod would not start without the ConfigMap", d.Name)
+		}
+		for _, a := range d.Spec.Template.Spec.Containers[0].Args {
+			if strings.Contains(a, "$(SYNAPSE_CLUSTER_ID)") {
+				t.Errorf("%s passes the id as an argument (%q): it stays literal when the ConfigMap is missing", d.Name, a)
+			}
+		}
 	}
 }

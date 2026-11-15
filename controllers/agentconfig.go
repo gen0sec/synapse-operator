@@ -47,6 +47,10 @@ type AgentConfigInput struct {
 	// Synapse's "[a,b]" form. spec.ids.homeNet wins over it. It comes from the
 	// operator, not from a user, so it is not validated here.
 	HomeNet string
+	// ClusterID is the operator's own cluster id. It is rendered as
+	// platform.identity.cluster for an agent with identity typed-enabled and
+	// no spec.platform.identity.cluster of its own.
+	ClusterID string
 	// RuleFiles are the names of the rule files the controller copied into
 	// the config Secret, in the order they load.
 	RuleFiles []string
@@ -87,6 +91,13 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	{"ids.enabled", "use spec.ids.enabled"},
 	{"ids.enforce_block", "use spec.ids.enforceBlock"},
 	{"ids.address_vars.HOME_NET", "use spec.ids.homeNet"},
+}
+
+// agentIdentityEnabled is true when spec.platform.identity.enabled is set to
+// true. A raw platform.identity block does not count.
+func agentIdentityEnabled(spec *synapsev1alpha1.SynapseAgentSpec) bool {
+	p := spec.Platform
+	return p != nil && p.Identity != nil && p.Identity.Enabled != nil && *p.Identity.Enabled
 }
 
 // agentEveDir is where a file EVE log lives in the pod.
@@ -205,8 +216,11 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 		if id.Identity.Enabled != nil {
 			setConfig(cfg, "platform.identity.enabled", *id.Identity.Enabled)
 		}
-		if id.Identity.Cluster != "" {
+		switch {
+		case id.Identity.Cluster != "":
 			setConfig(cfg, "platform.identity.cluster", id.Identity.Cluster)
+		case agentIdentityEnabled(spec) && in.ClusterID != "":
+			setConfig(cfg, "platform.identity.cluster", in.ClusterID)
 		}
 	}
 	if c := spec.Capture; c != nil {

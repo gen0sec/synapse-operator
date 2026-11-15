@@ -691,3 +691,66 @@ func managedByAs(o client.Object, manager string, op metav1.ManagedFieldsOperati
 	}
 	return false
 }
+
+func TestAgent_ClusterIDCondition(t *testing.T) {
+	identity := func(enabled *bool, cluster string) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Platform = &synapsev1alpha1.AgentPlatformSpec{Identity: &synapsev1alpha1.AgentIdentitySpec{Enabled: enabled, Cluster: cluster}}
+		}
+	}
+	cases := []struct {
+		name     string
+		operator string
+		spec     func(*synapsev1alpha1.SynapseAgentSpec)
+		status   metav1.ConditionStatus // empty: the condition is absent
+		reason   string
+	}{
+		{"spec equals the operator's", "prod-eu", identity(boolPtr(true), "prod-eu"), metav1.ConditionTrue, ReasonClusterMatches},
+		{"spec differs", "prod-eu", identity(boolPtr(true), "other"), metav1.ConditionFalse, ReasonClusterMismatch},
+		{"spec set and the operator has none", "", identity(boolPtr(true), "other"), metav1.ConditionFalse, ReasonClusterMismatch},
+		{"spec empty, identity on", "prod-eu", identity(boolPtr(true), ""), metav1.ConditionTrue, ReasonClusterFromOperator},
+		{"spec empty, identity off", "prod-eu", identity(boolPtr(false), ""), "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newAgentEnv(t)
+			e.agents.ClusterID = tc.operator
+			a := e.running(tc.spec)
+			if tc.status == "" {
+				if c := meta.FindStatusCondition(a.Status.Conditions, ConditionClusterIDMatches); c != nil {
+					t.Fatalf("unexpected %s condition: %+v", ConditionClusterIDMatches, c)
+				}
+			} else {
+				wantAgentCondition(t, a, ConditionClusterIDMatches, tc.status, tc.reason)
+			}
+			// Advisory: Ready is what the DaemonSet says, whatever the ids are.
+			wantAgentCondition(t, a, ConditionReady, metav1.ConditionFalse, ReasonRollingOut)
+			wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionTrue, ReasonRendered)
+		})
+	}
+
+	t.Run("follows the spec and is kept on an invalid one", func(t *testing.T) {
+		e := newAgentEnv(t)
+		e.agents.ClusterID = "prod-eu"
+		a := e.running(identity(boolPtr(true), ""))
+		wantAgentCondition(t, a, ConditionClusterIDMatches, metav1.ConditionTrue, ReasonClusterFromOperator)
+
+		e.edit(a, identity(boolPtr(true), "other"))
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionClusterIDMatches, metav1.ConditionFalse, ReasonClusterMismatch)
+
+		e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
+			identity(boolPtr(true), "other")(s)
+			agentRawConfig(`{"mode":"proxy"}`)(s)
+		})
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonInvalidConfig)
+		wantAgentCondition(t, a, ConditionClusterIDMatches, metav1.ConditionFalse, ReasonClusterMismatch)
+
+		e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) { s.Config = nil; identity(boolPtr(false), "")(s) })
+		e.reconcile(a)
+		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionClusterIDMatches); c != nil {
+			t.Errorf("the condition stays after identity is turned off: %+v", c)
+		}
+	})
+}

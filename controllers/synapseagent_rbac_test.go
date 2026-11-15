@@ -50,7 +50,7 @@ func runAgentController(t *testing.T, cfg *rest.Config, namespace ...string) (st
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := SetupAgentControllers(mgr); err != nil {
+	if err := SetupAgentControllers(mgr, ""); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

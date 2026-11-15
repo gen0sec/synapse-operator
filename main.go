@@ -128,7 +128,7 @@ func main() {
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.BoolVar(&identityProducer, "identity-producer", false, "Enable the IdentityProducerReconciler: build a workload-identity MMDB (pod IP -> workload/namespace/app) from cluster Pods and upload it to the download-api (--download-api-url) so agents can pull it for east-west detection. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.StringVar(&downloadAPIURL, "download-api-url", "https://api.gen0sec.com/v1", "download-api base URL the identity producer uploads to (uses {url}/identity/upload). Only used with --identity-producer.")
-	flag.StringVar(&clusterID, "cluster-id", "", "Cluster identifier that scopes this cluster's identity/edge baseline in the download-api, so multiple clusters sharing one workspace don't overwrite each other's MMDB (last-writer-wins). Empty = the legacy shared global path. To isolate, set a stable unique value here AND the matching platform.identity.cluster on every agent in this cluster.")
+	flag.StringVar(&clusterID, "cluster-id", "", "Cluster identifier that scopes this cluster's identity/edge baseline in the download-api, so multiple clusters sharing one workspace don't overwrite each other's MMDB (last-writer-wins). Defaults to the SYNAPSE_CLUSTER_ID environment variable. Empty = the legacy shared global path. To isolate, set a stable unique value here AND the matching platform.identity.cluster on every agent in this cluster.")
 	flag.DurationVar(&identityProducerInterval, "identity-producer-interval", 5*time.Minute, "How often the identity producer re-uploads the full MMDB *baseline* (cold-start/resync source). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --identity-producer.")
 	flag.BoolVar(&edgeProducer, "edge-producer", false, "Enable the EdgeProducerReconciler: compile cluster NetworkPolicy into a declared-edge allow-list (workload->workload:port + governed destinations) and upload it to the download-api (--download-api-url) for the agent's `edge.*` microsegmentation fields. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
 	flag.DurationVar(&edgeProducerInterval, "edge-producer-interval", 5*time.Minute, "How often the edge producer re-uploads the full declared-edge allow-list *baseline* (cold-start/resync). Per-change freshness is delivered by event-driven deltas, so this can be infrequent. Only used with --edge-producer.")
@@ -150,6 +150,9 @@ func main() {
 	flag.BoolVar(&proxyController, "proxy-controller", false, "Run SynapseProxy resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its Deployment, Service and ServiceAccount, and render the routes and certificates of the Ingresses whose IngressClass names it in spec.parameters. Needs the CRD and the role in config/proxy-controller. Composable with the config-hash controller and the resolvers; cannot be combined with --ingress-mode or --config-sync.")
 	flag.BoolVar(&agentController, "agent-controller", false, "Run SynapseAgent resources (synapse.gen0sec.com/v1alpha1): for each one, render its configuration and create its DaemonSet, Secret and ServiceAccount. Needs the CRD in config/crd and the role in config/agent-controller.")
 	flag.Parse()
+	clusterIDSet := false
+	flag.Visit(func(f *flag.Flag) { clusterIDSet = clusterIDSet || f.Name == "cluster-id" })
+	clusterID = resolveClusterID(clusterID, clusterIDSet, os.Getenv("SYNAPSE_CLUSTER_ID"))
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -461,7 +464,7 @@ func main() {
 	}
 
 	if agentController {
-		if err = controllers.SetupAgentControllers(mgr); err != nil {
+		if err = controllers.SetupAgentControllers(mgr, clusterID); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SynapseAgent")
 			os.Exit(1)
 		}
@@ -702,4 +705,13 @@ const defaultLeaderElectionID = "86a223f3.synapse.gen0sec.com"
 // ingress or config-sync mode, and not when --config-hash-controller=false.
 func registersConfigHash(ingressMode, configSync, configHashController bool) bool {
 	return !ingressMode && !configSync && configHashController
+}
+
+// resolveClusterID is the --cluster-id flag when it was given, even empty, and
+// otherwise the SYNAPSE_CLUSTER_ID environment variable.
+func resolveClusterID(flagVal string, flagSet bool, env string) string {
+	if flagSet {
+		return flagVal
+	}
+	return strings.TrimSpace(env)
 }

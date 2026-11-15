@@ -582,3 +582,41 @@ func TestRenderAgentConfig_MergeErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestRenderAgentConfig_ClusterDefault(t *testing.T) {
+	identity := func(enabled *bool, cluster string) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Platform = &synapsev1alpha1.AgentPlatformSpec{Identity: &synapsev1alpha1.AgentIdentitySpec{Enabled: enabled, Cluster: cluster}}
+		}
+	}
+	cases := []struct {
+		name     string
+		agent    *synapsev1alpha1.SynapseAgent
+		operator string
+		want     any
+	}{
+		{"enabled and spec empty takes the operator's", agentForConfig(identity(boolPtr(true), "")), "prod-eu", "prod-eu"},
+		{"spec wins", agentForConfig(identity(boolPtr(true), "mine")), "prod-eu", "mine"},
+		{"spec renders without the operator's", agentForConfig(identity(boolPtr(true), "mine")), "", "mine"},
+		{"identity off gets nothing", agentForConfig(identity(boolPtr(false), "")), "prod-eu", nil},
+		{"identity unset gets nothing", agentForConfig(identity(nil, "")), "prod-eu", nil},
+		{"no platform gets nothing", agentForConfig(), "prod-eu", nil},
+		{"enabled with no operator id gets nothing", agentForConfig(identity(boolPtr(true), "")), "", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := agentTree(t, AgentConfigInput{Agent: tc.agent, ClusterID: tc.operator})
+			platform, _ := tree["platform"].(map[string]any)
+			ident, _ := platform["identity"].(map[string]any)
+			if got := ident["cluster"]; got != tc.want {
+				t.Errorf("platform.identity.cluster = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The input that is not typed-enabled must not change the output at all.
+	a := agentForConfig(identity(nil, ""))
+	if string(renderAgentOK(t, AgentConfigInput{Agent: a}).YAML) != string(renderAgentOK(t, AgentConfigInput{Agent: a, ClusterID: "prod-eu"}).YAML) {
+		t.Error("the operator's id changed the config of an agent without identity enabled")
+	}
+}
