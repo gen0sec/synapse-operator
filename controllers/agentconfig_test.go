@@ -86,6 +86,15 @@ func TestRenderAgentConfig_Golden(t *testing.T) {
 				PolicyEdges: &synapsev1alpha1.AgentPolicyEdgesSpec{Enabled: boolPtr(true)},
 			}
 		})},
+		"cni-cilium": {Agent: agentForConfig(withCapture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"}))},
+		"cni-bridge": {Agent: agentForConfig(withCapture(synapsev1alpha1.AgentCaptureSpec{CNI: "bridge"}))},
+		"cni-override": {Agent: agentForConfig(withCapture(synapsev1alpha1.AgentCaptureSpec{
+			CNI:                     "bridge",
+			ObserveInterfaces:       []string{"flannel.1", "cni0"},
+			ObserveEgressInterfaces: []string{"bond0"},
+			ObserveMode:             "af_packet",
+			ObservePodVeths:         boolPtr(false),
+		}))},
 		"home-net": {
 			HomeNet: "[10.42.0.0/16,192.168.1.5/32]",
 			Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
@@ -824,6 +833,86 @@ func TestRenderAgentConfig_EastWestDownloadDefaults(t *testing.T) {
 		b, _ := block(t, a, "policy_edges")
 		if b["url"] != apiURL {
 			t.Errorf("platform.policy_edges.url = %v, want the default", b["url"])
+		}
+	})
+}
+
+func withCapture(c synapsev1alpha1.AgentCaptureSpec) func(*synapsev1alpha1.SynapseAgentSpec) {
+	return func(s *synapsev1alpha1.SynapseAgentSpec) { s.Capture = &c }
+}
+
+func TestRenderAgentConfig_ObserverConflicts(t *testing.T) {
+	keys := []string{"observe_interfaces", "observe_egress_interfaces", "observe_mode", "observe_pod_veths"}
+	rawWith := func(key string) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return agentRawConfig(`{"capture": {"` + key + `": "raw"}}`)
+	}
+	typed := map[string]synapsev1alpha1.AgentCaptureSpec{
+		"observe_interfaces":        {ObserveInterfaces: []string{"eth0"}},
+		"observe_egress_interfaces": {ObserveEgressInterfaces: []string{"auto"}},
+		"observe_mode":              {ObserveMode: "tcx"},
+		"observe_pod_veths":         {ObservePodVeths: boolPtr(true)},
+	}
+	presetWrites := map[string]map[string]bool{
+		"cilium": {"observe_interfaces": true, "observe_egress_interfaces": true, "observe_mode": true},
+		"bridge": {"observe_interfaces": true, "observe_egress_interfaces": true, "observe_mode": true, "observe_pod_veths": true},
+		"none":   {},
+		"":       {},
+	}
+	refused := func(t *testing.T, key string, capture synapsev1alpha1.AgentCaptureSpec, hint string) {
+		t.Helper()
+		_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(rawWith(key), withCapture(capture))})
+		if err == nil {
+			t.Fatalf("render accepted capture.%s beside %s", key, hint)
+		}
+		for _, want := range []string{"spec.config.capture." + key, hint} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to name %s", err, want)
+			}
+		}
+	}
+
+	for _, key := range keys {
+		t.Run("typed "+key, func(t *testing.T) {
+			refused(t, key, typed[key], "spec.capture.")
+		})
+		for cni, writes := range presetWrites {
+			t.Run("preset "+cni+" "+key, func(t *testing.T) {
+				capture := synapsev1alpha1.AgentCaptureSpec{CNI: cni}
+				if writes[key] {
+					refused(t, key, capture, "spec.capture.cni")
+					return
+				}
+				tree := agentTree(t, AgentConfigInput{Agent: agentForConfig(rawWith(key), withCapture(capture))})
+				if _, ok := tree["capture"].(map[string]any)[key]; !ok {
+					t.Errorf("capture.%s did not pass through", key)
+				}
+			})
+		}
+		t.Run("raw alone "+key, func(t *testing.T) {
+			agentTree(t, AgentConfigInput{Agent: agentForConfig(rawWith(key))})
+		})
+	}
+
+	t.Run("a raw key beside an unrelated capture field", func(t *testing.T) {
+		agentTree(t, AgentConfigInput{Agent: agentForConfig(rawWith("observe_mode"), withCapture(synapsev1alpha1.AgentCaptureSpec{Interfaces: []string{"eth0"}}))})
+	})
+
+	t.Run("passthrough keeps the raw value", func(t *testing.T) {
+		tree := agentTree(t, AgentConfigInput{Agent: agentForConfig(agentRawConfig(`{"capture": {"observe_mode": "af_packet"}}`))})
+		wantAt(t, tree, "capture.observe_mode", "af_packet")
+	})
+
+	t.Run("control characters are refused", func(t *testing.T) {
+		_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(withCapture(synapsev1alpha1.AgentCaptureSpec{
+			ObserveInterfaces: []string{"eth0", "a\x01b"}, ObserveEgressInterfaces: []string{"c\x01d"},
+		}))})
+		if err == nil {
+			t.Fatal("render accepted control characters")
+		}
+		for _, want := range []string{"spec.capture.observeInterfaces[1]", "spec.capture.observeEgressInterfaces[0]"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to name %s", err, want)
+			}
 		}
 	})
 }

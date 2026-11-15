@@ -196,6 +196,17 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{ConfigMapRef: &v1alpha1.ObjectNameReference{}}}}
 			},
 			"spec.ids.rules[0].configMapRef.name"},
+		{"an unknown cni",
+			func(a *v1alpha1.SynapseAgent) { a.Spec.Capture = &v1alpha1.AgentCaptureSpec{CNI: "calico"} },
+			"spec.capture.cni"},
+		{"an unknown observeMode",
+			func(a *v1alpha1.SynapseAgent) { a.Spec.Capture = &v1alpha1.AgentCaptureSpec{ObserveMode: "xdp"} },
+			"spec.capture.observeMode"},
+		{"an empty observed interface name",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Capture = &v1alpha1.AgentCaptureSpec{ObserveInterfaces: []string{""}}
+			},
+			"spec.capture.observeInterfaces"},
 		{"a config that is not an object",
 			func(a *v1alpha1.SynapseAgent) { a.Spec.Config = &runtime.RawExtension{Raw: []byte(`"mode: agent"`)} },
 			"spec.config"},
@@ -500,5 +511,22 @@ func TestSynapseAgent_PrinterColumns(t *testing.T) {
 		if want := name == "Image" || name == "Config"; isWide != want {
 			t.Errorf("column %s: shown only with -o wide = %v, want %v", name, isWide, want)
 		}
+	}
+}
+
+func TestSynapseAgent_AcceptsCaptureObserver(t *testing.T) {
+	for _, cni := range []string{"cilium", "bridge", "none"} {
+		t.Run("cni "+cni, func(t *testing.T) {
+			a := validAgent()
+			a.Spec.Capture = &v1alpha1.AgentCaptureSpec{CNI: cni}
+			mustCreateAgent(t, a)
+		})
+	}
+	for _, mode := range []string{"tcx", "af_packet"} {
+		t.Run("observeMode "+mode, func(t *testing.T) {
+			a := validAgent()
+			a.Spec.Capture = &v1alpha1.AgentCaptureSpec{ObserveMode: mode, ObservePodVeths: ptr.To(false)}
+			mustCreateAgent(t, a)
+		})
 	}
 }
