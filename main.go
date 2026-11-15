@@ -152,9 +152,15 @@ func main() {
 	flag.Parse()
 	clusterIDSet := false
 	flag.Visit(func(f *flag.Flag) { clusterIDSet = clusterIDSet || f.Name == "cluster-id" })
-	clusterID = resolveClusterID(clusterID, clusterIDSet, os.Getenv("SYNAPSE_CLUSTER_ID"))
+	var clusterIDErr error
+	clusterID, clusterIDErr = resolveValidClusterID(clusterID, clusterIDSet, os.Getenv("SYNAPSE_CLUSTER_ID"))
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if clusterIDErr != nil {
+		setupLog.Error(clusterIDErr, "--cluster-id or SYNAPSE_CLUSTER_ID")
+		os.Exit(1)
+	}
 
 	if conflict := proxyControllerConflict(proxyController, ingressMode, configSync); conflict != "" {
 		setupLog.Error(nil, conflict)
@@ -714,4 +720,14 @@ func resolveClusterID(flagVal string, flagSet bool, env string) string {
 		return flagVal
 	}
 	return strings.TrimSpace(env)
+}
+
+// resolveValidClusterID is resolveClusterID, refused when the id holds a
+// control character. Every process runs it, the producers' too.
+func resolveValidClusterID(flagVal string, flagSet bool, env string) (string, error) {
+	id := resolveClusterID(flagVal, flagSet, env)
+	if err := controllers.ValidateClusterID(id); err != nil {
+		return "", err
+	}
+	return id, nil
 }

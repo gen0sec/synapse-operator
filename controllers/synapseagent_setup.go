@@ -46,8 +46,8 @@ const agentAPIKeySecretIndex = "spec.platform.apiKeySecretRef.name"
 // identity enabled takes unless its spec names one; it may be empty, and it
 // is refused when it holds a control character.
 func SetupAgentControllers(mgr ctrl.Manager, clusterID string) error {
-	if strings.ContainsFunc(clusterID, unicode.IsControl) {
-		return errors.New("the cluster id holds control characters")
+	if err := ValidateClusterID(clusterID); err != nil {
+		return err
 	}
 	agents := &SynapseAgentReconciler{
 		Client:    mgr.GetClient(),
@@ -229,4 +229,14 @@ func CheckAgentAccess(ctx context.Context, c client.Reader, namespace string) er
 		return fmt.Errorf("not allowed to read SynapseAgent resources; the role that allows it is in %s: %w", agentRoleInstall, err)
 	}
 	return err
+}
+
+// ValidateClusterID refuses a cluster id that holds a control character. The
+// id goes into an upload URL and into the agents' config, and every process of
+// the operator checks it, so that none runs on an id another refuses.
+func ValidateClusterID(id string) error {
+	if strings.ContainsFunc(id, unicode.IsControl) {
+		return errors.New("the cluster id holds control characters")
+	}
+	return nil
 }

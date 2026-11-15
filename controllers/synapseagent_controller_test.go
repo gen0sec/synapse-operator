@@ -710,6 +710,8 @@ func TestAgent_ClusterIDCondition(t *testing.T) {
 		{"spec set and the operator has none", "", identity(boolPtr(true), "other"), metav1.ConditionFalse, ReasonClusterMismatch},
 		{"spec empty, identity on", "prod-eu", identity(boolPtr(true), ""), metav1.ConditionTrue, ReasonClusterFromOperator},
 		{"spec empty, identity off", "prod-eu", identity(boolPtr(false), ""), "", ""},
+		{"spec set, identity off", "prod-eu", identity(boolPtr(false), "other"), "", ""},
+		{"spec set, identity unset", "prod-eu", identity(nil, "prod-eu"), "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -751,6 +753,15 @@ func TestAgent_ClusterIDCondition(t *testing.T) {
 		e.reconcile(a)
 		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionClusterIDMatches); c != nil {
 			t.Errorf("the condition stays after identity is turned off: %+v", c)
+		}
+
+		e.edit(a, identity(boolPtr(true), "other"))
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionClusterIDMatches, metav1.ConditionFalse, ReasonClusterMismatch)
+		e.edit(a, identity(boolPtr(false), "other"))
+		e.reconcile(a)
+		if c := meta.FindStatusCondition(a.Status.Conditions, ConditionClusterIDMatches); c != nil {
+			t.Errorf("the condition stays after identity is turned off with a spec cluster still set: %+v", c)
 		}
 	})
 }
