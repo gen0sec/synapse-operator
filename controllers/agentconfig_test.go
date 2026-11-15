@@ -620,3 +620,68 @@ func TestRenderAgentConfig_ClusterDefault(t *testing.T) {
 		t.Error("the operator's id changed the config of an agent without identity enabled")
 	}
 }
+
+func TestRenderAgentConfig_PolicyEdges(t *testing.T) {
+	typed := func(enabled *bool) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			if s.Platform == nil {
+				s.Platform = &synapsev1alpha1.AgentPlatformSpec{}
+			}
+			s.Platform.PolicyEdges = &synapsev1alpha1.AgentPolicyEdgesSpec{Enabled: enabled}
+		}
+	}
+	edges := func(t *testing.T, a *synapsev1alpha1.SynapseAgent) (map[string]any, bool) {
+		t.Helper()
+		platform, _ := agentTree(t, AgentConfigInput{Agent: a})["platform"].(map[string]any)
+		block, present := platform["policy_edges"].(map[string]any)
+		return block, present
+	}
+
+	t.Run("typed on renders enabled true", func(t *testing.T) {
+		block, present := edges(t, agentForConfig(typed(boolPtr(true))))
+		if !present || block["enabled"] != true {
+			t.Errorf("platform.policy_edges = %v, want enabled: true", block)
+		}
+	})
+	for name, a := range map[string]*synapsev1alpha1.SynapseAgent{
+		"typed off renders nothing":   agentForConfig(typed(boolPtr(false))),
+		"typed empty renders nothing": agentForConfig(typed(nil)),
+		"no platform renders nothing": agentForConfig(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if block, present := edges(t, a); present {
+				t.Errorf("platform.policy_edges = %v, want no block", block)
+			}
+		})
+	}
+
+	t.Run("a raw block alone passes through", func(t *testing.T) {
+		block, present := edges(t, agentForConfig(agentRawConfig(`{"platform": {"policy_edges": {"enabled": true, "url": "https://example.test/v1"}}}`)))
+		if !present || block["enabled"] != true || block["url"] != "https://example.test/v1" {
+			t.Errorf("platform.policy_edges = %v, want the raw block kept", block)
+		}
+	})
+
+	for name, typedEnabled := range map[string]*bool{"on": boolPtr(true), "off": boolPtr(false)} {
+		t.Run("a raw enabled beside typed "+name+" is refused", func(t *testing.T) {
+			a := agentForConfig(typed(typedEnabled), agentRawConfig(`{"platform": {"policy_edges": {"enabled": false}}}`))
+			_, err := RenderAgentConfig(AgentConfigInput{Agent: a})
+			if err == nil {
+				t.Fatal("render accepted both")
+			}
+			for _, want := range []string{"spec.config.platform.policy_edges.enabled", "spec.platform.policyEdges.enabled"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error does not mention %q: %v", want, err)
+				}
+			}
+		})
+	}
+
+	t.Run("other raw policy_edges keys beside typed are allowed", func(t *testing.T) {
+		a := agentForConfig(typed(boolPtr(true)), agentRawConfig(`{"platform": {"policy_edges": {"url": "https://example.test/v1"}}}`))
+		block, _ := edges(t, a)
+		if block["enabled"] != true || block["url"] != "https://example.test/v1" {
+			t.Errorf("platform.policy_edges = %v, want enabled and url", block)
+		}
+	})
+}

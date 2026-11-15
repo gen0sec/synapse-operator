@@ -1235,7 +1235,23 @@ spec:
                           default.
                         type: boolean
                     type: object
+                  policyEdges:
+                    description: |-
+                      PolicyEdges configures the declared-edge allow-list the agent downloads
+                      for east-west detection.
+                    properties:
+                      enabled:
+                        description: |-
+                          Enabled turns the allow-list on. It needs spec.platform.identity.enabled
+                          to be true. Empty leaves Synapse's default.
+                        type: boolean
+                    type: object
                 type: object
+                x-kubernetes-validations:
+                - message: 'policyEdges.enabled needs identity.enabled: true'
+                  rule: '!has(self.policyEdges) || !has(self.policyEdges.enabled)
+                    || !self.policyEdges.enabled || (has(self.identity) && has(self.identity.enabled)
+                    && self.identity.enabled)'
               priorityClassName:
                 description: PriorityClassName is the priority class of the agent
                   pods.

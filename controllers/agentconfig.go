@@ -137,6 +137,14 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 
 	errs := checkOwnedConfigKeysIn(agentOwnedConfigKeys, raw, specPath.Child("config"))
 
+	// Unlike the owned keys, this one is refused only while the typed field is
+	// set: a raw policy_edges block alone is passed through.
+	if spec.Platform != nil && spec.Platform.PolicyEdges != nil && spec.Platform.PolicyEdges.Enabled != nil {
+		errs = append(errs, checkOwnedConfigKeysIn([]ownedConfigKey{
+			{"platform.policy_edges.enabled", "use spec.platform.policyEdges.enabled, or remove it from spec.platform"},
+		}, raw, specPath.Child("config"))...)
+	}
+
 	apiKey := ""
 	if spec.Platform != nil && spec.Platform.APIKeySecretRef != nil {
 		apiKey = strings.TrimSpace(in.APIKey)
@@ -222,6 +230,11 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 		case agentIdentityEnabled(spec) && in.ClusterID != "":
 			setConfig(cfg, "platform.identity.cluster", in.ClusterID)
 		}
+	}
+	// Only an explicit true is rendered: the agent enables a policy_edges
+	// block by default, so a block without a typed enable must never appear.
+	if p := spec.Platform; p != nil && p.PolicyEdges != nil && p.PolicyEdges.Enabled != nil && *p.PolicyEdges.Enabled {
+		setConfig(cfg, "platform.policy_edges.enabled", true)
 	}
 	if c := spec.Capture; c != nil {
 		if len(c.Interfaces) > 0 {
