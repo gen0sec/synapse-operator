@@ -70,6 +70,9 @@ func (r *IdentityProducerReconciler) Start(ctx context.Context) error {
 	if r.DeltaDebounce <= 0 {
 		r.DeltaDebounce = 200 * time.Millisecond
 	}
+	if idleWithoutAPIKey(ctx, r.Log, "identity-producer", r.APIKey) {
+		return nil
+	}
 	r.epoch = uint64(time.Now().UnixNano())
 	r.index = map[string]identityEntry{}
 
@@ -600,4 +603,16 @@ func clusterQuery(sep, clusterID string) string {
 		return ""
 	}
 	return sep + "cluster=" + clusterID
+}
+
+// idleWithoutAPIKey holds a producer back when it has no API key: the
+// download-api refuses every request without one, so it would only fail on a
+// loop. It logs once, waits for ctx to end and reports true.
+func idleWithoutAPIKey(ctx context.Context, log logr.Logger, name, apiKey string) bool {
+	if strings.TrimSpace(apiKey) != "" {
+		return false
+	}
+	log.Info(name + ": no API key (SYNAPSE_API_KEY is empty); idle, nothing is uploaded. Create the Secret and restart to enable")
+	<-ctx.Done()
+	return true
 }

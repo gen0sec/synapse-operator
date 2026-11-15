@@ -499,7 +499,7 @@ func main() {
 			Cache:     mgr.GetCache(),
 			Log:       ctrl.Log.WithName("identity-producer"),
 			UploadURL: downloadAPIURL,
-			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
+			APIKey:    strings.TrimSpace(os.Getenv("SYNAPSE_API_KEY")),
 			Interval:  identityProducerInterval,
 			ClusterID: clusterID,
 		}
@@ -516,7 +516,7 @@ func main() {
 			Cache:     mgr.GetCache(),
 			Log:       ctrl.Log.WithName("edge-producer"),
 			UploadURL: downloadAPIURL,
-			APIKey:    os.Getenv("SYNAPSE_API_KEY"),
+			APIKey:    strings.TrimSpace(os.Getenv("SYNAPSE_API_KEY")),
 			Interval:  edgeProducerInterval,
 			ClusterID: clusterID,
 		}
