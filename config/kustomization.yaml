@@ -5,6 +5,7 @@ namespace: synapse-os
 
 resources:
   - rbac.yaml
+  - rbac-producers.yaml
   - manager.yaml
   - manager-producers.yaml
 

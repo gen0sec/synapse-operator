@@ -2,8 +2,15 @@
 #
 # Part of the default install. It is a second Deployment of the operator image
 # with the two producer modes on and the config-hash controller off, so each
-# Deployment holds its own leader lease. It reuses the synapse-operator
-# ServiceAccount and ClusterRole from config/rbac.yaml.
+# Deployment holds its own leader lease. It runs as the read-only
+# synapse-operator-producers ServiceAccount from config/rbac-producers.yaml.
+#
+# Upgrading:
+#   - The image MUST be overridden for BOTH Deployments, through a kustomize
+#     `images:` entry for `synapse-operator`. Both use synapse-operator:local.
+#   - Anyone who added --identity-producer or --edge-producer to the
+#     synapse-operator (controller) Deployment by hand MUST remove them, or
+#     both Deployments upload.
 #
 # Without the Secret below the producers start, log once and stay idle. To
 # enable them, create it and restart the Deployment:
@@ -33,7 +40,7 @@ spec:
         app.kubernetes.io/name: synapse-operator
         app.kubernetes.io/component: producers
     spec:
-      serviceAccountName: synapse-operator
+      serviceAccountName: synapse-operator-producers
       containers:
         - name: manager
           image: synapse-operator:local

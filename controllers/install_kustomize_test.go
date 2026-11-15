@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 )
@@ -72,6 +73,8 @@ func TestDefaultInstall_ShipsProducers(t *testing.T) {
 	}
 
 	deployments := map[string]*appsv1.Deployment{}
+	clusterRoles := map[string]*rbacv1.ClusterRole{}
+	bindings := map[string]*rbacv1.ClusterRoleBinding{}
 	dec := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(out), 4096)
 	for {
 		var obj map[string]any
@@ -80,18 +83,30 @@ func TestDefaultInstall_ShipsProducers(t *testing.T) {
 		} else if err != nil {
 			t.Fatal(err)
 		}
-		if obj["kind"] != "Deployment" {
-			continue
-		}
 		raw, err := yaml.Marshal(obj)
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := &appsv1.Deployment{}
-		if err := yaml.Unmarshal(raw, d); err != nil {
-			t.Fatal(err)
+		switch obj["kind"] {
+		case "Deployment":
+			d := &appsv1.Deployment{}
+			if err := yaml.Unmarshal(raw, d); err != nil {
+				t.Fatal(err)
+			}
+			deployments[d.Name] = d
+		case "ClusterRole":
+			r := &rbacv1.ClusterRole{}
+			if err := yaml.Unmarshal(raw, r); err != nil {
+				t.Fatal(err)
+			}
+			clusterRoles[r.Name] = r
+		case "ClusterRoleBinding":
+			b := &rbacv1.ClusterRoleBinding{}
+			if err := yaml.Unmarshal(raw, b); err != nil {
+				t.Fatal(err)
+			}
+			bindings[b.Name] = b
 		}
-		deployments[d.Name] = d
 	}
 	if len(deployments) != 2 {
 		names := make([]string, 0, len(deployments))
@@ -125,6 +140,49 @@ func TestDefaultInstall_ShipsProducers(t *testing.T) {
 	}
 	if c, p := controller.Spec.Template.Spec.Containers[0].Image, producers.Spec.Template.Spec.Containers[0].Image; c != p {
 		t.Errorf("the images differ (%q, %q): one images: entry has to cover both", c, p)
+	}
+
+	has := func(d *appsv1.Deployment, flag string) bool {
+		for _, a := range d.Spec.Template.Spec.Containers[0].Args {
+			if a == flag {
+				return true
+			}
+		}
+		return false
+	}
+	for _, flag := range []string{"--identity-producer", "--edge-producer", "--leader-elect"} {
+		if !has(producers, flag) {
+			t.Errorf("the producers Deployment lacks %s", flag)
+		}
+	}
+	for _, flag := range []string{"--identity-producer", "--edge-producer"} {
+		if has(controller, flag) {
+			t.Errorf("the controller Deployment has %s: both Deployments would upload", flag)
+		}
+	}
+
+	if sa := producers.Spec.Template.Spec.ServiceAccountName; sa != "synapse-operator-producers" {
+		t.Errorf("the producers run as %q, want their own synapse-operator-producers", sa)
+	}
+	role := clusterRoles["synapse-operator-producers"]
+	if role == nil {
+		t.Fatal("no ClusterRole synapse-operator-producers")
+	}
+	for _, rule := range role.Rules {
+		for _, v := range rule.Verbs {
+			if v != "get" && v != "list" && v != "watch" {
+				t.Errorf("the producers' ClusterRole grants %q on %v", v, rule.Resources)
+			}
+		}
+		for _, r := range rule.Resources {
+			if r == "secrets" || r == "*" {
+				t.Errorf("the producers' ClusterRole reaches %q", r)
+			}
+		}
+	}
+	if b := bindings["synapse-operator-producers"]; b == nil || b.RoleRef.Name != "synapse-operator-producers" ||
+		len(b.Subjects) != 1 || b.Subjects[0].Name != "synapse-operator-producers" {
+		t.Errorf("the producers' ClusterRole is not bound to their ServiceAccount: %+v", b)
 	}
 
 	found := false

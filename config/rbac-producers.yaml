@@ -1,0 +1,81 @@
+# The east-west producers run under their own identity: they read cluster
+# state and upload it elsewhere, so they get no write access and no Secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: synapse-operator-producers
+  namespace: synapse-os
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: synapse-operator-producers
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - namespaces
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: synapse-operator-producers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: synapse-operator-producers
+subjects:
+  - kind: ServiceAccount
+    name: synapse-operator-producers
+    namespace: synapse-os
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: synapse-operator-producers-leader-election
+  namespace: synapse-os
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: synapse-operator-producers-leader-election
+  namespace: synapse-os
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: synapse-operator-producers-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: synapse-operator-producers
+    namespace: synapse-os
