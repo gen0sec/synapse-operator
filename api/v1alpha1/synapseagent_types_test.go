@@ -161,6 +161,16 @@ func TestSynapseAgent_Rejects(t *testing.T) {
 				}
 			},
 			"policyEdges.enabled needs identity.enabled: true"},
+		{"policyEdges enabled with identity present but enabled unset",
+			func(a *v1alpha1.SynapseAgent) {
+				a.Spec.Platform = &v1alpha1.AgentPlatformSpec{
+					Identity:    &v1alpha1.AgentIdentitySpec{},
+					PolicyEdges: &v1alpha1.AgentPolicyEdgesSpec{Enabled: ptr.To(true)},
+				}
+			},
+			// The leading text rules out a CEL evaluation error, which carries
+			// the same message after "evaluating rule:".
+			`Invalid value: policyEdges.enabled needs identity.enabled: true`},
 		{"a rule source with both references",
 			func(a *v1alpha1.SynapseAgent) {
 				a.Spec.IDS = &v1alpha1.AgentIDSSpec{Rules: []v1alpha1.AgentIDSRuleSource{{
