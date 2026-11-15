@@ -644,7 +644,6 @@ func TestRenderAgentConfig_PolicyEdges(t *testing.T) {
 		}
 	})
 	for name, a := range map[string]*synapsev1alpha1.SynapseAgent{
-		"typed off renders nothing":   agentForConfig(typed(boolPtr(false))),
 		"typed empty renders nothing": agentForConfig(typed(nil)),
 		"no platform renders nothing": agentForConfig(),
 	} {
@@ -654,6 +653,20 @@ func TestRenderAgentConfig_PolicyEdges(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("typed off renders an explicit false", func(t *testing.T) {
+		block, present := edges(t, agentForConfig(typed(boolPtr(false))))
+		if !present || block["enabled"] != false {
+			t.Errorf("platform.policy_edges = %v, want enabled: false", block)
+		}
+	})
+	t.Run("typed off with a raw url renders false and keeps the url", func(t *testing.T) {
+		a := agentForConfig(typed(boolPtr(false)), agentRawConfig(`{"platform": {"policy_edges": {"url": "https://example.test/v1"}}}`))
+		block, present := edges(t, a)
+		if !present || block["enabled"] != false || block["url"] != "https://example.test/v1" {
+			t.Errorf("platform.policy_edges = %v, want enabled: false and the url", block)
+		}
+	})
 
 	t.Run("a raw block alone passes through", func(t *testing.T) {
 		block, present := edges(t, agentForConfig(agentRawConfig(`{"platform": {"policy_edges": {"enabled": true, "url": "https://example.test/v1"}}}`)))
