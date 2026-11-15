@@ -88,6 +88,8 @@ func main() {
 	var statusLeaderElectionID string
 	var leaderElectionNamespace string
 	var identityProducer bool
+	var leaderElectionID string
+	var configHashController bool
 	var downloadAPIURL string
 	var identityProducerInterval time.Duration
 	var edgeProducer bool
@@ -104,6 +106,8 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
+	flag.StringVar(&leaderElectionID, "leader-election-id", defaultLeaderElectionID, "Name of the Lease --leader-elect takes. Each Deployment that runs controllers on its own needs a distinct one.")
+	flag.BoolVar(&configHashController, "config-hash-controller", true, "Register the config-hash controller. Set false on a Deployment that runs only other modes, such as the producers.")
 	flag.StringVar(&watchedNamespace, "namespace", "", "Namespace to watch. Defaults to all namespaces.")
 	flag.StringVar(&labelSelector, "label-selector", defaultLabelSelector, "Label selector for config sources and workloads. Objects controlled by one of the operator's own resources are left alone even when they match.")
 	flag.StringVar(&configHashAnnotation, "config-hash-annotation", "synapse.gen0sec.com/config-hash", "Annotation key to store the config hash.")
@@ -290,7 +294,7 @@ func main() {
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "86a223f3.synapse.gen0sec.com",
+		LeaderElectionID:       leaderElectionID,
 	}
 
 	if watchedNamespace != "" {
@@ -432,6 +436,8 @@ func main() {
 		// cluster-scoped concern and would additionally collide on the
 		// derived controller name "configmap".
 		setupLog.Info("config-sync mode: config-hash controller not registered")
+	} else if !registersConfigHash(ingressMode, configSync, configHashController) {
+		setupLog.Info("config-hash controller not registered (--config-hash-controller=false)")
 	} else if err = (&controllers.ConfigMapReconciler{
 		Client:                    mgr.GetClient(),
 		Scheme:                    mgr.GetScheme(),
@@ -687,4 +693,13 @@ func upstreamsCADirError(dir string) string {
 		return fmt.Sprintf("--upstreams-ca-dir %q must be an absolute path", dir)
 	}
 	return ""
+}
+
+// defaultLeaderElectionID is the lease the config-hash manager has always held.
+const defaultLeaderElectionID = "86a223f3.synapse.gen0sec.com"
+
+// registersConfigHash says whether the config-hash controller runs: not in
+// ingress or config-sync mode, and not when --config-hash-controller=false.
+func registersConfigHash(ingressMode, configSync, configHashController bool) bool {
+	return !ingressMode && !configSync && configHashController
 }
