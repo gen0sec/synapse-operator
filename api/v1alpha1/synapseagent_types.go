@@ -236,7 +236,9 @@ type AgentCaptureSpec struct {
 
 	// CNI names the cluster network the agent observes pod traffic on, and
 	// fills in the observer settings below for it. cilium observes the
-	// cilium_vxlan tunnel device. bridge observes cni0 and every pod veth,
+	// cilium_vxlan tunnel device, so it fits Cilium's default VXLAN tunnel mode
+	// only. With native routing or Geneve (cilium_geneve), leave it unset and
+	// set observeInterfaces. bridge observes cni0 and every pod veth,
 	// for flannel, kindnet and other veth-bridge CNIs. none, or empty, sets
 	// nothing. A field below replaces the value the preset gives its key. The
 	// tcx observer needs Linux 6.6 or newer.
@@ -246,7 +248,8 @@ type AgentCaptureSpec struct {
 	CNI string `json:"cni,omitempty"`
 
 	// ObserveInterfaces are the devices the east-west observer attaches to.
-	// It replaces the interfaces of the cni preset.
+	// It replaces the interfaces of the cni preset. The af_packet backend taps
+	// only the first entry and ignores the rest.
 	//
 	// +optional
 	// +listType=set
@@ -255,7 +258,8 @@ type AgentCaptureSpec struct {
 
 	// ObserveEgressInterfaces are the devices the observer attaches to for
 	// traffic that leaves the node. auto picks the default-route device. It
-	// replaces the egress interfaces of the cni preset.
+	// replaces the egress interfaces of the cni preset. Only the tcx backend
+	// uses it. The af_packet backend ignores it.
 	//
 	// +optional
 	// +listType=set
@@ -264,7 +268,8 @@ type AgentCaptureSpec struct {
 
 	// ObserveMode is the capture backend of the observer: tcx, an in-kernel
 	// observer, or af_packet, a portable tap. It replaces the mode of the cni
-	// preset.
+	// preset. af_packet taps only the first observeInterfaces entry. It
+	// ignores observeEgressInterfaces and observePodVeths.
 	//
 	// +optional
 	// +kubebuilder:validation:Enum=tcx;af_packet
@@ -272,7 +277,8 @@ type AgentCaptureSpec struct {
 
 	// ObservePodVeths also attaches the observer to every pod veth. Bridge
 	// CNIs need it, because traffic between pods on one node bypasses the
-	// bridge device. It replaces the value of the cni preset.
+	// bridge device. It replaces the value of the cni preset. Only the tcx
+	// backend uses it. The af_packet backend ignores it.
 	//
 	// +optional
 	ObservePodVeths *bool `json:"observePodVeths,omitempty"`
