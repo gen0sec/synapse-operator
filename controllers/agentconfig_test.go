@@ -858,7 +858,13 @@ func TestRenderAgentConfig_ObserverConflicts(t *testing.T) {
 		"none":   {},
 		"":       {},
 	}
-	refused := func(t *testing.T, key string, capture synapsev1alpha1.AgentCaptureSpec, hint string) {
+	typedField := map[string]string{
+		"observe_interfaces":        "observeInterfaces",
+		"observe_egress_interfaces": "observeEgressInterfaces",
+		"observe_mode":              "observeMode",
+		"observe_pod_veths":         "observePodVeths",
+	}
+	refused := func(t *testing.T, key string, capture synapsev1alpha1.AgentCaptureSpec, hint string, notWant string) {
 		t.Helper()
 		_, err := RenderAgentConfig(AgentConfigInput{Agent: agentForConfig(rawWith(key), withCapture(capture))})
 		if err == nil {
@@ -869,17 +875,20 @@ func TestRenderAgentConfig_ObserverConflicts(t *testing.T) {
 				t.Errorf("err = %v, want it to name %s", err, want)
 			}
 		}
+		if notWant != "" && strings.Contains(err.Error(), notWant) {
+			t.Errorf("err = %v, want it not to name %s", err, notWant)
+		}
 	}
 
 	for _, key := range keys {
 		t.Run("typed "+key, func(t *testing.T) {
-			refused(t, key, typed[key], "spec.capture.")
+			refused(t, key, typed[key], "use spec.capture."+typedField[key]+", or remove it from spec.capture", "spec.capture.cni")
 		})
 		for cni, writes := range presetWrites {
 			t.Run("preset "+cni+" "+key, func(t *testing.T) {
 				capture := synapsev1alpha1.AgentCaptureSpec{CNI: cni}
 				if writes[key] {
-					refused(t, key, capture, "spec.capture.cni")
+					refused(t, key, capture, "spec.capture.cni "+cni+" sets it; use spec.capture."+typedField[key]+" to change it", "")
 					return
 				}
 				tree := agentTree(t, AgentConfigInput{Agent: agentForConfig(rawWith(key), withCapture(capture))})
