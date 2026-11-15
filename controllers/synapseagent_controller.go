@@ -223,8 +223,11 @@ func (r *SynapseAgentReconciler) reconcile(ctx context.Context, agent *synapsev1
 // clusterIDCondition compares the cluster id the agent reports with the
 // operator's, which the producers upload under. It is advice and nothing
 // more: it never touches Ready. It is nil when there is nothing to compare,
-// that is when neither id is in play or the agent has no identity to scope.
+// that is when neither id is in play or identity is not typed-enabled.
 func clusterIDCondition(agent *synapsev1alpha1.SynapseAgent, operator string) *metav1.Condition {
+	if !agentIdentityEnabled(&agent.Spec) {
+		return nil
+	}
 	spec := ""
 	if p := agent.Spec.Platform; p != nil && p.Identity != nil {
 		spec = p.Identity.Cluster
@@ -241,7 +244,7 @@ func clusterIDCondition(agent *synapsev1alpha1.SynapseAgent, operator string) *m
 		} else {
 			c.Message = "spec.platform.identity.cluster differs from the operator's cluster id: the operator's producers upload to another path than this agent reads"
 		}
-	case agentIdentityEnabled(&agent.Spec) && operator != "":
+	case operator != "":
 		c.Status, c.Reason = metav1.ConditionTrue, ReasonClusterFromOperator
 		c.Message = "the agent takes the operator's cluster id"
 	default:

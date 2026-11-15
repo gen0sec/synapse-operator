@@ -447,3 +447,18 @@ func TestResolveClusterID(t *testing.T) {
 		})
 	}
 }
+
+// Every process validates the id, the producers-only Deployment included: it
+// never reaches SetupAgentControllers.
+func TestResolveValidClusterID(t *testing.T) {
+	got, err := resolveValidClusterID("", false, "prod-eu\n")
+	require.NoError(t, err)
+	assert.Equal(t, "prod-eu", got)
+
+	_, err = resolveValidClusterID("bad\x00id", true, "")
+	assert.Error(t, err, "a flag value with a control character")
+	_, err = resolveValidClusterID("", false, "bad\x1bid")
+	assert.Error(t, err, "an env value with a control character")
+	_, err = resolveValidClusterID("", false, "bad\tid")
+	assert.Error(t, err, "an env value with a tab inside")
+}

@@ -110,6 +110,19 @@ func TestCheckAgentAccess_AnythingElseIsPassedOnAsItIs(t *testing.T) {
 	}
 }
 
+func TestValidateClusterID(t *testing.T) {
+	for _, id := range []string{"", "prod-eu", "eu west 1"} {
+		if err := ValidateClusterID(id); err != nil {
+			t.Errorf("cluster id %q refused: %v", id, err)
+		}
+	}
+	for _, id := range []string{"a\nb", "a\x00b", "a\tb", "a\x7fb"} {
+		if err := ValidateClusterID(id); err == nil {
+			t.Errorf("cluster id %q accepted", id)
+		}
+	}
+}
+
 func TestSetupAgentControllers_RefusesControlCharacters(t *testing.T) {
 	for _, id := range []string{"a\nb", "a\x00b", "a\tb", "a\x7fb"} {
 		if err := SetupAgentControllers(nil, id); err == nil {
