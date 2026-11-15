@@ -394,6 +394,25 @@ func setConfig(cfg map[string]any, path string, value any) {
 	cfg[parts[len(parts)-1]] = value
 }
 
+// setConfigDefault sets path only when the key is absent or null. An empty
+// string is a value, so it opts out of the default.
+func setConfigDefault(cfg map[string]any, path string, value any) {
+	parts := strings.Split(path, ".")
+	cur := cfg
+	for _, part := range parts[:len(parts)-1] {
+		next, isObject := cur[part].(map[string]any)
+		if !isObject {
+			next = map[string]any{}
+			cur[part] = next
+		}
+		cur = next
+	}
+	last := parts[len(parts)-1]
+	if cur[last] == nil {
+		cur[last] = value
+	}
+}
+
 // internalServicesPort is the port the merged config gives Synapse's internal
 // services, or Synapse's default. A value that is there but is not a port is
 // an error: read loosely it would pass for the default, and the listeners

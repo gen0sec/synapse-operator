@@ -80,6 +80,12 @@ func TestRenderAgentConfig_Golden(t *testing.T) {
 			"daemon": {"working_directory": null},
 			"platform": {"identity": {"url": "https://example.test/identity.mmdb"}}
 		}`))},
+		"east-west": {Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
+			s.Platform = &synapsev1alpha1.AgentPlatformSpec{
+				Identity:    &synapsev1alpha1.AgentIdentitySpec{Enabled: boolPtr(true)},
+				PolicyEdges: &synapsev1alpha1.AgentPolicyEdgesSpec{Enabled: boolPtr(true)},
+			}
+		})},
 		"home-net": {
 			HomeNet: "[10.42.0.0/16,192.168.1.5/32]",
 			Agent: agentForConfig(func(s *synapsev1alpha1.SynapseAgentSpec) {
@@ -695,6 +701,99 @@ func TestRenderAgentConfig_PolicyEdges(t *testing.T) {
 		block, _ := edges(t, a)
 		if block["enabled"] != true || block["url"] != "https://example.test/v1" {
 			t.Errorf("platform.policy_edges = %v, want enabled and url", block)
+		}
+	})
+}
+
+func TestRenderAgentConfig_EastWestDownloadDefaults(t *testing.T) {
+	identityOn := func(on bool) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			if s.Platform == nil {
+				s.Platform = &synapsev1alpha1.AgentPlatformSpec{}
+			}
+			s.Platform.Identity = &synapsev1alpha1.AgentIdentitySpec{Enabled: boolPtr(on)}
+		}
+	}
+	edgesOn := func(on bool) func(*synapsev1alpha1.SynapseAgentSpec) {
+		return func(s *synapsev1alpha1.SynapseAgentSpec) {
+			if s.Platform == nil {
+				s.Platform = &synapsev1alpha1.AgentPlatformSpec{}
+			}
+			s.Platform.PolicyEdges = &synapsev1alpha1.AgentPolicyEdgesSpec{Enabled: boolPtr(on)}
+		}
+	}
+	// block returns platform.<name> and whether it is there.
+	block := func(t *testing.T, a *synapsev1alpha1.SynapseAgent, name string) (map[string]any, bool) {
+		t.Helper()
+		platform, _ := agentTree(t, AgentConfigInput{Agent: a})["platform"].(map[string]any)
+		b, present := platform[name].(map[string]any)
+		return b, present
+	}
+	const apiURL = "https://api.gen0sec.com/v1"
+
+	t.Run("identity on defaults url and path", func(t *testing.T) {
+		b, _ := block(t, agentForConfig(identityOn(true)), "identity")
+		if b["url"] != apiURL || b["path"] != "/var/lib/synapse/identity.mmdb" {
+			t.Errorf("platform.identity = %v", b)
+		}
+	})
+	t.Run("policyEdges on defaults url and path", func(t *testing.T) {
+		b, _ := block(t, agentForConfig(edgesOn(true)), "policy_edges")
+		if b["url"] != apiURL || b["path"] != "/var/lib/synapse/policy-edges.txt" {
+			t.Errorf("platform.policy_edges = %v", b)
+		}
+	})
+	t.Run("identity on leaves policy_edges alone", func(t *testing.T) {
+		if b, present := block(t, agentForConfig(identityOn(true)), "policy_edges"); present {
+			t.Errorf("platform.policy_edges = %v, want none", b)
+		}
+	})
+	t.Run("identity off fills nothing", func(t *testing.T) {
+		b, _ := block(t, agentForConfig(identityOn(false)), "identity")
+		if _, ok := b["url"]; ok {
+			t.Errorf("platform.identity = %v, want no url", b)
+		}
+		if _, ok := b["path"]; ok {
+			t.Errorf("platform.identity = %v, want no path", b)
+		}
+	})
+	t.Run("policyEdges off fills nothing", func(t *testing.T) {
+		b, _ := block(t, agentForConfig(edgesOn(false)), "policy_edges")
+		if _, ok := b["url"]; ok {
+			t.Errorf("platform.policy_edges = %v, want no url", b)
+		}
+		if _, ok := b["path"]; ok {
+			t.Errorf("platform.policy_edges = %v, want no path", b)
+		}
+	})
+	t.Run("a raw block alone fills nothing", func(t *testing.T) {
+		b, _ := block(t, agentForConfig(agentRawConfig(`{"platform": {"identity": {"refresh_secs": 60}}}`)), "identity")
+		if _, ok := b["url"]; ok {
+			t.Errorf("platform.identity = %v, want no url", b)
+		}
+	})
+	t.Run("raw url and path are kept", func(t *testing.T) {
+		a := agentForConfig(identityOn(true), agentRawConfig(`{"platform": {"identity": {"url": "https://example.test/v1", "path": "/data/id.mmdb"}}}`))
+		b, _ := block(t, a, "identity")
+		if b["url"] != "https://example.test/v1" || b["path"] != "/data/id.mmdb" {
+			t.Errorf("platform.identity = %v", b)
+		}
+	})
+	t.Run("an empty url opts out", func(t *testing.T) {
+		a := agentForConfig(identityOn(true), agentRawConfig(`{"platform": {"identity": {"url": ""}}}`))
+		b, _ := block(t, a, "identity")
+		if url, ok := b["url"]; !ok || url != "" {
+			t.Errorf("platform.identity.url = %v (present %v), want an empty string", url, ok)
+		}
+		if b["path"] != "/var/lib/synapse/identity.mmdb" {
+			t.Errorf("platform.identity.path = %v, want the default", b["path"])
+		}
+	})
+	t.Run("a null url gets the default", func(t *testing.T) {
+		a := agentForConfig(edgesOn(true), agentRawConfig(`{"platform": {"policy_edges": {"url": null}}}`))
+		b, _ := block(t, a, "policy_edges")
+		if b["url"] != apiURL {
+			t.Errorf("platform.policy_edges.url = %v, want the default", b["url"])
 		}
 	})
 }
