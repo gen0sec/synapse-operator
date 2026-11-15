@@ -382,12 +382,15 @@ func (r *SynapseAgentReconciler) writeStatus(ctx context.Context, agent *synapse
 // anything, and if not, why and what to change. It follows Synapse: both
 // observer backends (tcx, af_packet) need an observe_interfaces entry that is
 // not blank, and only an agent on the host network sees the node's
-// interfaces.
+// interfaces. Synapse starts no observer at all when capture.enabled is false.
 func eastWestObservation(tree map[string]any, hostNetwork bool) (bool, string) {
 	if !hostNetwork {
 		return false, "spec.hostNetwork is false: the agent sees only its own pod's network namespace, so nothing is observed; enable hostNetwork"
 	}
 	capture, _ := tree["capture"].(map[string]any)
+	if enabled, ok := capture["enabled"].(bool); ok && !enabled {
+		return false, "capture.enabled is false, so no observer starts; remove spec.config.capture.enabled"
+	}
 	names, _ := capture["observe_interfaces"].([]any)
 	for _, n := range names {
 		if name, _ := n.(string); strings.TrimSpace(name) != "" {

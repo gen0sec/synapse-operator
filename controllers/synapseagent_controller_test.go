@@ -790,6 +790,9 @@ func TestEastWestObservation(t *testing.T) {
 		{"host network off", ifaces("eth0"), false, false, "hostNetwork"},
 		{"af_packet with no interface", tree(map[string]any{"observe_mode": "af_packet"}), true, false, "observe_interfaces"},
 		{"af_packet with blanks", tree(map[string]any{"observe_interfaces": []any{"", " "}, "observe_mode": "af_packet"}), true, false, "observe_interfaces"},
+		{"egress interfaces alone", tree(map[string]any{"observe_egress_interfaces": []any{"auto"}}), true, false, "observe_interfaces"},
+		{"capture disabled", tree(map[string]any{"enabled": false, "observe_interfaces": []any{"eth0"}}), true, false, "capture.enabled"},
+		{"capture enabled explicitly", tree(map[string]any{"enabled": true, "observe_interfaces": []any{"eth0"}}), true, true, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -836,6 +839,7 @@ func TestAgent_EastWestObservedCondition(t *testing.T) {
 		{"pod veths only", with(capture(synapsev1alpha1.AgentCaptureSpec{ObservePodVeths: boolPtr(true)})), metav1.ConditionFalse, ReasonNothingObserved, "observe_interfaces"},
 		{"host network off", with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"}), noHost), metav1.ConditionFalse, ReasonNothingObserved, "hostNetwork"},
 		{"af_packet with no interface", with(capture(synapsev1alpha1.AgentCaptureSpec{ObserveMode: "af_packet"})), metav1.ConditionFalse, ReasonNothingObserved, "observe_interfaces"},
+		{"capture disabled in the raw config", with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"}), agentRawConfig(`{"capture": {"enabled": false}}`)), metav1.ConditionFalse, ReasonNothingObserved, "capture.enabled"},
 		{"identity off", func(s *synapsev1alpha1.SynapseAgentSpec) {
 			capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})(s)
 		}, "", "", ""},
@@ -865,14 +869,30 @@ func TestAgent_EastWestObservedCondition(t *testing.T) {
 		a := e.running(with(capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})))
 		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionTrue, ReasonObserving)
 
-		e.edit(a, with(noHost))
-		e.reconcile(a)
-		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved)
+		trueGen := wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionTrue, ReasonObserving).ObservedGeneration
 
-		e.edit(a, with(noHost, agentRawConfig(`{"mode":"proxy"}`)))
+		// An invalid edit that would still observe: the condition is kept as
+		// it was, not recomputed.
+		cilium := capture(synapsev1alpha1.AgentCaptureSpec{CNI: "cilium"})
+		e.edit(a, with(cilium, agentRawConfig(`{"mode":"proxy"}`)))
 		e.reconcile(a)
 		wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonInvalidConfig)
-		wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved)
+		if c := wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionTrue, ReasonObserving); c.ObservedGeneration != trueGen {
+			t.Errorf("kept condition generation = %d, want %d", c.ObservedGeneration, trueGen)
+		}
+
+		e.edit(a, with(func(s *synapsev1alpha1.SynapseAgentSpec) { s.Config = nil }, cilium, noHost))
+		e.reconcile(a)
+		falseGen := wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved).ObservedGeneration
+
+		// Invalid again, with the host network back on: a recompute would
+		// say True, the kept condition stays False.
+		e.edit(a, with(cilium, agentRawConfig(`{"mode":"proxy"}`)))
+		e.reconcile(a)
+		wantAgentCondition(t, a, ConditionConfigValid, metav1.ConditionFalse, ReasonInvalidConfig)
+		if c := wantAgentCondition(t, a, ConditionEastWestObserved, metav1.ConditionFalse, ReasonNothingObserved); c.ObservedGeneration != falseGen {
+			t.Errorf("kept condition generation = %d, want %d", c.ObservedGeneration, falseGen)
+		}
 
 		e.edit(a, func(s *synapsev1alpha1.SynapseAgentSpec) {
 			s.Config = nil
