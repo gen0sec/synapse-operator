@@ -191,7 +191,12 @@ type AgentPlatformSpec struct {
 // AgentPolicyEdgesSpec configures the declared-edge allow-list.
 type AgentPolicyEdgesSpec struct {
 	// Enabled turns the allow-list on. It needs spec.platform.identity.enabled
-	// to be true. Empty leaves Synapse's default.
+	// to be true. Empty leaves Synapse's default. When true, the operator
+	// renders the download url https://api.gen0sec.com/v1 and a path under
+	// /var/lib/synapse unless spec.config sets them; setting
+	// spec.config.platform.policy_edges.url to "" turns the download off.
+	// Synapse starts the feed only with a platform API key
+	// (spec.platform.apiKeySecretRef).
 	//
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
@@ -200,7 +205,11 @@ type AgentPolicyEdgesSpec struct {
 // AgentIdentitySpec configures the identity the agent reports.
 type AgentIdentitySpec struct {
 	// Enabled turns the identity reporting on or off. Empty leaves Synapse's
-	// default.
+	// default. When true, the operator renders the download url
+	// https://api.gen0sec.com/v1 and a path under /var/lib/synapse unless
+	// spec.config sets them; setting spec.config.platform.identity.url to ""
+	// turns the download off. Synapse starts the feed only with a platform
+	// API key (spec.platform.apiKeySecretRef).
 	//
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
