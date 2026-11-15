@@ -266,6 +266,24 @@ func TestManagerOptionsConfiguration(t *testing.T) {
 	}
 }
 
+func TestRegistersConfigHash(t *testing.T) {
+	tests := []struct {
+		name                       string
+		ingressMode, configSync    bool
+		configHashController, want bool
+	}{
+		{"default", false, false, true, true},
+		{"switched off for the producers", false, false, false, false},
+		{"ingress mode", true, false, true, false},
+		{"config-sync", false, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, registersConfigHash(tt.ingressMode, tt.configSync, tt.configHashController))
+		})
+	}
+}
+
 func TestLeaderElectionID(t *testing.T) {
 	// Verify the leader election ID matches expected format
 	expectedID := "86a223f3.synapse.gen0sec.com"
