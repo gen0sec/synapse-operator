@@ -29,6 +29,8 @@ platform:
   identity:
     cluster: prod-eu
     enabled: true
+    path: /var/lib/synapse/identity.mmdb
+    url: https://api.gen0sec.com/v1
   threat:
     path: /var/lib/synapse
     url: https://download.gen0sec.com/v1

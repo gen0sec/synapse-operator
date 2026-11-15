@@ -93,6 +93,10 @@ var agentOwnedConfigKeys = []ownedConfigKey{
 	{"ids.address_vars.HOME_NET", "use spec.ids.homeNet"},
 }
 
+// agentPlatformAPIURL is the base url of the identity and policy-edges feeds.
+// Synapse appends the feed's own path to it.
+const agentPlatformAPIURL = "https://api.gen0sec.com/v1"
+
 // agentIdentityEnabled is true when spec.platform.identity.enabled is set to
 // true. A raw platform.identity block does not count.
 func agentIdentityEnabled(spec *synapsev1alpha1.SynapseAgentSpec) bool {
@@ -236,6 +240,16 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	// false would otherwise turn the feed on.
 	if p := spec.Platform; p != nil && p.PolicyEdges != nil && p.PolicyEdges.Enabled != nil {
 		setConfig(cfg, "platform.policy_edges.enabled", *p.PolicyEdges.Enabled)
+	}
+	// Defaults come last, so they see the merged raw config and every typed
+	// field. Only a feed the typed fields turn on gets any.
+	if agentIdentityEnabled(spec) {
+		setConfigDefault(cfg, "platform.identity.url", agentPlatformAPIURL)
+		setConfigDefault(cfg, "platform.identity.path", agentDataDir+"/identity.mmdb")
+	}
+	if p := spec.Platform; p != nil && p.PolicyEdges != nil && p.PolicyEdges.Enabled != nil && *p.PolicyEdges.Enabled {
+		setConfigDefault(cfg, "platform.policy_edges.url", agentPlatformAPIURL)
+		setConfigDefault(cfg, "platform.policy_edges.path", agentDataDir+"/policy-edges.txt")
 	}
 	if c := spec.Capture; c != nil {
 		if len(c.Interfaces) > 0 {
