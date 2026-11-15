@@ -233,6 +233,49 @@ type AgentCaptureSpec struct {
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
 	Interfaces []string `json:"interfaces,omitempty"`
+
+	// CNI names the cluster network the agent observes pod traffic on, and
+	// fills in the observer settings below for it. cilium observes the
+	// cilium_vxlan tunnel device. bridge observes cni0 and every pod veth,
+	// for flannel, kindnet and other veth-bridge CNIs. none, or empty, sets
+	// nothing. A field below replaces the value the preset gives its key. The
+	// tcx observer needs Linux 6.6 or newer.
+	//
+	// +optional
+	// +kubebuilder:validation:Enum=cilium;bridge;none
+	CNI string `json:"cni,omitempty"`
+
+	// ObserveInterfaces are the devices the east-west observer attaches to.
+	// It replaces the interfaces of the cni preset.
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	ObserveInterfaces []string `json:"observeInterfaces,omitempty"`
+
+	// ObserveEgressInterfaces are the devices the observer attaches to for
+	// traffic that leaves the node. auto picks the default-route device. It
+	// replaces the egress interfaces of the cni preset.
+	//
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	ObserveEgressInterfaces []string `json:"observeEgressInterfaces,omitempty"`
+
+	// ObserveMode is the capture backend of the observer: tcx, an in-kernel
+	// observer, or af_packet, a portable tap. It replaces the mode of the cni
+	// preset.
+	//
+	// +optional
+	// +kubebuilder:validation:Enum=tcx;af_packet
+	ObserveMode string `json:"observeMode,omitempty"`
+
+	// ObservePodVeths also attaches the observer to every pod veth. Bridge
+	// CNIs need it, because traffic between pods on one node bypasses the
+	// bridge device. It replaces the value of the cni preset.
+	//
+	// +optional
+	ObservePodVeths *bool `json:"observePodVeths,omitempty"`
 }
 
 // AgentLoggingSpec configures the agent's own logs and its EVE log.

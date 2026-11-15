@@ -991,6 +991,19 @@ spec:
               capture:
                 description: Capture configures the packet capture.
                 properties:
+                  cni:
+                    description: |-
+                      CNI names the cluster network the agent observes pod traffic on, and
+                      fills in the observer settings below for it. cilium observes the
+                      cilium_vxlan tunnel device. bridge observes cni0 and every pod veth,
+                      for flannel, kindnet and other veth-bridge CNIs. none, or empty, sets
+                      nothing. A field below replaces the value the preset gives its key. The
+                      tcx observer needs Linux 6.6 or newer.
+                    enum:
+                    - cilium
+                    - bridge
+                    - none
+                    type: string
                   interfaces:
                     description: |-
                       Interfaces are the network interfaces the agent captures on. Empty
@@ -1000,6 +1013,40 @@ spec:
                       type: string
                     type: array
                     x-kubernetes-list-type: set
+                  observeEgressInterfaces:
+                    description: |-
+                      ObserveEgressInterfaces are the devices the observer attaches to for
+                      traffic that leaves the node. auto picks the default-route device. It
+                      replaces the egress interfaces of the cni preset.
+                    items:
+                      minLength: 1
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  observeInterfaces:
+                    description: |-
+                      ObserveInterfaces are the devices the east-west observer attaches to.
+                      It replaces the interfaces of the cni preset.
+                    items:
+                      minLength: 1
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  observeMode:
+                    description: |-
+                      ObserveMode is the capture backend of the observer: tcx, an in-kernel
+                      observer, or af_packet, a portable tap. It replaces the mode of the cni
+                      preset.
+                    enum:
+                    - tcx
+                    - af_packet
+                    type: string
+                  observePodVeths:
+                    description: |-
+                      ObservePodVeths also attaches the observer to every pod veth. Bridge
+                      CNIs need it, because traffic between pods on one node bypasses the
+                      bridge device. It replaces the value of the cni preset.
+                    type: boolean
                 type: object
               config:
                 description: |-

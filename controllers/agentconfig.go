@@ -149,6 +149,9 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 		}, raw, specPath.Child("config"))...)
 	}
 
+	observer := agentObserverSettings(spec.Capture)
+	errs = append(errs, checkObserverConflicts(observer, spec.Capture, raw, specPath)...)
+
 	apiKey := ""
 	if spec.Platform != nil && spec.Platform.APIKeySecretRef != nil {
 		apiKey = strings.TrimSpace(in.APIKey)
@@ -176,6 +179,18 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 	}
 	if spec.Platform != nil && spec.Platform.Identity != nil && !isConfigText(spec.Platform.Identity.Cluster) {
 		errs = append(errs, field.Invalid(specPath.Child("platform", "identity", "cluster"), "<text>", "holds control characters"))
+	}
+	if c := spec.Capture; c != nil {
+		for i, name := range c.ObserveInterfaces {
+			if !isConfigText(name) {
+				errs = append(errs, field.Invalid(specPath.Child("capture", "observeInterfaces").Index(i), "<text>", "holds control characters"))
+			}
+		}
+		for i, name := range c.ObserveEgressInterfaces {
+			if !isConfigText(name) {
+				errs = append(errs, field.Invalid(specPath.Child("capture", "observeEgressInterfaces").Index(i), "<text>", "holds control characters"))
+			}
+		}
 	}
 	if spec.Capture != nil {
 		if network, ok := raw["network"].(map[string]any); ok && len(spec.Capture.Interfaces) > 0 && network["iface"] != nil {
@@ -261,6 +276,11 @@ func RenderAgentConfig(in AgentConfigInput) (AgentConfigOutput, error) {
 			}
 		}
 	}
+	for _, key := range observerConfigKeys {
+		if v, ok := observer[key]; ok {
+			setConfig(cfg, "capture."+key, v)
+		}
+	}
 	if ids := spec.IDS; ids != nil {
 		if ids.Enabled != nil {
 			setConfig(cfg, "ids.enabled", *ids.Enabled)
@@ -337,5 +357,81 @@ func copyConfigTree(v any) any {
 		return out
 	default:
 		return v
+	}
+}
+
+// observerConfigKeys are the capture.* keys of the east-west observer, in the
+// order they are rendered.
+var observerConfigKeys = []string{"observe_interfaces", "observe_egress_interfaces", "observe_mode", "observe_pod_veths"}
+
+// agentObserverSettings is the capture.observe_* settings the spec writes: the
+// preset named by spec.capture.cni, with each typed observe field replacing
+// the key it names. A key the spec does not write is absent.
+func agentObserverSettings(c *synapsev1alpha1.AgentCaptureSpec) map[string]any {
+	out := map[string]any{}
+	if c == nil {
+		return out
+	}
+	switch c.CNI {
+	case "cilium":
+		out["observe_interfaces"] = []string{"cilium_vxlan"}
+		out["observe_egress_interfaces"] = []string{"auto"}
+		out["observe_mode"] = "tcx"
+	case "bridge":
+		out["observe_interfaces"] = []string{"cni0"}
+		out["observe_egress_interfaces"] = []string{"auto"}
+		out["observe_mode"] = "tcx"
+		out["observe_pod_veths"] = true
+	}
+	if len(c.ObserveInterfaces) > 0 {
+		out["observe_interfaces"] = slices.Clone(c.ObserveInterfaces)
+	}
+	if len(c.ObserveEgressInterfaces) > 0 {
+		out["observe_egress_interfaces"] = slices.Clone(c.ObserveEgressInterfaces)
+	}
+	if c.ObserveMode != "" {
+		out["observe_mode"] = c.ObserveMode
+	}
+	if c.ObservePodVeths != nil {
+		out["observe_pod_veths"] = *c.ObservePodVeths
+	}
+	return out
+}
+
+// checkObserverConflicts refuses a raw capture.observe_* key that the spec
+// also writes. A raw key the spec leaves alone is passed through.
+func checkObserverConflicts(written map[string]any, c *synapsev1alpha1.AgentCaptureSpec, raw map[string]any, specPath *field.Path) field.ErrorList {
+	typedField := map[string]string{
+		"observe_interfaces":        "observeInterfaces",
+		"observe_egress_interfaces": "observeEgressInterfaces",
+		"observe_mode":              "observeMode",
+		"observe_pod_veths":         "observePodVeths",
+	}
+	var owned []ownedConfigKey
+	for _, key := range observerConfigKeys {
+		if _, ok := written[key]; !ok {
+			continue
+		}
+		hint := "use spec.capture." + typedField[key] + ", or remove it from spec.capture"
+		if !typedSet(c, key) {
+			hint = "spec.capture.cni " + c.CNI + " sets it; use spec.capture." + typedField[key] + " to change it, or remove it from spec.config"
+		}
+		owned = append(owned, ownedConfigKey{"capture." + key, hint})
+	}
+	return checkOwnedConfigKeysIn(owned, raw, specPath.Child("config"))
+}
+
+// typedSet reports whether the typed observe field for a capture.observe_* key
+// is set, so the preset is not blamed for a key the field wrote.
+func typedSet(c *synapsev1alpha1.AgentCaptureSpec, key string) bool {
+	switch key {
+	case "observe_interfaces":
+		return len(c.ObserveInterfaces) > 0
+	case "observe_egress_interfaces":
+		return len(c.ObserveEgressInterfaces) > 0
+	case "observe_mode":
+		return c.ObserveMode != ""
+	default:
+		return c.ObservePodVeths != nil
 	}
 }
