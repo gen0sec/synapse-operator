@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/yaml"
 )
 
@@ -388,4 +389,160 @@ func TestNetVars_ControlPlaneNet_NoKubernetesService(t *testing.T) {
 	if got, ok := readBackAddressVar(t, r, "CONTROL_PLANE_NET"); ok {
 		t.Errorf("CONTROL_PLANE_NET should be absent, got %q", got)
 	}
+}
+
+func reconcileCM(t *testing.T, r *NetVarsResolverReconciler) corev1.ConfigMap {
+	t.Helper()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "synapse-os", Name: "synapse-agent-config"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var out corev1.ConfigMap
+	if err := r.Get(context.Background(), req.NamespacedName, &out); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	return out
+}
+
+func cpNetOf(t *testing.T, cm *corev1.ConfigMap) (string, bool) {
+	t.Helper()
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(cm.Data[SynapseConfigKey]), &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	v, ok := nestedMap(root, "ids", "address_vars")["CONTROL_PLANE_NET"].(string)
+	return v, ok
+}
+
+func updateCM(t *testing.T, r *NetVarsResolverReconciler, cm *corev1.ConfigMap) {
+	t.Helper()
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatalf("update cm: %v", err)
+	}
+}
+
+func autoCPFixture(t *testing.T) (*NetVarsResolverReconciler, corev1.ConfigMap) {
+	t.Helper()
+	cm := srcCM("", map[string]string{labelOn: "true"}, nil)
+	r := netvarsWithObjs(t, cm, []runtime.Object{kubernetesSvc("10.96.0.1")})
+	out := reconcileCM(t, r)
+	if out.Annotations[ControlPlaneNetManagedAnnotation] != managedAuto {
+		t.Fatalf("fixture: expected auto marker, got %q", out.Annotations[ControlPlaneNetManagedAnnotation])
+	}
+	return r, out
+}
+
+func setCPNet(t *testing.T, cm *corev1.ConfigMap, value string) {
+	t.Helper()
+	cm.Data[SynapseConfigKey] = "ids:\n  address_vars:\n    CONTROL_PLANE_NET: \"" + value + "\"\n"
+}
+
+func TestNetVars_ControlPlaneNet_EditWhileAutoIsOverwritten(t *testing.T) {
+	r, cm := autoCPFixture(t)
+	setCPNet(t, &cm, "[198.51.100.0/24]")
+	updateCM(t, r, &cm)
+	out := reconcileCM(t, r)
+	got, _ := cpNetOf(t, &out)
+	if got != "[10.96.0.1/32]" {
+		t.Errorf("edit under the auto marker should be re-derived, got %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_OverrideAnnotationKept(t *testing.T) {
+	r, cm := autoCPFixture(t)
+	cm.Annotations[ControlPlaneNetOverrideAnnotation] = "[198.51.100.0/24]"
+	updateCM(t, r, &cm)
+	out := reconcileCM(t, r)
+	got, _ := cpNetOf(t, &out)
+	if got != "[198.51.100.0/24]" {
+		t.Errorf("override annotation not applied: %q", got)
+	}
+	if _, ok := out.Annotations[ControlPlaneNetManagedAnnotation]; ok {
+		t.Errorf("auto marker should be dropped while pinned")
+	}
+	got, _ = cpNetOf(t, func() *corev1.ConfigMap { o := reconcileCM(t, r); return &o }())
+	if got != "[198.51.100.0/24]" {
+		t.Errorf("override lost on second reconcile: %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_ClearedIsReDerived(t *testing.T) {
+	r, cm := autoCPFixture(t)
+	cm.Data[SynapseConfigKey] = "ids:\n  address_vars:\n    CONTROL_PLANE_NET: \"\"\n"
+	updateCM(t, r, &cm)
+	out := reconcileCM(t, r)
+	if got, _ := cpNetOf(t, &out); got != "[10.96.0.1/32]" {
+		t.Errorf("cleared value should be re-derived, got %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_RemovingManagedAnnotationPins(t *testing.T) {
+	r, cm := autoCPFixture(t)
+	delete(cm.Annotations, ControlPlaneNetManagedAnnotation)
+	updateCM(t, r, &cm)
+	out := reconcileCM(t, r)
+	if got, _ := cpNetOf(t, &out); got != "[10.96.0.1/32]" {
+		t.Fatalf("pinned value changed: %q", got)
+	}
+	// A cluster change must not move the pin.
+	n := cpNode("cp2", "10.0.0.6")
+	if err := r.Create(context.Background(), &n); err != nil {
+		t.Fatal(err)
+	}
+	out = reconcileCM(t, r)
+	if got, _ := cpNetOf(t, &out); got != "[10.96.0.1/32]" {
+		t.Errorf("pinned value was re-derived: %q", got)
+	}
+	if _, ok := out.Annotations[ControlPlaneNetManagedAnnotation]; ok {
+		t.Errorf("auto marker came back on a pinned value")
+	}
+}
+
+func TestNetVars_ControlPlaneNet_ServiceDisappearsRemovesAuto(t *testing.T) {
+	r, _ := autoCPFixture(t)
+	if err := r.Delete(context.Background(), kubernetesSvc("10.96.0.1")); err != nil {
+		t.Fatal(err)
+	}
+	out := reconcileCM(t, r)
+	if got, ok := cpNetOf(t, &out); ok {
+		t.Errorf("auto value should be removed, got %q", got)
+	}
+	if _, ok := out.Annotations[ControlPlaneNetManagedAnnotation]; ok {
+		t.Errorf("auto marker should be removed")
+	}
+}
+
+func TestNetVars_ControlPlaneNet_IPv6Rendered(t *testing.T) {
+	cm := srcCM("", map[string]string{labelOn: "true"}, nil)
+	slice := kubernetesSlice("2001:db8::10")
+	slice.AddressType = discoveryv1.AddressTypeIPv6
+	n := cpNode("cp1", "2001:db8::5")
+	r := netvarsWithObjs(t, cm, []runtime.Object{kubernetesSvc("fd00::1"), slice}, n)
+	out := reconcileCM(t, r)
+	got, _ := cpNetOf(t, &out)
+	for _, want := range []string{"fd00::1/128", "2001:db8::10/128", "2001:db8::5/128"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("CONTROL_PLANE_NET %q missing %s", got, want)
+		}
+	}
+}
+
+func TestKubernetesSlicePredicate(t *testing.T) {
+	p := kubernetesSlicePredicate()
+	mk := func(ns, svc string) *discoveryv1.EndpointSlice {
+		return &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "x", Labels: map[string]string{discoveryv1.LabelServiceName: svc}}}
+	}
+	if !p.Generic(eventGeneric(mk("default", "kubernetes"))) {
+		t.Error("default/kubernetes slice should pass")
+	}
+	for _, o := range []*discoveryv1.EndpointSlice{mk("other", "kubernetes"), mk("default", "api")} {
+		if p.Generic(eventGeneric(o)) {
+			t.Errorf("slice %s/%s should be filtered", o.Namespace, o.Labels[discoveryv1.LabelServiceName])
+		}
+	}
+}
+
+func eventGeneric(o *discoveryv1.EndpointSlice) event.GenericEvent {
+	return event.GenericEvent{Object: o}
 }
