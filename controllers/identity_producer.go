@@ -18,6 +18,7 @@ import (
 	"github.com/maxmind/mmdbwriter/mmdbtype"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -92,16 +93,27 @@ func (r *IdentityProducerReconciler) Start(ctx context.Context) error {
 		}
 	}
 	if r.Cache != nil {
-		inf, err := r.Cache.GetInformer(ctx, &corev1.Pod{})
-		if err != nil {
-			return fmt.Errorf("identity-producer: get pod informer: %w", err)
-		}
-		if _, err := inf.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
-			AddFunc:    func(interface{}) { signal() },
-			UpdateFunc: func(_, _ interface{}) { signal() },
-			DeleteFunc: func(interface{}) { signal() },
-		}); err != nil {
-			return fmt.Errorf("identity-producer: add pod event handler: %w", err)
+		// Pods, plus everything the service-account privilege flag derives
+		// from: a binding or role change re-derives it.
+		for _, obj := range []client.Object{
+			&corev1.Pod{},
+			&corev1.ServiceAccount{},
+			&rbacv1.RoleBinding{},
+			&rbacv1.ClusterRoleBinding{},
+			&rbacv1.Role{},
+			&rbacv1.ClusterRole{},
+		} {
+			inf, err := r.Cache.GetInformer(ctx, obj)
+			if err != nil {
+				return fmt.Errorf("identity-producer: get %T informer: %w", obj, err)
+			}
+			if _, err := inf.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+				AddFunc:    func(interface{}) { signal() },
+				UpdateFunc: func(_, _ interface{}) { signal() },
+				DeleteFunc: func(interface{}) { signal() },
+			}); err != nil {
+				return fmt.Errorf("identity-producer: add %T event handler: %w", obj, err)
+			}
 		}
 	}
 
@@ -142,6 +154,10 @@ type identityEntry struct {
 	internetExposed bool
 	controlPlane    bool
 	labels          map[string]string
+	// serviceAccount is the pod's service account ("default" when unset).
+	// saPrivileged is stamped from the cluster's RBAC objects.
+	serviceAccount string
+	saPrivileged   bool
 }
 
 // filterLabels drops the k8s-internal churn labels (pod-template-hash and
@@ -179,6 +195,9 @@ func (e identityEntry) equalTo(o identityEntry) bool {
 	if e.internetExposed != o.internetExposed || e.controlPlane != o.controlPlane {
 		return false
 	}
+	if e.serviceAccount != o.serviceAccount || e.saPrivileged != o.saPrivileged {
+		return false
+	}
 	if len(e.labels) != len(o.labels) {
 		return false
 	}
@@ -208,6 +227,7 @@ func (r *IdentityProducerReconciler) buildAndUpload(ctx context.Context) {
 	}
 
 	entries := resolveIdentityEntries(pods.Items)
+	r.stampServiceAccountPrivilege(ctx, entries)
 	// Reseed the delta diff-base from the baseline snapshot; deltas emitted after
 	// this baseline diff against the current full state (self-heals any drift).
 	r.index = indexEntries(entries)
@@ -246,6 +266,10 @@ type IdentityEntry struct {
 	Namespace string            `json:"namespace"`
 	App       string            `json:"app"`
 	Labels    map[string]string `json:"labels,omitempty"`
+	// ServiceAccount and SAPrivileged are always on the wire, so a delta that
+	// clears the flag is distinguishable from one that never carried it.
+	ServiceAccount string `json:"service_account"`
+	SAPrivileged   bool   `json:"sa_privileged"`
 }
 
 // IdentityDelta is an incremental change to the IP->identity table: upserted rows
@@ -279,12 +303,17 @@ func (r *IdentityProducerReconciler) flushDelta(ctx context.Context) {
 		r.Log.Error(err, "identity-producer: list pods failed (delta)")
 		return
 	}
-	newIndex := indexEntries(resolveIdentityEntries(pods.Items))
+	entries := resolveIdentityEntries(pods.Items)
+	r.stampServiceAccountPrivilege(ctx, entries)
+	newIndex := indexEntries(entries)
 
 	var upserts []IdentityEntry
 	for ip, e := range newIndex {
 		if prev, ok := r.index[ip]; !ok || !prev.equalTo(e) {
-			upserts = append(upserts, IdentityEntry{IP: e.ip, Workload: e.workload, Namespace: e.namespace, App: e.app, Labels: e.labels})
+			upserts = append(upserts, IdentityEntry{
+				IP: e.ip, Workload: e.workload, Namespace: e.namespace, App: e.app, Labels: e.labels,
+				ServiceAccount: e.serviceAccount, SAPrivileged: e.saPrivileged,
+			})
 		}
 	}
 	var removes []string
@@ -375,6 +404,8 @@ func resolveIdentityEntries(pods []corev1.Pod) []identityEntry {
 				namespace: p.Namespace,
 				app:       app,
 				labels:    filterLabels(p.Labels),
+
+				serviceAccount: serviceAccountName(p),
 			}
 			start[ip] = st
 		}
@@ -509,7 +540,7 @@ func trimReplicaSetHash(name string) string {
 func identityVersion(entries []identityEntry) string {
 	rows := make([]string, len(entries))
 	for i, e := range entries {
-		rows[i] = fmt.Sprintf("%s|%s|%s|%s|%t|%t", e.ip, e.namespace, e.workload, e.app, e.internetExposed, e.controlPlane)
+		rows[i] = fmt.Sprintf("%s|%s|%s|%s|%t|%t|%s|%t", e.ip, e.namespace, e.workload, e.app, e.internetExposed, e.controlPlane, e.serviceAccount, e.saPrivileged)
 	}
 	sort.Strings(rows)
 	h := sha256.Sum256([]byte(strings.Join(rows, "\n")))
@@ -517,7 +548,8 @@ func identityVersion(entries []identityEntry) string {
 }
 
 // buildIdentityMMDB writes an MMDB keyed by pod IP /32 (or /128) -> identity.
-// Field names (workload/namespace/app/internet_exposed/control_plane) mirror
+// Field names (workload/namespace/app/internet_exposed/control_plane/
+// service_account/sa_privileged) mirror
 // the agent's MmdbIdentityRecord.
 func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 	writer, err := mmdbwriter.New(mmdbwriter.Options{
@@ -553,6 +585,8 @@ func buildIdentityMMDB(entries []identityEntry) ([]byte, error) {
 			"app":              mmdbtype.String(e.app),
 			"internet_exposed": mmdbtype.Bool(e.internetExposed),
 			"control_plane":    mmdbtype.Bool(e.controlPlane),
+			"service_account":  mmdbtype.String(e.serviceAccount),
+			"sa_privileged":    mmdbtype.Bool(e.saPrivileged),
 		}
 		if len(e.labels) > 0 {
 			lm := mmdbtype.Map{}
