@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,6 +27,9 @@ func netvarsWithObjs(t *testing.T, cm *corev1.ConfigMap, extra []runtime.Object,
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("scheme: %v", err)
 	}
 	objs := []runtime.Object{cm}
@@ -276,5 +280,112 @@ func TestHostCIDR(t *testing.T) {
 	}
 	if got := hostCIDR("not-an-ip"); got != "" {
 		t.Errorf("invalid ip should be empty; got %q", got)
+	}
+}
+
+const cpLabel = "node-role.kubernetes.io/control-plane"
+
+func kubernetesSvc(clusterIP string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: clusterIP},
+	}
+}
+
+func kubernetesSlice(addrs ...string) *discoveryv1.EndpointSlice {
+	eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+	for _, a := range addrs {
+		eps = append(eps, discoveryv1.Endpoint{Addresses: []string{a}})
+	}
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kubernetes", Namespace: "default",
+			Labels: map[string]string{discoveryv1.LabelServiceName: "kubernetes"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   eps,
+	}
+}
+
+func cpNode(name, ip string) corev1.Node {
+	n := node(name, ip, "", "")
+	n.Labels = map[string]string{cpLabel: ""}
+	return n
+}
+
+func readBackAddressVar(t *testing.T, r *NetVarsResolverReconciler, key string) (string, bool) {
+	t.Helper()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "synapse-os", Name: "synapse-agent-config"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var out corev1.ConfigMap
+	if err := r.Get(context.Background(), req.NamespacedName, &out); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(out.Data[SynapseConfigKey]), &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	v, ok := nestedMap(root, "ids", "address_vars")[key].(string)
+	return v, ok
+}
+
+func TestNetVars_ControlPlaneNet_ServiceEndpointsAndCPNodes(t *testing.T) {
+	cm := srcCM("", map[string]string{labelOn: "true"}, nil)
+	r := netvarsWithObjs(t, cm,
+		[]runtime.Object{kubernetesSvc("10.96.0.1"), kubernetesSlice("192.0.2.10", "192.0.2.11")},
+		cpNode("cp1", "10.0.0.5"), node("w1", "10.0.0.30", "", ""))
+	got, ok := readBackAddressVar(t, r, "CONTROL_PLANE_NET")
+	if !ok {
+		t.Fatal("CONTROL_PLANE_NET absent")
+	}
+	for _, want := range []string{"10.96.0.1/32", "192.0.2.10/32", "192.0.2.11/32", "10.0.0.5/32"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("CONTROL_PLANE_NET %q missing %s", got, want)
+		}
+	}
+	if strings.Contains(got, "10.0.0.30") {
+		t.Errorf("worker node leaked into CONTROL_PLANE_NET: %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_ManualSurvives(t *testing.T) {
+	cm := srcCM("ids:\n  address_vars:\n    CONTROL_PLANE_NET: \"[198.51.100.0/24]\"\n",
+		map[string]string{labelOn: "true"}, nil)
+	r := netvarsWithObjs(t, cm, []runtime.Object{kubernetesSvc("10.96.0.1")}, cpNode("cp1", "10.0.0.5"))
+	got, _ := readBackAddressVar(t, r, "CONTROL_PLANE_NET")
+	if got != "[198.51.100.0/24]" {
+		t.Errorf("manual CONTROL_PLANE_NET not preserved: %q", got)
+	}
+	// A second reconcile must not adopt it as auto either.
+	got, _ = readBackAddressVar(t, r, "CONTROL_PLANE_NET")
+	if got != "[198.51.100.0/24]" {
+		t.Errorf("manual CONTROL_PLANE_NET lost on second reconcile: %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_AutoReDerives(t *testing.T) {
+	cm := srcCM("", map[string]string{labelOn: "true"}, nil)
+	r := netvarsWithObjs(t, cm, []runtime.Object{kubernetesSvc("10.96.0.1")})
+	got, _ := readBackAddressVar(t, r, "CONTROL_PLANE_NET")
+	if !strings.Contains(got, "10.96.0.1/32") {
+		t.Fatalf("first derive: %q", got)
+	}
+	n := cpNode("cp2", "10.0.0.6")
+	if err := r.Create(context.Background(), &n); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = readBackAddressVar(t, r, "CONTROL_PLANE_NET")
+	if !strings.Contains(got, "10.0.0.6/32") {
+		t.Errorf("auto value not re-derived after a control-plane node joined: %q", got)
+	}
+}
+
+func TestNetVars_ControlPlaneNet_NoKubernetesService(t *testing.T) {
+	cm := srcCM("", map[string]string{labelOn: "true"}, nil)
+	r := netvarsWith(t, cm, node("w1", "10.0.0.30", "", ""))
+	if got, ok := readBackAddressVar(t, r, "CONTROL_PLANE_NET"); ok {
+		t.Errorf("CONTROL_PLANE_NET should be absent, got %q", got)
 	}
 }
