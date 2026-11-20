@@ -32,6 +32,7 @@
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 package controllers
 
 import (
@@ -43,6 +44,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -74,6 +76,16 @@ const HomeNetOverrideAnnotation = "synapse.gen0sec.com/home-net"
 // would see that value and treat it as manual — freezing auto-discovery so
 // Node/Service changes never re-derive. Values: "auto" | "manual".
 const NetVarsManagedAnnotation = "synapse.gen0sec.com/netvars-managed"
+
+// ControlPlaneNetManagedAnnotation is the HOME_NET marker's counterpart for
+// ids.address_vars.CONTROL_PLANE_NET: "auto" means the operator wrote the
+// current value, so a non-empty value without it is a user pin.
+const ControlPlaneNetManagedAnnotation = "synapse.gen0sec.com/control-plane-net-managed"
+
+// controlPlaneNodeLabel marks control-plane Nodes.
+const controlPlaneNodeLabel = "node-role.kubernetes.io/control-plane"
+
+const controlPlaneNetVar = "CONTROL_PLANE_NET"
 
 const (
 	managedAuto   = "auto"
@@ -140,6 +152,23 @@ func (r *NetVarsResolverReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	cpNet, cpManual, err := r.desiredControlPlaneNet(ctx, &cm, newRaw)
+	if err != nil {
+		logger.Error(err, "failed to compute CONTROL_PLANE_NET")
+		return ctrl.Result{}, err
+	}
+	newRaw, cpChanged, err := setIdsAddressVar(newRaw, controlPlaneNetVar, cpNet)
+	if err != nil {
+		logger.Error(err, "failed to rewrite config.yaml CONTROL_PLANE_NET")
+		return ctrl.Result{}, err
+	}
+	configChanged = configChanged || cpChanged
+	desiredCP := ""
+	if !cpManual && cpNet != "" {
+		desiredCP = managedAuto
+	}
+	cpAnnotationChanged := cm.Annotations[ControlPlaneNetManagedAnnotation] != desiredCP
+
 	// Record the management mode so a future reconcile re-derives an auto value
 	// (instead of mistaking it for a manual pin). See NetVarsManagedAnnotation.
 	desiredManaged := managedAuto
@@ -148,7 +177,7 @@ func (r *NetVarsResolverReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	annotationChanged := cm.Annotations[NetVarsManagedAnnotation] != desiredManaged
 
-	if !configChanged && !annotationChanged {
+	if !configChanged && !annotationChanged && !cpAnnotationChanged {
 		return ctrl.Result{}, nil
 	}
 
@@ -157,6 +186,11 @@ func (r *NetVarsResolverReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		cm.Annotations = map[string]string{}
 	}
 	cm.Annotations[NetVarsManagedAnnotation] = desiredManaged
+	if desiredCP == "" {
+		delete(cm.Annotations, ControlPlaneNetManagedAnnotation)
+	} else {
+		cm.Annotations[ControlPlaneNetManagedAnnotation] = desiredCP
+	}
 	if err := r.Update(ctx, &cm); err != nil {
 		logger.Error(err, "failed to write HOME_NET/EXTERNAL_NET into ConfigMap")
 		return ctrl.Result{}, err
@@ -190,6 +224,73 @@ func (r *NetVarsResolverReconciler) desiredHomeNet(ctx context.Context, cm *core
 		return "", false, err
 	}
 	return auto, false, nil
+}
+
+// desiredControlPlaneNet decides CONTROL_PLANE_NET: a non-empty value the
+// operator did not write is kept verbatim (manual); otherwise it is derived.
+// An empty result means the variable is left out.
+func (r *NetVarsResolverReconciler) desiredControlPlaneNet(ctx context.Context, cm *corev1.ConfigMap, raw string) (string, bool, error) {
+	if cur := currentAddressVar(raw, controlPlaneNetVar); cur != "" &&
+		cm.Annotations[ControlPlaneNetManagedAnnotation] != managedAuto {
+		return cur, true, nil
+	}
+	var svc corev1.Service
+	err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &svc)
+	if apierrors.IsNotFound(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get default/kubernetes service: %w", err)
+	}
+	var slices discoveryv1.EndpointSliceList
+	if err := r.List(ctx, &slices, client.InNamespace("default"),
+		client.MatchingLabels{discoveryv1.LabelServiceName: "kubernetes"}); err != nil {
+		return "", false, fmt.Errorf("list kubernetes endpointslices: %w", err)
+	}
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes, client.HasLabels{controlPlaneNodeLabel}); err != nil {
+		return "", false, fmt.Errorf("list control-plane nodes: %w", err)
+	}
+	return controlPlaneNetFromCluster(&svc, slices.Items, nodes.Items), false, nil
+}
+
+// controlPlaneNetFromCluster returns the sorted "[a,b,...]" list of the
+// kubernetes Service ClusterIP, its endpoint addresses and the InternalIPs of
+// control-plane Nodes, or "" when none is a valid IP.
+func controlPlaneNetFromCluster(svc *corev1.Service, slices []discoveryv1.EndpointSlice, nodes []corev1.Node) string {
+	set := make(map[string]struct{})
+	add := func(ip string) {
+		if cidr := hostCIDR(strings.TrimSpace(ip)); cidr != "" {
+			set[cidr] = struct{}{}
+		}
+	}
+	add(svc.Spec.ClusterIP)
+	for _, ip := range svc.Spec.ClusterIPs {
+		add(ip)
+	}
+	for i := range slices {
+		for _, ep := range slices[i].Endpoints {
+			for _, a := range ep.Addresses {
+				add(a)
+			}
+		}
+	}
+	for i := range nodes {
+		for _, addr := range nodes[i].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				add(addr.Address)
+			}
+		}
+	}
+	if len(set) == 0 {
+		return ""
+	}
+	cidrs := make([]string, 0, len(set))
+	for c := range set {
+		cidrs = append(cidrs, c)
+	}
+	sort.Strings(cidrs)
+	return "[" + strings.Join(cidrs, ",") + "]"
 }
 
 // autoHomeNet lists the cluster's Nodes and Services and builds HOME_NET
@@ -336,6 +437,46 @@ func setIdsAddressVars(raw, homeNet, externalNet string) (string, bool, error) {
 	return string(out), true, nil
 }
 
+// currentAddressVar returns ids.address_vars.<key> from the raw config, or "".
+func currentAddressVar(raw, key string) string {
+	var root map[string]any
+	if yaml.Unmarshal([]byte(raw), &root) != nil {
+		return ""
+	}
+	v, _ := nestedMap(root, "ids", "address_vars")[key].(string)
+	return strings.TrimSpace(v)
+}
+
+// setIdsAddressVar sets ids.address_vars.<key>, or removes it when value is
+// empty. Returns (newYAML, changed?).
+func setIdsAddressVar(raw, key, value string) (string, bool, error) {
+	var root map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &root); err != nil {
+		return "", false, fmt.Errorf("unmarshal config.yaml: %w", err)
+	}
+	av := nestedMap(root, "ids", "address_vars")
+	cur, present := av[key].(string)
+	if value == "" {
+		if !present {
+			return raw, false, nil
+		}
+		delete(av, key)
+	} else {
+		if present && cur == value {
+			return raw, false, nil
+		}
+		if av == nil {
+			return raw, false, fmt.Errorf("ids.address_vars missing")
+		}
+		av[key] = value
+	}
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal config.yaml: %w", err)
+	}
+	return string(out), true, nil
+}
+
 // nestedMap walks a map[string]any by keys, returning the final map or nil.
 func nestedMap(root map[string]any, keys ...string) map[string]any {
 	cur := root
@@ -380,7 +521,15 @@ func (r *NetVarsResolverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&corev1.ConfigMap{}, builder.WithPredicates(netVarsSourcePredicate())).
 		Watches(&corev1.Node{}, enqueueAllSources).
 		Watches(&corev1.Service{}, enqueueAllSources).
+		Watches(&discoveryv1.EndpointSlice{}, enqueueAllSources, builder.WithPredicates(kubernetesSlicePredicate())).
 		Complete(r)
+}
+
+func kubernetesSlicePredicate() predicate.Predicate {
+	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return obj.GetNamespace() == "default" &&
+			obj.GetLabels()[discoveryv1.LabelServiceName] == "kubernetes"
+	})
 }
 
 func netVarsSourcePredicate() predicate.Predicate {
