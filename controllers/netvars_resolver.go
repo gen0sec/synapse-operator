@@ -77,6 +77,10 @@ const HomeNetOverrideAnnotation = "synapse.gen0sec.com/home-net"
 // Node/Service changes never re-derive. Values: "auto" | "manual".
 const NetVarsManagedAnnotation = "synapse.gen0sec.com/netvars-managed"
 
+// ControlPlaneNetOverrideAnnotation, when set on the source ConfigMap, pins
+// CONTROL_PLANE_NET to its value verbatim (auto-discovery is skipped).
+const ControlPlaneNetOverrideAnnotation = "synapse.gen0sec.com/control-plane-net"
+
 // ControlPlaneNetManagedAnnotation is the HOME_NET marker's counterpart for
 // ids.address_vars.CONTROL_PLANE_NET: "auto" means the operator wrote the
 // current value, so a non-empty value without it is a user pin.
@@ -226,10 +230,14 @@ func (r *NetVarsResolverReconciler) desiredHomeNet(ctx context.Context, cm *core
 	return auto, false, nil
 }
 
-// desiredControlPlaneNet decides CONTROL_PLANE_NET: a non-empty value the
-// operator did not write is kept verbatim (manual); otherwise it is derived.
+// desiredControlPlaneNet decides CONTROL_PLANE_NET: the override annotation
+// wins, then a non-empty value the operator did not write is kept verbatim
+// (manual); otherwise it is derived.
 // An empty result means the variable is left out.
 func (r *NetVarsResolverReconciler) desiredControlPlaneNet(ctx context.Context, cm *corev1.ConfigMap, raw string) (string, bool, error) {
+	if ov, ok := cm.Annotations[ControlPlaneNetOverrideAnnotation]; ok && strings.TrimSpace(ov) != "" {
+		return strings.TrimSpace(ov), true, nil
+	}
 	if cur := currentAddressVar(raw, controlPlaneNetVar); cur != "" &&
 		cm.Annotations[ControlPlaneNetManagedAnnotation] != managedAuto {
 		return cur, true, nil
