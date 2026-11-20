@@ -18,7 +18,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func saSubject(ns, name string) rbacv1.Subject {
@@ -210,6 +212,10 @@ type deltaSink struct {
 func (s *deltaSink) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path != "/identity/delta" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		var d IdentityDelta
 		if err := json.Unmarshal(body, &d); err != nil {
 			t.Errorf("delta body: %v", err)
@@ -315,5 +321,63 @@ func TestProducersRoleReadsRBAC(t *testing.T) {
 				t.Errorf("%s/%s verbs = %v, want exactly %v", group, res, verbs, readOnly)
 			}
 		}
+	}
+}
+
+// When the RBAC objects cannot be read, the last published flag is kept: a
+// transient error or a missing grant must not clear a detection.
+func TestRBACListFailureKeepsPublishedFlag(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "shop", Labels: map[string]string{"app": "web"}},
+		Spec:       corev1.PodSpec{ServiceAccountName: "builder"},
+		Status:     servingStatus("10.0.0.1"),
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "builder-admin"},
+		RoleRef:    rbacv1.RoleRef{Kind: "ClusterRole", Name: "cluster-admin"},
+		Subjects:   []rbacv1.Subject{saSubject("shop", "builder")},
+	}
+	var failRBAC bool
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, binding).
+		WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, l client.ObjectList, o ...client.ListOption) error {
+			if _, ok := l.(*rbacv1.RoleList); ok && failRBAC {
+				return context.DeadlineExceeded
+			}
+			return c.List(ctx, l, o...)
+		}}).Build()
+
+	sink := &deltaSink{}
+	srv := httptest.NewServer(sink.handler(t))
+	defer srv.Close()
+	r := &IdentityProducerReconciler{
+		Client: cl, Log: logr.Discard(), UploadURL: srv.URL, HTTPClient: srv.Client(),
+		index: map[string]identityEntry{},
+	}
+	ctx := context.Background()
+
+	r.flushDelta(ctx)
+	if len(sink.deltas) != 1 || !sink.deltas[0].Upserts[0].SAPrivileged {
+		t.Fatalf("setup: want one delta with a true flag, got %+v", sink.deltas)
+	}
+
+	failRBAC = true
+	r.flushDelta(ctx)
+	if len(sink.deltas) != 1 {
+		t.Fatalf("flag flipped on an RBAC read failure: %+v", sink.deltas[1:])
+	}
+	r.buildAndUpload(ctx)
+	if !r.index["10.0.0.1"].saPrivileged {
+		t.Fatal("baseline reseeded the flag to false on an RBAC read failure")
+	}
+
+	// With no previous value there is nothing to keep: false.
+	r2 := &IdentityProducerReconciler{Client: cl, Log: logr.Discard(), index: map[string]identityEntry{}}
+	entries := []identityEntry{{ip: "10.0.0.1", namespace: "shop", serviceAccount: "builder"}}
+	if r2.stampServiceAccountPrivilege(ctx, entries) || entries[0].saPrivileged {
+		t.Fatal("a failed read with no previous value must report failure and leave false")
 	}
 }

@@ -31,7 +31,8 @@ rules:
       - list
       - watch
   # Read-only: the identity producer derives a ServiceAccount's privileged
-  # flag from its bindings and roles.
+  # flag from its bindings and roles. RBAC objects are read cluster-wide, with
+  # no access to Secrets.
   - apiGroups:
       - ""
     resources:

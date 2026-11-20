@@ -37,7 +37,9 @@ func (p saPrivilege) privileged(ns, name string) bool {
 
 // newSAPrivilege derives the privileged set. A binding counts when its role is
 // cluster-admin or has a rule with a "*" verb or resource. A RoleBinding only
-// counts for subjects in its own namespace, where it grants.
+// counts for subjects in its own namespace, where it grants. One that grants an
+// SA from another namespace is ignored on purpose: it is a namespace-scoped
+// grant in a foreign namespace, not cluster privilege.
 func newSAPrivilege(
 	crbs []rbacv1.ClusterRoleBinding,
 	rbs []rbacv1.RoleBinding,
@@ -109,6 +111,8 @@ func newSAPrivilege(
 	return p
 }
 
+// rulesWildcard over-reports by design: a "*" verb on any resource, or any verb
+// on "*" resources, is enough, without checking that the two combine.
 func rulesWildcard(rules []rbacv1.PolicyRule) bool {
 	for _, r := range rules {
 		if slices.Contains(r.Verbs, rbacv1.VerbAll) || slices.Contains(r.Resources, rbacv1.ResourceAll) {
@@ -119,9 +123,11 @@ func rulesWildcard(rules []rbacv1.PolicyRule) bool {
 }
 
 // stampServiceAccountPrivilege sets saPrivileged on each entry from the
-// current RBAC objects. A failed list leaves the flags false (logged), so a
-// producer without the RBAC read grant still publishes identity.
-func (r *IdentityProducerReconciler) stampServiceAccountPrivilege(ctx context.Context, entries []identityEntry) {
+// current RBAC objects and reports whether they could be read. When they could
+// not (a transient error, or a missing read grant), each entry keeps the value
+// last published for its IP, false only when there is none, so a failed read
+// never clears a detection. Identity still publishes either way.
+func (r *IdentityProducerReconciler) stampServiceAccountPrivilege(ctx context.Context, entries []identityEntry) bool {
 	var (
 		crbs  rbacv1.ClusterRoleBindingList
 		rbs   rbacv1.RoleBindingList
@@ -138,12 +144,16 @@ func (r *IdentityProducerReconciler) stampServiceAccountPrivilege(ctx context.Co
 		{"clusterroles", func() error { return r.List(ctx, &crs) }},
 	} {
 		if err := l.list(); err != nil {
-			r.Log.Error(err, "identity-producer: list "+l.name+" failed (sa_privileged degraded to false)")
-			return
+			r.Log.Error(err, "identity-producer: list "+l.name+" failed (keeping the last published sa_privileged)")
+			for i := range entries {
+				entries[i].saPrivileged = r.index[entries[i].ip].saPrivileged
+			}
+			return false
 		}
 	}
 	p := newSAPrivilege(crbs.Items, rbs.Items, roles.Items, crs.Items)
 	for i := range entries {
 		entries[i].saPrivileged = p.privileged(entries[i].namespace, entries[i].serviceAccount)
 	}
+	return true
 }
