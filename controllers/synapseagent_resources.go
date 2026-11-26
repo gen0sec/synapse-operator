@@ -117,7 +117,7 @@ func buildAgentDaemonSet(a *synapsev1alpha1.SynapseAgent, restartHash string) *a
 			SeccompProfile:  &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
 			AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined},
 			Capabilities: &corev1.Capabilities{
-				Add:  []corev1.Capability{"SYS_ADMIN", "NET_ADMIN", "BPF", "SYS_RESOURCE"},
+				Add:  []corev1.Capability{"SYS_ADMIN", "NET_ADMIN", "BPF", "SYS_RESOURCE", "SYS_PTRACE", "DAC_READ_SEARCH", "PERFMON"},
 				Drop: []corev1.Capability{"ALL"},
 			},
 		},

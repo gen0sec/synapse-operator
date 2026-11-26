@@ -134,7 +134,7 @@ func TestAgentDaemonSet_Pod(t *testing.T) {
 	if sc.AppArmorProfile == nil || sc.AppArmorProfile.Type != corev1.AppArmorProfileTypeUnconfined {
 		t.Errorf("appArmor = %+v", sc.AppArmorProfile)
 	}
-	if want := []corev1.Capability{"SYS_ADMIN", "NET_ADMIN", "BPF", "SYS_RESOURCE"}; !slices.Equal(sc.Capabilities.Add, want) {
+	if want := []corev1.Capability{"SYS_ADMIN", "NET_ADMIN", "BPF", "SYS_RESOURCE", "SYS_PTRACE", "DAC_READ_SEARCH", "PERFMON"}; !slices.Equal(sc.Capabilities.Add, want) {
 		t.Errorf("caps add = %v", sc.Capabilities.Add)
 	}
 	if want := []corev1.Capability{"ALL"}; !slices.Equal(sc.Capabilities.Drop, want) {
